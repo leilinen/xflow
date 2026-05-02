@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 data/
 *.egg-info/
+target/
+xflow-token.json
+*.token.json
+.xflow-auth-profile/

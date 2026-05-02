@@ -1,19 +1,19 @@
-from __future__ import annotations
+use crate::utils::ensure_parent;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
+use std::path::Path;
+use std::str::FromStr;
 
-import sqlite3
-from pathlib import Path
-
-from xflow.utils import ensure_parent
-
-
-SCHEMA = """
+pub const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS auth_accounts (
     label TEXT PRIMARY KEY,
+    domain TEXT NOT NULL DEFAULT 'x.com',
     auth_token TEXT NOT NULL,
     ct0 TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'unknown',
+    exported_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -72,17 +72,28 @@ CREATE TABLE IF NOT EXISTS deliveries (
     delivered_at TEXT,
     FOREIGN KEY(tweet_id) REFERENCES tweets(tweet_id) ON DELETE SET NULL
 );
-"""
+"#;
 
+pub async fn connect(db_path: &Path) -> anyhow::Result<SqlitePool> {
+    ensure_parent(db_path)?;
+    let url = format!("sqlite://{}", db_path.display());
+    let options = SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await?;
+    Ok(pool)
+}
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    ensure_parent(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def init_db(db_path: Path) -> None:
-    with connect(db_path) as conn:
-        conn.executescript(SCHEMA)
+pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
+    for statement in SCHEMA.split(';') {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            sqlx::query(statement).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
