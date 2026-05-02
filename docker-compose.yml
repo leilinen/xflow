@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    command: xflow serve --config config.docker.yaml
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+
+  worker:
+    build: .
+    command: xflow worker --config config.docker.yaml
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
