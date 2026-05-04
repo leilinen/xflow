@@ -162,7 +162,7 @@ pub async fn list_tweets(
     );
     let mut where_parts = Vec::new();
     if filter.username.is_some() {
-        where_parts.push("t.author_username = ?");
+        where_parts.push("LOWER(t.author_username) = LOWER(?)");
     }
     if filter.important_only {
         where_parts.push("COALESCE(a.should_push, 0) = 1");

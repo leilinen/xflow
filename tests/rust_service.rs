@@ -178,7 +178,7 @@ async fn rss_generation_contains_items() {
             tweet_id: "1".to_string(),
             source_type: SourceType::Account,
             source_value: "openai".to_string(),
-            author_username: "openai".to_string(),
+            author_username: "OpenAI".to_string(),
             author_name: "OpenAI".to_string(),
             text: "AI update".to_string(),
             url: "https://x.com/openai/status/1".to_string(),
@@ -201,4 +201,40 @@ async fn rss_generation_contains_items() {
     let xml = rss_feed::generate_rss("Test", "http://localhost/rss/all", "desc", &tweets).unwrap();
     assert!(xml.contains("<rss"));
     assert!(xml.contains("AI update"));
+}
+
+#[tokio::test]
+async fn tweet_username_filter_is_case_insensitive() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_tweet(
+        &pool,
+        &Tweet {
+            tweet_id: "1".to_string(),
+            source_type: SourceType::Account,
+            source_value: "openai".to_string(),
+            author_username: "OpenAI".to_string(),
+            author_name: "OpenAI".to_string(),
+            text: "AI update".to_string(),
+            url: "https://x.com/OpenAI/status/1".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Utc::now(),
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let tweets = storage::list_tweets(
+        &pool,
+        TweetFilter {
+            username: Some("openai".to_string()),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(tweets.len(), 1);
+    assert_eq!(tweets[0].tweet.author_username, "OpenAI");
 }
