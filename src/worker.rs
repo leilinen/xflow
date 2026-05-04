@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::pipeline::{self, FetchResult};
-use crate::telegram::{self, TelegramResult};
+use crate::{channel, telegram::TelegramResult};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::time::Duration;
@@ -13,7 +13,8 @@ pub struct WorkerOnceResult {
 
 pub async fn run_once(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<WorkerOnceResult> {
     let fetch = pipeline::run_fetch(config, pool).await?;
-    let telegram = telegram::send_undelivered(pool, &config.telegram, 100).await?;
+    let channels = channel::configured_channels(config)?;
+    let telegram = channel::send_undelivered(pool, &channels, 100).await?;
     Ok(WorkerOnceResult { fetch, telegram })
 }
 
