@@ -1,10 +1,11 @@
 use chrono::Utc;
 use tempfile::tempdir;
 use xflow::auth;
+use xflow::channel::{self, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use xflow::config::{load_config, AppConfig};
 use xflow::db;
 use xflow::digest;
-use xflow::models::{Source, SourceType, Tweet};
+use xflow::models::{Source, SourceType, StoredTweet, Tweet};
 use xflow::pipeline;
 use xflow::rss_feed;
 use xflow::storage::{self, TokenImport, TweetFilter};
@@ -237,4 +238,59 @@ async fn tweet_username_filter_is_case_insensitive() {
 
     assert_eq!(tweets.len(), 1);
     assert_eq!(tweets[0].tweet.author_username, "OpenAI");
+}
+
+struct MockChannel;
+
+impl DeliveryChannel for MockChannel {
+    fn id(&self) -> String {
+        "mock:test".to_string()
+    }
+
+    fn send_all(&self) -> bool {
+        true
+    }
+
+    fn send_tweet<'a>(&'a self, _tweet: &'a StoredTweet) -> ChannelSendFuture<'a> {
+        Box::pin(async {
+            Ok(ChannelSendReceipt {
+                payload: serde_json::json!({"ok": true}),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn channel_delivery_records_prevent_duplicate_sends() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_tweet(
+        &pool,
+        &Tweet {
+            tweet_id: "1".to_string(),
+            source_type: SourceType::Account,
+            source_value: "openai".to_string(),
+            author_username: "OpenAI".to_string(),
+            author_name: "OpenAI".to_string(),
+            text: "AI update".to_string(),
+            url: "https://x.com/OpenAI/status/1".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Utc::now(),
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let channels: Vec<Box<dyn DeliveryChannel>> = vec![Box::new(MockChannel)];
+    let first = channel::send_undelivered(&pool, &channels, 10)
+        .await
+        .unwrap();
+    let second = channel::send_undelivered(&pool, &channels, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(first.sent, 1);
+    assert_eq!(first.failed, 0);
+    assert_eq!(second.sent, 0);
+    assert_eq!(second.failed, 0);
 }

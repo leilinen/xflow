@@ -1,9 +1,10 @@
+use crate::channel::{
+    ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel,
+};
 use crate::config::TelegramConfig;
 use crate::models::StoredTweet;
-use crate::storage::{self, delivery_payload};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -35,11 +36,27 @@ struct TelegramResponse {
     result: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TelegramResult {
-    pub sent: i64,
-    pub failed: i64,
-    pub skipped: i64,
+pub type TelegramResult = ChannelDeliveryResult;
+
+#[derive(Debug, Clone)]
+pub struct TelegramChannel {
+    credentials: TelegramCredentials,
+    send_all: bool,
+    parse_mode: String,
+    disable_web_page_preview: bool,
+    client: Client,
+}
+
+impl TelegramChannel {
+    pub fn from_config(config: &TelegramConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            credentials: load_credentials(config)?,
+            send_all: config.send_all,
+            parse_mode: config.parse_mode.clone(),
+            disable_web_page_preview: config.disable_web_page_preview,
+            client: Client::new(),
+        })
+    }
 }
 
 pub fn load_credentials(config: &TelegramConfig) -> anyhow::Result<TelegramCredentials> {
@@ -74,6 +91,59 @@ pub fn format_tweet_message(stored: &StoredTweet) -> String {
     parts.join("\n\n")
 }
 
+impl DeliveryChannel for TelegramChannel {
+    fn id(&self) -> String {
+        self.credentials.channel()
+    }
+
+    fn send_all(&self) -> bool {
+        self.send_all
+    }
+
+    fn send_tweet<'a>(&'a self, tweet: &'a StoredTweet) -> ChannelSendFuture<'a> {
+        Box::pin(async move {
+            let payload = SendMessagePayload {
+                chat_id: self.credentials.chat_id.clone(),
+                text: format_tweet_message(tweet),
+                parse_mode: if self.parse_mode.is_empty() {
+                    None
+                } else {
+                    Some(self.parse_mode.clone())
+                },
+                disable_web_page_preview: self.disable_web_page_preview,
+            };
+            let response = self
+                .client
+                .post(format!(
+                    "https://api.telegram.org/bot{}/sendMessage",
+                    self.credentials.bot_token
+                ))
+                .json(&payload)
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response
+                .json::<TelegramResponse>()
+                .await
+                .unwrap_or(TelegramResponse {
+                    ok: false,
+                    description: Some(format!("invalid Telegram response with status {status}")),
+                    result: serde_json::Value::Null,
+                });
+            if status.is_success() && body.ok {
+                Ok(ChannelSendReceipt {
+                    payload: serde_json::to_value(body)?,
+                })
+            } else {
+                anyhow::bail!(
+                    "{}",
+                    serde_json::json!({"request": payload, "response": body})
+                )
+            }
+        })
+    }
+}
+
 pub async fn send_undelivered(
     pool: &SqlitePool,
     config: &TelegramConfig,
@@ -86,86 +156,12 @@ pub async fn send_undelivered(
             skipped: 0,
         });
     }
-    let credentials = load_credentials(config)?;
-    let channel = credentials.channel();
-    let tweets = storage::list_undelivered_tweets(pool, &channel, !config.send_all, limit).await?;
-    let client = Client::new();
-    let mut result = TelegramResult {
-        sent: 0,
-        failed: 0,
-        skipped: 0,
-    };
-    for tweet in tweets {
-        let payload = SendMessagePayload {
-            chat_id: credentials.chat_id.clone(),
-            text: format_tweet_message(&tweet),
-            parse_mode: if config.parse_mode.is_empty() {
-                None
-            } else {
-                Some(config.parse_mode.clone())
-            },
-            disable_web_page_preview: config.disable_web_page_preview,
-        };
-        let response = client
-            .post(format!(
-                "https://api.telegram.org/bot{}/sendMessage",
-                credentials.bot_token
-            ))
-            .json(&payload)
-            .send()
-            .await;
-        match response {
-            Ok(response) => {
-                let status = response.status();
-                let body = response
-                    .json::<TelegramResponse>()
-                    .await
-                    .unwrap_or(TelegramResponse {
-                        ok: false,
-                        description: Some(format!(
-                            "invalid Telegram response with status {status}"
-                        )),
-                        result: serde_json::Value::Null,
-                    });
-                if status.is_success() && body.ok {
-                    storage::save_delivery(
-                        pool,
-                        &tweet.tweet.tweet_id,
-                        &channel,
-                        "delivered",
-                        &delivery_payload(&body),
-                        true,
-                    )
-                    .await?;
-                    result.sent += 1;
-                } else {
-                    storage::save_delivery(
-                        pool,
-                        &tweet.tweet.tweet_id,
-                        &channel,
-                        "error",
-                        &json!({"request": payload, "response": body}),
-                        false,
-                    )
-                    .await?;
-                    result.failed += 1;
-                }
-            }
-            Err(err) => {
-                storage::save_delivery(
-                    pool,
-                    &tweet.tweet.tweet_id,
-                    &channel,
-                    "error",
-                    &json!({"request": payload, "error": err.to_string()}),
-                    false,
-                )
-                .await?;
-                result.failed += 1;
-            }
-        }
-    }
-    Ok(result)
+    crate::channel::send_undelivered(
+        pool,
+        &[Box::new(TelegramChannel::from_config(config)?)],
+        limit,
+    )
+    .await
 }
 
 fn html_escape(value: &str) -> String {
