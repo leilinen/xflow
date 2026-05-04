@@ -4,11 +4,11 @@ This document tracks the next engineering work after the Rust service migration.
 
 ## 1. Real X Fetcher
 
-- Implement a real X fetcher in Rust using `reqwest`.
-- Read imported `auth_token` and `ct0` from SQLite.
+- Implemented first-pass `x_web` account timeline fetcher in Rust using `reqwest`.
+- Implemented reading imported `auth_token` and `ct0` from SQLite inside the fetcher boundary.
 - Keep cookie/header construction inside the fetcher boundary.
-- Add rate-limit handling, retry policy, and clear fetch-state errors.
 - Ensure token, cookie, and header values are never logged or passed to agent code.
+- Next: add list/search support, stronger retry policy, live endpoint drift checks, and richer rate-limit handling.
 
 ## 2. Auth Improvements
 

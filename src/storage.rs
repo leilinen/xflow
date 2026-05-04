@@ -16,6 +16,13 @@ pub struct AuthAccount {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthAccountSecret {
+    pub label: String,
+    pub auth_token: String,
+    pub ct0: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenImport {
     pub label: String,
@@ -310,6 +317,20 @@ pub async fn get_auth_account(
         .await?
         .into_iter()
         .find(|a| a.label == label))
+}
+
+pub async fn first_auth_account_secret(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<AuthAccountSecret>> {
+    let row =
+        sqlx::query("SELECT label, auth_token, ct0 FROM auth_accounts ORDER BY label LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|row| AuthAccountSecret {
+        label: row.get("label"),
+        auth_token: row.get("auth_token"),
+        ct0: row.get("ct0"),
+    }))
 }
 
 pub async fn delete_auth_account(pool: &SqlitePool, label: &str) -> anyhow::Result<bool> {
