@@ -18,7 +18,7 @@ pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<
     let sources = config.parsed_sources();
     for source in &sources {
         storage::upsert_source(pool, source).await?;
-        match fetch_source(config, source) {
+        match fetch_source(config, pool, source).await {
             Ok(tweets) => {
                 for tweet in tweets {
                     storage::upsert_tweet(pool, &tweet).await?;
