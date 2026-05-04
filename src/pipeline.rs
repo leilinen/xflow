@@ -15,9 +15,12 @@ pub struct FetchResult {
 pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<FetchResult> {
     let mut fetched = 0;
     let mut analyzed = 0;
-    let sources = config.parsed_sources();
+    let mut sources = storage::list_sources(pool, true).await?;
+    if sources.is_empty() {
+        sources = config.parsed_sources();
+        storage::ensure_config_sources(pool, &sources).await?;
+    }
     for source in &sources {
-        storage::upsert_source(pool, source).await?;
         match fetch_source(config, pool, source).await {
             Ok(tweets) => {
                 for tweet in tweets {

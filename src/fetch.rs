@@ -1,8 +1,8 @@
 use crate::config::AppConfig;
 use crate::models::{Source, SourceType, Tweet};
 use crate::storage::{self, AuthAccountSecret};
-use chrono::{DateTime, Duration, Utc};
-use reqwest::header;
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use reqwest::{header, Response};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -78,6 +78,7 @@ struct XWebFetcher {
     config: AppConfig,
     auth: AuthAccountSecret,
     client: reqwest::Client,
+    pool: SqlitePool,
     user_by_screen_name_query_id: String,
     user_tweets_query_id: String,
 }
@@ -94,6 +95,7 @@ impl XWebFetcher {
             config: config.clone(),
             auth,
             client,
+            pool: pool.clone(),
             user_by_screen_name_query_id: std::env::var("XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID")
                 .unwrap_or_else(|_| DEFAULT_USER_BY_SCREEN_NAME_QUERY_ID.to_string()),
             user_tweets_query_id: std::env::var("XFLOW_X_USER_TWEETS_QUERY_ID")
@@ -182,6 +184,7 @@ impl XWebFetcher {
         features: Value,
         field_toggles: Option<Value>,
     ) -> anyhow::Result<Value> {
+        self.ensure_rate_limit_budget(operation_name).await?;
         let url = format!("https://x.com/i/api/graphql/{query_id}/{operation_name}");
         let mut query = vec![
             ("variables", variables.to_string()),
@@ -219,19 +222,30 @@ impl XWebFetcher {
             .header("sec-fetch-site", "same-site")
             .send()
             .await?;
+        self.save_rate_limit_headers(operation_name, &response)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             match status.as_u16() {
-                401 | 403 => anyhow::bail!(
-                    "X Web auth was rejected; refresh the imported token for account '{}'",
-                    self.auth.label
-                ),
+                401 | 403 => {
+                    storage::mark_auth_rejected(&self.pool, &self.auth.label, "rejected").await?;
+                    anyhow::bail!(
+                        "X Web auth was rejected; refresh the imported token for account '{}'",
+                        self.auth.label
+                    )
+                }
                 429 => {
+                    let limited_until = rate_limit_reset_at(&response)
+                        .unwrap_or_else(|| Utc::now() + Duration::hours(1))
+                        .to_rfc3339();
+                    storage::mark_auth_limited(&self.pool, &self.auth.label, &limited_until)
+                        .await?;
                     anyhow::bail!("X Web rate limit reached for account '{}'", self.auth.label)
                 }
                 _ => anyhow::bail!("X Web request failed with status {status}"),
             }
         }
+        storage::mark_auth_used(&self.pool, &self.auth.label).await?;
         let value = response.json::<Value>().await?;
         if let Some(errors) = value.get("errors").and_then(Value::as_array) {
             if !errors.is_empty() {
@@ -249,9 +263,86 @@ impl XWebFetcher {
         Ok(value)
     }
 
+    async fn ensure_rate_limit_budget(&self, endpoint: &str) -> anyhow::Result<()> {
+        let margin = self.config.fetch.rate_limit_safety_margin.max(0);
+        if margin == 0 {
+            return Ok(());
+        }
+        let Some(limit) =
+            storage::get_auth_rate_limit(&self.pool, &self.auth.label, endpoint).await?
+        else {
+            return Ok(());
+        };
+        let Some(remaining) = limit.remaining else {
+            return Ok(());
+        };
+        if remaining > margin {
+            return Ok(());
+        }
+        let reset_at = limit
+            .reset_at
+            .as_deref()
+            .and_then(parse_rfc3339_utc)
+            .unwrap_or_else(|| Utc::now() + Duration::minutes(15));
+        if reset_at <= Utc::now() {
+            return Ok(());
+        }
+        storage::mark_auth_limited(&self.pool, &self.auth.label, &reset_at.to_rfc3339()).await?;
+        anyhow::bail!(
+            "X Web rate limit safety margin reached for account '{}' endpoint '{}' (remaining {}, reset_at {})",
+            self.auth.label,
+            endpoint,
+            remaining,
+            reset_at.to_rfc3339()
+        )
+    }
+
+    async fn save_rate_limit_headers(
+        &self,
+        endpoint: &str,
+        response: &Response,
+    ) -> anyhow::Result<()> {
+        let headers = response.headers();
+        let remaining = parse_i64_header(headers, "x-rate-limit-remaining");
+        let reset_at = rate_limit_reset_at(response).map(|dt| dt.to_rfc3339());
+        let limit_value = parse_i64_header(headers, "x-rate-limit-limit");
+        if remaining.is_some() || reset_at.is_some() || limit_value.is_some() {
+            storage::save_auth_rate_limit(
+                &self.pool,
+                &storage::AuthRateLimitUpdate {
+                    auth_label: self.auth.label.clone(),
+                    endpoint: endpoint.to_string(),
+                    remaining,
+                    reset_at,
+                    limit_value,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     fn cookie_header(&self) -> String {
         format!("auth_token={}; ct0={}", self.auth.auth_token, self.auth.ct0)
     }
+}
+
+fn parse_i64_header(headers: &header::HeaderMap, name: &str) -> Option<i64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn rate_limit_reset_at(response: &Response) -> Option<DateTime<Utc>> {
+    parse_i64_header(response.headers(), "x-rate-limit-reset")
+        .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single())
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[derive(Debug, Clone)]

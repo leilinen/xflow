@@ -23,6 +23,25 @@ pub struct AuthAccountSecret {
     pub ct0: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthRateLimitUpdate {
+    pub auth_label: String,
+    pub endpoint: String,
+    pub remaining: Option<i64>,
+    pub reset_at: Option<String>,
+    pub limit_value: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthRateLimit {
+    pub auth_label: String,
+    pub endpoint: String,
+    pub remaining: Option<i64>,
+    pub reset_at: Option<String>,
+    pub limit_value: Option<i64>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenImport {
     pub label: String,
@@ -45,19 +64,81 @@ pub struct TweetFilter {
 }
 
 pub async fn upsert_source(pool: &SqlitePool, source: &Source) -> anyhow::Result<()> {
+    upsert_source_enabled(pool, source, true).await
+}
+
+pub async fn upsert_source_enabled(
+    pool: &SqlitePool,
+    source: &Source,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO sources (source_type, value, label, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(source_type, value) DO UPDATE SET label=excluded.label
+        INSERT INTO sources (source_type, value, label, fetch_limit, enabled, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_type, value) DO UPDATE SET
+            label=excluded.label,
+            fetch_limit=excluded.fetch_limit,
+            enabled=excluded.enabled,
+            updated_at=excluded.updated_at
         "#,
     )
     .bind(source.source_type.as_str())
     .bind(&source.value)
     .bind(&source.label)
-    .bind(Utc::now().to_rfc3339())
+    .bind(source.limit)
+    .bind(i64::from(enabled))
+    .bind(&now)
+    .bind(&now)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+pub async fn disable_source(
+    pool: &SqlitePool,
+    source_type: SourceType,
+    value: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE sources
+        SET enabled = 0, updated_at = ?
+        WHERE source_type = ? AND value = ?
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(source_type.as_str())
+    .bind(value.trim_start_matches('@'))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn list_sources(pool: &SqlitePool, enabled_only: bool) -> anyhow::Result<Vec<Source>> {
+    let sql = if enabled_only {
+        "SELECT source_type, value, label, fetch_limit FROM sources WHERE enabled = 1 ORDER BY source_type, value"
+    } else {
+        "SELECT source_type, value, label, fetch_limit FROM sources ORDER BY source_type, value"
+    };
+    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(Source {
+                source_type: SourceType::try_from(row.get::<String, _>("source_type").as_str())?,
+                value: row.get("value"),
+                label: row.get("label"),
+                limit: row.get("fetch_limit"),
+            })
+        })
+        .collect()
+}
+
+pub async fn ensure_config_sources(pool: &SqlitePool, sources: &[Source]) -> anyhow::Result<()> {
+    for source in sources {
+        upsert_source(pool, source).await?;
+    }
     Ok(())
 }
 
@@ -322,14 +403,138 @@ pub async fn get_auth_account(
 pub async fn first_auth_account_secret(
     pool: &SqlitePool,
 ) -> anyhow::Result<Option<AuthAccountSecret>> {
-    let row =
-        sqlx::query("SELECT label, auth_token, ct0 FROM auth_accounts ORDER BY label LIMIT 1")
-            .fetch_optional(pool)
-            .await?;
+    let row = sqlx::query(
+        r#"
+        SELECT label, auth_token, ct0
+        FROM auth_accounts
+        WHERE status NOT IN ('rejected', 'deleted')
+          AND (limited_until IS NULL OR limited_until <= ?)
+        ORDER BY label
+        LIMIT 1
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|row| AuthAccountSecret {
         label: row.get("label"),
         auth_token: row.get("auth_token"),
         ct0: row.get("ct0"),
+    }))
+}
+
+pub async fn mark_auth_used(pool: &SqlitePool, label: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE auth_accounts
+        SET status = 'active',
+            last_used_at = ?,
+            consecutive_failures = 0,
+            updated_at = ?
+        WHERE label = ?
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(label)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_auth_rejected(
+    pool: &SqlitePool,
+    label: &str,
+    status: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE auth_accounts
+        SET status = ?,
+            consecutive_failures = consecutive_failures + 1,
+            updated_at = ?
+        WHERE label = ?
+        "#,
+    )
+    .bind(status)
+    .bind(Utc::now().to_rfc3339())
+    .bind(label)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_auth_limited(
+    pool: &SqlitePool,
+    label: &str,
+    limited_until: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE auth_accounts
+        SET status = 'limited',
+            limited_until = ?,
+            updated_at = ?
+        WHERE label = ?
+        "#,
+    )
+    .bind(limited_until)
+    .bind(Utc::now().to_rfc3339())
+    .bind(label)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn save_auth_rate_limit(
+    pool: &SqlitePool,
+    update: &AuthRateLimitUpdate,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO auth_rate_limits (auth_label, endpoint, remaining, reset_at, limit_value, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(auth_label, endpoint) DO UPDATE SET
+            remaining=excluded.remaining,
+            reset_at=excluded.reset_at,
+            limit_value=excluded.limit_value,
+            updated_at=excluded.updated_at
+        "#,
+    )
+    .bind(&update.auth_label)
+    .bind(&update.endpoint)
+    .bind(update.remaining)
+    .bind(&update.reset_at)
+    .bind(update.limit_value)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_auth_rate_limit(
+    pool: &SqlitePool,
+    auth_label: &str,
+    endpoint: &str,
+) -> anyhow::Result<Option<AuthRateLimit>> {
+    let row = sqlx::query(
+        r#"
+        SELECT auth_label, endpoint, remaining, reset_at, limit_value, updated_at
+        FROM auth_rate_limits
+        WHERE auth_label = ? AND endpoint = ?
+        "#,
+    )
+    .bind(auth_label)
+    .bind(endpoint)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| AuthRateLimit {
+        auth_label: row.get("auth_label"),
+        endpoint: row.get("endpoint"),
+        remaining: row.get("remaining"),
+        reset_at: row.get("reset_at"),
+        limit_value: row.get("limit_value"),
+        updated_at: row.get("updated_at"),
     }))
 }
 

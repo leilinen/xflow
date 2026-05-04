@@ -13,9 +13,23 @@ CREATE TABLE IF NOT EXISTS auth_accounts (
     auth_token TEXT NOT NULL,
     ct0 TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'unknown',
+    limited_until TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
     exported_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_rate_limits (
+    auth_label TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    remaining INTEGER,
+    reset_at TEXT,
+    limit_value INTEGER,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(auth_label, endpoint),
+    FOREIGN KEY(auth_label) REFERENCES auth_accounts(label) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -23,7 +37,10 @@ CREATE TABLE IF NOT EXISTS sources (
     source_type TEXT NOT NULL,
     value TEXT NOT NULL,
     label TEXT,
+    fetch_limit INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     UNIQUE(source_type, value)
 );
 
@@ -94,6 +111,65 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
         if !statement.is_empty() {
             sqlx::query(statement).execute(pool).await?;
         }
+    }
+    migrate_sources(pool).await?;
+    migrate_auth_accounts(pool).await?;
+    Ok(())
+}
+
+async fn table_columns(pool: &SqlitePool, table: &str) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| sqlx::Row::get::<String, _>(row, "name"))
+        .collect())
+}
+
+async fn migrate_sources(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = table_columns(pool, "sources").await?;
+    let has_column = |name: &str| columns.iter().any(|column| column == name);
+    if !has_column("fetch_limit") {
+        sqlx::query("ALTER TABLE sources ADD COLUMN fetch_limit INTEGER")
+            .execute(pool)
+            .await?;
+    }
+    if !has_column("enabled") {
+        sqlx::query("ALTER TABLE sources ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            .execute(pool)
+            .await?;
+    }
+    if !has_column("updated_at") {
+        sqlx::query("ALTER TABLE sources ADD COLUMN updated_at TEXT")
+            .execute(pool)
+            .await?;
+        sqlx::query("UPDATE sources SET updated_at = created_at WHERE updated_at IS NULL")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn migrate_auth_accounts(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = table_columns(pool, "auth_accounts").await?;
+    let has_column = |name: &str| columns.iter().any(|column| column == name);
+    if !has_column("limited_until") {
+        sqlx::query("ALTER TABLE auth_accounts ADD COLUMN limited_until TEXT")
+            .execute(pool)
+            .await?;
+    }
+    if !has_column("consecutive_failures") {
+        sqlx::query(
+            "ALTER TABLE auth_accounts ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await?;
+    }
+    if !has_column("last_used_at") {
+        sqlx::query("ALTER TABLE auth_accounts ADD COLUMN last_used_at TEXT")
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }

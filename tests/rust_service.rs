@@ -96,6 +96,121 @@ async fn auth_import_list_check_delete() {
 }
 
 #[tokio::test]
+async fn auth_selection_skips_rejected_and_limited_accounts() {
+    let (_dir, pool) = test_pool().await;
+    let token = TokenImport {
+        label: "account1".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "abcd1234efgh".to_string(),
+        ct0: "ct0value123".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token).await.unwrap();
+    assert!(storage::first_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .is_some());
+
+    storage::mark_auth_rejected(&pool, "account1", "rejected")
+        .await
+        .unwrap();
+    assert!(storage::first_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .is_none());
+
+    storage::import_auth_account(&pool, &token).await.unwrap();
+    storage::mark_auth_limited(&pool, "account1", "2999-01-01T00:00:00+00:00")
+        .await
+        .unwrap();
+    assert!(storage::first_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn auth_rate_limit_updates_are_upserted() {
+    let (_dir, pool) = test_pool().await;
+    let token = TokenImport {
+        label: "account1".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "abcd1234efgh".to_string(),
+        ct0: "ct0value123".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token).await.unwrap();
+    storage::save_auth_rate_limit(
+        &pool,
+        &storage::AuthRateLimitUpdate {
+            auth_label: "account1".to_string(),
+            endpoint: "UserTweets".to_string(),
+            remaining: Some(10),
+            reset_at: Some("2026-05-04T08:00:00+00:00".to_string()),
+            limit_value: Some(50),
+        },
+    )
+    .await
+    .unwrap();
+    storage::save_auth_rate_limit(
+        &pool,
+        &storage::AuthRateLimitUpdate {
+            auth_label: "account1".to_string(),
+            endpoint: "UserTweets".to_string(),
+            remaining: Some(9),
+            reset_at: Some("2026-05-04T08:00:00+00:00".to_string()),
+            limit_value: Some(50),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn x_web_fetcher_stops_before_rate_limit_margin() {
+    let (_dir, pool) = test_pool().await;
+    let token = TokenImport {
+        label: "account1".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "abcd1234efgh".to_string(),
+        ct0: "ct0value123".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token).await.unwrap();
+    storage::save_auth_rate_limit(
+        &pool,
+        &storage::AuthRateLimitUpdate {
+            auth_label: "account1".to_string(),
+            endpoint: "UserByScreenName".to_string(),
+            remaining: Some(1),
+            reset_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            limit_value: Some(150),
+        },
+    )
+    .await
+    .unwrap();
+    let mut config = AppConfig::default();
+    config.fetch.fetcher = "x_web".to_string();
+    config.fetch.rate_limit_safety_margin = 10;
+    let source = Source {
+        source_type: SourceType::Account,
+        value: "openai".to_string(),
+        label: None,
+        limit: Some(1),
+    };
+
+    let err = xflow::fetch::fetch_source(&config, &pool, &source)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("safety margin"));
+    assert!(storage::first_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn auth_import_rejects_malformed_token_json() {
     let (dir, pool) = test_pool().await;
     let path = dir.path().join("bad-token.json");
@@ -124,6 +239,53 @@ async fn fetch_dedupes_and_generates_digest() {
     assert_eq!(tweets.len() as i64, first.fetched);
     let markdown = digest::generate_digest(&pool, 0.1).await.unwrap();
     assert!(markdown.starts_with("# xFlow Digest"));
+}
+
+#[tokio::test]
+async fn fetch_seeds_sources_from_config_once() {
+    let (_dir, pool) = test_pool().await;
+    let config = AppConfig::default();
+    assert!(storage::list_sources(&pool, true).await.unwrap().is_empty());
+
+    let result = pipeline::run_fetch(&config, &pool).await.unwrap();
+    let sources = storage::list_sources(&pool, true).await.unwrap();
+
+    assert_eq!(result.sources, 3);
+    assert_eq!(sources.len(), 3);
+}
+
+#[tokio::test]
+async fn fetch_uses_enabled_database_sources() {
+    let (_dir, pool) = test_pool().await;
+    let config = AppConfig::default();
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::Account,
+            value: "custom".to_string(),
+            label: Some("Custom".to_string()),
+            limit: Some(2),
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = pipeline::run_fetch(&config, &pool).await.unwrap();
+    let tweets = storage::list_tweets(
+        &pool,
+        TweetFilter {
+            limit: 500,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.sources, 1);
+    assert_eq!(result.fetched, 2);
+    assert!(tweets
+        .iter()
+        .all(|stored| stored.tweet.source_value == "custom"));
 }
 
 #[tokio::test]
