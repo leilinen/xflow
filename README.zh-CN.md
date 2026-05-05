@@ -132,8 +132,17 @@ Fetched 5 tweets from 1 sources; analyzed 5.
 可以用环境变量覆盖 GraphQL query id：
 
 ```bash
+export XFLOW_X_WEB_BEARER_TOKEN=...
 export XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID=...
 export XFLOW_X_USER_TWEETS_QUERY_ID=...
+```
+
+为了降低连续请求特征，可以配置账号之间的抓取延迟：
+
+```yaml
+fetch:
+  source_delay_min_seconds: 5
+  source_delay_max_seconds: 20
 ```
 
 ## 访问 RSS/JSON

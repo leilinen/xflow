@@ -37,6 +37,8 @@ pub struct FetchConfig {
     pub default_limit: i64,
     pub fetcher: String,
     pub rate_limit_safety_margin: i64,
+    pub source_delay_min_seconds: u64,
+    pub source_delay_max_seconds: u64,
 }
 
 impl Default for FetchConfig {
@@ -46,6 +48,8 @@ impl Default for FetchConfig {
             default_limit: 20,
             fetcher: "mock".to_string(),
             rate_limit_safety_margin: 10,
+            source_delay_min_seconds: 0,
+            source_delay_max_seconds: 0,
         }
     }
 }

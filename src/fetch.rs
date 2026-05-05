@@ -79,6 +79,7 @@ struct XWebFetcher {
     auth: AuthAccountSecret,
     client: reqwest::Client,
     pool: SqlitePool,
+    bearer_token: String,
     user_by_screen_name_query_id: String,
     user_tweets_query_id: String,
 }
@@ -96,6 +97,8 @@ impl XWebFetcher {
             auth,
             client,
             pool: pool.clone(),
+            bearer_token: std::env::var("XFLOW_X_WEB_BEARER_TOKEN")
+                .unwrap_or_else(|_| X_WEB_BEARER_TOKEN.to_string()),
             user_by_screen_name_query_id: std::env::var("XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID")
                 .unwrap_or_else(|_| DEFAULT_USER_BY_SCREEN_NAME_QUERY_ID.to_string()),
             user_tweets_query_id: std::env::var("XFLOW_X_USER_TWEETS_QUERY_ID")
@@ -199,7 +202,7 @@ impl XWebFetcher {
             .query(&query)
             .header(
                 header::AUTHORIZATION,
-                format!("Bearer {X_WEB_BEARER_TOKEN}"),
+                format!("Bearer {}", self.bearer_token),
             )
             .header(header::COOKIE, self.cookie_header())
             .header("x-csrf-token", self.auth.ct0.as_str())
