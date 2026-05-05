@@ -4,6 +4,7 @@ use crate::fetch::fetch_source;
 use crate::storage;
 use serde::Serialize;
 use sqlx::SqlitePool;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FetchResult {
@@ -20,7 +21,10 @@ pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<
         sources = config.parsed_sources();
         storage::ensure_config_sources(pool, &sources).await?;
     }
-    for source in &sources {
+    for (index, source) in sources.iter().enumerate() {
+        if index > 0 {
+            delay_between_sources(config).await;
+        }
         match fetch_source(config, pool, source).await {
             Ok(tweets) => {
                 for tweet in tweets {
@@ -51,4 +55,20 @@ pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<
         analyzed,
         sources: sources.len() as i64,
     })
+}
+
+async fn delay_between_sources(config: &AppConfig) {
+    if config.fetch.fetcher != "x_web" {
+        return;
+    }
+    let min = config.fetch.source_delay_min_seconds;
+    let max = config.fetch.source_delay_max_seconds;
+    let delay = if max > min {
+        min + ((max - min) / 2)
+    } else {
+        min
+    };
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
 }

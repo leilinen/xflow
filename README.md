@@ -177,8 +177,17 @@ Fetched 5 tweets from 1 sources; analyzed 5.
 X Web internals can change. The fetcher uses browser-compatible headers, the `x.com/i/api/graphql` endpoint, and current defaults based on the public web client behavior. GraphQL query ids can be overridden without rebuilding:
 
 ```bash
+export XFLOW_X_WEB_BEARER_TOKEN=...
 export XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID=...
 export XFLOW_X_USER_TWEETS_QUERY_ID=...
+```
+
+For conservative scheduling, configure a delay between account sources:
+
+```yaml
+fetch:
+  source_delay_min_seconds: 5
+  source_delay_max_seconds: 20
 ```
 
 If X returns `Could not authenticate you`, refresh `auth_token` and `ct0` from the same logged-in browser session. If X returns GraphQL errors after authentication succeeds, the query ids or response shape may need updating.
