@@ -330,7 +330,15 @@ pub async fn save_delivery(
     let now = Utc::now().to_rfc3339();
     let delivered_at = if delivered { Some(now.clone()) } else { None };
     sqlx::query(
-        "INSERT INTO deliveries (tweet_id, channel, status, payload_json, created_at, delivered_at) VALUES (?, ?, ?, ?, ?, ?)",
+        r#"
+        INSERT INTO deliveries (tweet_id, channel, status, payload_json, created_at, delivered_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tweet_id, channel) DO UPDATE SET
+            status=excluded.status,
+            payload_json=excluded.payload_json,
+            created_at=excluded.created_at,
+            delivered_at=excluded.delivered_at
+        "#,
     )
     .bind(tweet_id)
     .bind(channel)

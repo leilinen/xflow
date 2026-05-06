@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     delivered_at TEXT,
-    FOREIGN KEY(tweet_id) REFERENCES tweets(tweet_id) ON DELETE SET NULL
+    FOREIGN KEY(tweet_id) REFERENCES tweets(tweet_id) ON DELETE SET NULL,
+    UNIQUE(tweet_id, channel)
 );
 "#;
 
@@ -114,6 +115,7 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
     }
     migrate_sources(pool).await?;
     migrate_auth_accounts(pool).await?;
+    migrate_deliveries(pool).await?;
     Ok(())
 }
 
@@ -171,5 +173,70 @@ async fn migrate_auth_accounts(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+async fn has_unique_on_deliveries(pool: &SqlitePool) -> anyhow::Result<bool> {
+    let rows = sqlx::query("PRAGMA index_list(deliveries)")
+        .fetch_all(pool)
+        .await?;
+    for row in &rows {
+        let unique: i64 = sqlx::Row::get(row, "unique");
+        if unique == 1 {
+            let idx_name: String = sqlx::Row::get(row, "name");
+            let cols = sqlx::query(&format!("PRAGMA index_info({idx_name})"))
+                .fetch_all(pool)
+                .await?;
+            let col_names: Vec<String> = cols
+                .iter()
+                .map(|r| sqlx::Row::get::<String, _>(r, "name"))
+                .collect();
+            if col_names.len() == 2
+                && col_names.contains(&"tweet_id".to_string())
+                && col_names.contains(&"channel".to_string())
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn migrate_deliveries(pool: &SqlitePool) -> anyhow::Result<()> {
+    if has_unique_on_deliveries(pool).await? {
+        return Ok(());
+    }
+    tracing::info!("migrating deliveries: adding UNIQUE(tweet_id, channel)");
+    sqlx::query(
+        r#"
+        CREATE TABLE deliveries_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tweet_id TEXT,
+            channel TEXT NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            delivered_at TEXT,
+            FOREIGN KEY(tweet_id) REFERENCES tweets(tweet_id) ON DELETE SET NULL,
+            UNIQUE(tweet_id, channel)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO deliveries_new (id, tweet_id, channel, status, payload_json, created_at, delivered_at)
+        SELECT id, tweet_id, channel, status, payload_json, created_at, delivered_at
+        FROM deliveries
+        ORDER BY id
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("DROP TABLE deliveries").execute(pool).await?;
+    sqlx::query("ALTER TABLE deliveries_new RENAME TO deliveries")
+        .execute(pool)
+        .await?;
     Ok(())
 }
