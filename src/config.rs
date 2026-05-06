@@ -36,8 +36,11 @@ pub struct FetchConfig {
     pub interval_seconds: u64,
     pub default_limit: i64,
     pub fetcher: String,
+    #[serde(default = "default_rate_limit_safety_margin")]
     pub rate_limit_safety_margin: i64,
+    #[serde(default)]
     pub source_delay_min_seconds: u64,
+    #[serde(default)]
     pub source_delay_max_seconds: u64,
 }
 
@@ -171,6 +174,10 @@ impl Default for AppConfig {
             telegram: TelegramConfig::default(),
         }
     }
+}
+
+fn default_rate_limit_safety_margin() -> i64 {
+    10
 }
 
 fn default_keywords() -> Vec<String> {
