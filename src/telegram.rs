@@ -142,6 +142,13 @@ async fn set_bot_commands_to(
 
 const TELEGRAM_MESSAGE_LIMIT: usize = 4096;
 const TRUNCATION_MARKER: &str = "\n\n…";
+const MAX_RETRIES: u32 = 2;
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+enum TelegramSendError {
+    Transient(anyhow::Error),
+    Permanent(anyhow::Error),
+}
 
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
     let mut parts = vec![
@@ -215,34 +222,82 @@ impl DeliveryChannel for TelegramChannel {
                 },
                 disable_web_page_preview: self.disable_web_page_preview,
             };
-            let response = self
-                .client
-                .post(telegram_api_url(&self.credentials.bot_token, "sendMessage"))
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("Telegram API request failed for sendMessage"))?;
-            let status = response.status();
-            let body = response
-                .json::<TelegramApiResponse<serde_json::Value>>()
-                .await
-                .unwrap_or(TelegramApiResponse {
-                    ok: false,
-                    description: Some(format!("invalid Telegram response with status {status}")),
-                    result: None,
-                });
-            if status.is_success() && body.ok {
-                Ok(ChannelSendReceipt {
-                    payload: serde_json::to_value(body)?,
-                })
-            } else {
-                anyhow::bail!(
-                    "{}",
-                    serde_json::json!({"request": payload, "response": body})
-                )
+            let mut last_err = None;
+            for attempt in 0..=MAX_RETRIES {
+                if attempt > 0 {
+                    tokio::time::sleep(RETRY_DELAY * attempt).await;
+                }
+                match self.try_send(&payload).await {
+                    Ok(receipt) => return Ok(receipt),
+                    Err(TelegramSendError::Transient(err)) => {
+                        tracing::warn!(
+                            attempt,
+                            tweet_id = %tweet.tweet.tweet_id,
+                            "Telegram transient error, will retry: {err}"
+                        );
+                        last_err = Some(err);
+                    }
+                    Err(TelegramSendError::Permanent(err)) => return Err(err),
+                }
             }
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
         })
     }
+}
+
+impl TelegramChannel {
+    async fn try_send(
+        &self,
+        payload: &SendMessagePayload,
+    ) -> Result<ChannelSendReceipt, TelegramSendError> {
+        let response = self
+            .client
+            .post(telegram_api_url(&self.credentials.bot_token, "sendMessage"))
+            .json(payload)
+            .send()
+            .await;
+        let response = match response {
+            Ok(r) => r,
+            Err(err) if is_transient_reqwest_error(&err) => {
+                return Err(TelegramSendError::Transient(anyhow::anyhow!(
+                    "Telegram connection error: {err}"
+                )))
+            }
+            Err(err) => {
+                return Err(TelegramSendError::Permanent(anyhow::anyhow!(
+                    "Telegram request failed: {err}"
+                )))
+            }
+        };
+        let status = response.status();
+        if status.is_server_error() || status.as_u16() == 429 {
+            return Err(TelegramSendError::Transient(anyhow::anyhow!(
+                "Telegram returned HTTP {status}"
+            )));
+        }
+        let body = response
+            .json::<TelegramApiResponse<serde_json::Value>>()
+            .await
+            .unwrap_or(TelegramApiResponse {
+                ok: false,
+                description: Some(format!("invalid Telegram response with status {status}")),
+                result: None,
+            });
+        if status.is_success() && body.ok {
+            Ok(ChannelSendReceipt {
+                payload: serde_json::to_value(body).unwrap_or_default(),
+            })
+        } else {
+            Err(TelegramSendError::Permanent(anyhow::anyhow!(
+                "{}",
+                serde_json::json!({"request": payload, "response": body})
+            )))
+        }
+    }
+}
+
+fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_request()
 }
 
 pub async fn send_undelivered(
