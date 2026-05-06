@@ -13,6 +13,9 @@ pub struct WorkerOnceResult {
 
 pub async fn run_once(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<WorkerOnceResult> {
     let fetch = pipeline::run_fetch(config, pool).await?;
+    if fetch.failed > 0 {
+        tracing::warn!(?fetch.errors, "fetch completed with source failures");
+    }
     let channels = channel::configured_channels(config)?;
     let telegram = channel::send_undelivered(pool, &channels, 100).await?;
     Ok(WorkerOnceResult { fetch, telegram })

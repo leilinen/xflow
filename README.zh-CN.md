@@ -173,7 +173,14 @@ cargo run -- serve
 cargo run -- worker
 cargo run -- digest --output digest.md
 cargo run -- telegram send
+cargo run -- telegram commands set
+cargo run -- telegram commands list
+cargo run -- telegram commands clear
 ```
+
+生产环境首次部署或 Telegram 菜单变更后，运行一次
+`cargo run -- telegram commands set` 注册 bot 对话里的 slash command 菜单。正常
+`worker` 启动不会重复注册菜单。
 
 鉴权命令：
 

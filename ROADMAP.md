@@ -27,8 +27,11 @@ This document tracks the next engineering work after the Rust service migration.
 ## 4. Telegram Integration
 
 - Test `xflow telegram send` against a real bot and channel.
+- Register Telegram slash command menus with `xflow telegram commands set` during production setup.
+- MVP scope: command menus are display-only; do not handle inbound Telegram commands yet.
 - Add retry behavior for transient Telegram API failures.
 - Add message length truncation for Telegram limits.
+- Post-MVP: add a Telegram command handler for `/status`, `/latest`, and `/digest` via polling or webhook.
 - Consider configurable message templates after the basic integration is stable.
 
 ## 5. API Enhancements

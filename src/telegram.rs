@@ -4,6 +4,7 @@ use crate::channel::{
 use crate::config::TelegramConfig;
 use crate::models::StoredTweet;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -28,15 +29,22 @@ struct SendMessagePayload {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct TelegramResponse {
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct TelegramApiResponse<T> {
     ok: bool,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    result: serde_json::Value,
+    result: Option<T>,
 }
 
 pub type TelegramResult = ChannelDeliveryResult;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TelegramBotCommand {
+    pub command: String,
+    pub description: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct TelegramChannel {
@@ -60,15 +68,76 @@ impl TelegramChannel {
 }
 
 pub fn load_credentials(config: &TelegramConfig) -> anyhow::Result<TelegramCredentials> {
+    let bot_token = load_bot_token(config)?;
+    let chat_id = std::env::var(&config.chat_id_env)
+        .map_err(|_| anyhow::anyhow!("missing Telegram chat id env var: {}", config.chat_id_env))?;
+    Ok(TelegramCredentials { bot_token, chat_id })
+}
+
+pub fn load_bot_token(config: &TelegramConfig) -> anyhow::Result<String> {
     let bot_token = std::env::var(&config.bot_token_env).map_err(|_| {
         anyhow::anyhow!(
             "missing Telegram bot token env var: {}",
             config.bot_token_env
         )
     })?;
-    let chat_id = std::env::var(&config.chat_id_env)
-        .map_err(|_| anyhow::anyhow!("missing Telegram chat id env var: {}", config.chat_id_env))?;
-    Ok(TelegramCredentials { bot_token, chat_id })
+    Ok(bot_token)
+}
+
+pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
+    vec![
+        TelegramBotCommand {
+            command: "help".to_string(),
+            description: "Show available xFlow commands".to_string(),
+        },
+        TelegramBotCommand {
+            command: "status".to_string(),
+            description: "Show xFlow status".to_string(),
+        },
+        TelegramBotCommand {
+            command: "latest".to_string(),
+            description: "Show latest cached items".to_string(),
+        },
+        TelegramBotCommand {
+            command: "digest".to_string(),
+            description: "Generate latest digest".to_string(),
+        },
+    ]
+}
+
+pub async fn set_bot_commands(config: &TelegramConfig) -> anyhow::Result<Vec<TelegramBotCommand>> {
+    let commands = default_bot_commands();
+    set_bot_commands_to(config, commands.clone()).await?;
+    Ok(commands)
+}
+
+pub async fn clear_bot_commands(config: &TelegramConfig) -> anyhow::Result<()> {
+    set_bot_commands_to(config, Vec::new()).await
+}
+
+pub async fn list_bot_commands(config: &TelegramConfig) -> anyhow::Result<Vec<TelegramBotCommand>> {
+    let bot_token = load_bot_token(config)?;
+    get_telegram_json::<Vec<TelegramBotCommand>>(&Client::new(), &bot_token, "getMyCommands").await
+}
+
+async fn set_bot_commands_to(
+    config: &TelegramConfig,
+    commands: Vec<TelegramBotCommand>,
+) -> anyhow::Result<()> {
+    #[derive(Debug, Serialize)]
+    struct SetMyCommandsPayload {
+        commands: Vec<TelegramBotCommand>,
+    }
+
+    let bot_token = load_bot_token(config)?;
+    post_telegram_json::<_, bool>(
+        &Client::new(),
+        &bot_token,
+        "setMyCommands",
+        &SetMyCommandsPayload { commands },
+    )
+    .await?;
+    Ok(())
 }
 
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
@@ -114,21 +183,19 @@ impl DeliveryChannel for TelegramChannel {
             };
             let response = self
                 .client
-                .post(format!(
-                    "https://api.telegram.org/bot{}/sendMessage",
-                    self.credentials.bot_token
-                ))
+                .post(telegram_api_url(&self.credentials.bot_token, "sendMessage"))
                 .json(&payload)
                 .send()
-                .await?;
+                .await
+                .map_err(|_| anyhow::anyhow!("Telegram API request failed for sendMessage"))?;
             let status = response.status();
             let body = response
-                .json::<TelegramResponse>()
+                .json::<TelegramApiResponse<serde_json::Value>>()
                 .await
-                .unwrap_or(TelegramResponse {
+                .unwrap_or(TelegramApiResponse {
                     ok: false,
                     description: Some(format!("invalid Telegram response with status {status}")),
-                    result: serde_json::Value::Null,
+                    result: None,
                 });
             if status.is_success() && body.ok {
                 Ok(ChannelSendReceipt {
@@ -172,6 +239,61 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+async fn get_telegram_json<T: DeserializeOwned>(
+    client: &Client,
+    bot_token: &str,
+    method: &str,
+) -> anyhow::Result<T> {
+    let response = client
+        .get(telegram_api_url(bot_token, method))
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("Telegram API request failed for {method}"))?;
+    parse_telegram_response(response, method).await
+}
+
+async fn post_telegram_json<TBody: Serialize + ?Sized, TResponse: DeserializeOwned>(
+    client: &Client,
+    bot_token: &str,
+    method: &str,
+    payload: &TBody,
+) -> anyhow::Result<TResponse> {
+    let response = client
+        .post(telegram_api_url(bot_token, method))
+        .json(payload)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("Telegram API request failed for {method}"))?;
+    parse_telegram_response(response, method).await
+}
+
+async fn parse_telegram_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    method: &str,
+) -> anyhow::Result<T> {
+    let status = response.status();
+    let body = response
+        .json::<TelegramApiResponse<T>>()
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("invalid Telegram response for {method} with status {status}")
+        })?;
+    if status.is_success() && body.ok {
+        return body
+            .result
+            .ok_or_else(|| anyhow::anyhow!("missing Telegram result for {method}"));
+    }
+    anyhow::bail!(
+        "Telegram API {method} failed: {}",
+        body.description
+            .unwrap_or_else(|| format!("HTTP status {status}"))
+    )
+}
+
+fn telegram_api_url(bot_token: &str, method: &str) -> String {
+    format!("https://api.telegram.org/bot{bot_token}/{method}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +321,20 @@ mod tests {
         let message = format_tweet_message(&stored);
         assert!(message.contains("AI &lt;agent&gt; &amp; update"));
         assert!(message.contains("x=1&amp;y=2"));
+    }
+
+    #[test]
+    fn default_bot_commands_match_supported_menu() {
+        let commands = default_bot_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["help", "status", "latest", "digest"]
+        );
+        assert!(commands
+            .iter()
+            .all(|command| !command.description.trim().is_empty()));
     }
 }

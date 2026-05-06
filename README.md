@@ -235,9 +235,15 @@ xflow serve
 xflow worker
 xflow digest --output digest.md
 xflow telegram send
+xflow telegram commands set
+xflow telegram commands list
+xflow telegram commands clear
 ```
 
 `xflow worker` runs fetch plus Telegram delivery every `fetch.interval_seconds`.
+Run `xflow telegram commands set` once during production setup, or whenever the
+bot command menu changes. It registers the Telegram slash command menu only; the
+worker does not repeat command registration on every start.
 
 ## Docker Compose
 
