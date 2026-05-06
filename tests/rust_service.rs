@@ -9,6 +9,7 @@ use xflow::models::{Source, SourceType, StoredTweet, Tweet};
 use xflow::pipeline;
 use xflow::rss_feed;
 use xflow::storage::{self, TokenImport, TweetFilter};
+use xflow::worker;
 
 async fn test_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
     let dir = tempdir().unwrap();
@@ -226,7 +227,10 @@ async fn fetch_dedupes_and_generates_digest() {
     let first = pipeline::run_fetch(&config, &pool).await.unwrap();
     let second = pipeline::run_fetch(&config, &pool).await.unwrap();
     assert_eq!(first.sources, 3);
+    assert_eq!(first.failed, 0);
+    assert!(first.errors.is_empty());
     assert_eq!(second.fetched, first.fetched);
+    assert_eq!(second.failed, 0);
     let tweets = storage::list_tweets(
         &pool,
         TweetFilter {
@@ -251,6 +255,7 @@ async fn fetch_seeds_sources_from_config_once() {
     let sources = storage::list_sources(&pool, true).await.unwrap();
 
     assert_eq!(result.sources, 3);
+    assert_eq!(result.failed, 0);
     assert_eq!(sources.len(), 3);
 }
 
@@ -283,9 +288,142 @@ async fn fetch_uses_enabled_database_sources() {
 
     assert_eq!(result.sources, 1);
     assert_eq!(result.fetched, 2);
+    assert_eq!(result.failed, 0);
     assert!(tweets
         .iter()
         .all(|stored| stored.tweet.source_value == "custom"));
+}
+
+#[tokio::test]
+async fn fetch_continues_after_source_failures() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::List,
+            value: "list-a".to_string(),
+            label: None,
+            limit: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::Search,
+            value: "AI agent".to_string(),
+            label: None,
+            limit: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    let mut config = AppConfig::default();
+    config.fetch.fetcher = "x_web".to_string();
+    let token = TokenImport {
+        label: "account1".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "abcd1234efgh".to_string(),
+        ct0: "ct0value123".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token).await.unwrap();
+
+    let result = pipeline::run_fetch(&config, &pool).await.unwrap();
+
+    assert_eq!(result.sources, 2);
+    assert_eq!(result.failed, 2);
+    assert_eq!(result.errors.len(), 2);
+    assert!(result
+        .errors
+        .iter()
+        .all(|error| error.message.contains("supports only account sources")));
+    let error_states: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM fetch_state WHERE last_status = 'error'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(error_states, 2);
+}
+
+#[tokio::test]
+async fn fetch_state_reports_per_source_count() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::Account,
+            value: "source-a".to_string(),
+            label: None,
+            limit: Some(2),
+        },
+    )
+    .await
+    .unwrap();
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::Search,
+            value: "source b".to_string(),
+            label: None,
+            limit: Some(3),
+        },
+    )
+    .await
+    .unwrap();
+    let config = AppConfig::default();
+
+    let result = pipeline::run_fetch(&config, &pool).await.unwrap();
+
+    assert_eq!(result.fetched, 5);
+    assert_eq!(result.failed, 0);
+    let mut messages: Vec<String> =
+        sqlx::query_scalar("SELECT message FROM fetch_state WHERE last_status = 'ok'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    messages.sort();
+    assert_eq!(
+        messages,
+        vec![
+            "Fetched 2 tweets.".to_string(),
+            "Fetched 3 tweets.".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn worker_returns_result_after_source_fetch_failure() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::Search,
+            value: "AI agent".to_string(),
+            label: None,
+            limit: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    let mut config = AppConfig::default();
+    config.fetch.fetcher = "x_web".to_string();
+    config.telegram.enabled = false;
+    let token = TokenImport {
+        label: "account1".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "abcd1234efgh".to_string(),
+        ct0: "ct0value123".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token).await.unwrap();
+
+    let result = worker::run_once(&config, &pool).await.unwrap();
+
+    assert_eq!(result.fetch.failed, 1);
+    assert_eq!(result.telegram.sent, 0);
+    assert_eq!(result.telegram.failed, 0);
 }
 
 #[tokio::test]
@@ -455,4 +593,111 @@ async fn channel_delivery_records_prevent_duplicate_sends() {
     assert_eq!(first.failed, 0);
     assert_eq!(second.sent, 0);
     assert_eq!(second.failed, 0);
+}
+
+#[tokio::test]
+async fn save_delivery_upsert_deduplicates() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_tweet(
+        &pool,
+        &Tweet {
+            tweet_id: "dup-1".to_string(),
+            source_type: SourceType::Account,
+            source_value: "openai".to_string(),
+            author_username: "OpenAI".to_string(),
+            author_name: "OpenAI".to_string(),
+            text: "test".to_string(),
+            url: "https://x.com/openai/status/dup-1".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Utc::now(),
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let channel = "telegram:123";
+    storage::save_delivery(
+        &pool,
+        "dup-1",
+        channel,
+        "error",
+        &serde_json::json!({"error": "timeout"}),
+        false,
+    )
+    .await
+    .unwrap();
+    storage::save_delivery(
+        &pool,
+        "dup-1",
+        channel,
+        "delivered",
+        &serde_json::json!({"ok": true}),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE tweet_id = 'dup-1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM deliveries WHERE tweet_id = 'dup-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "delivered");
+}
+
+#[tokio::test]
+async fn deliveries_unique_constraint_allows_different_channels() {
+    let (_dir, pool) = test_pool().await;
+    storage::upsert_tweet(
+        &pool,
+        &Tweet {
+            tweet_id: "multi-1".to_string(),
+            source_type: SourceType::Account,
+            source_value: "openai".to_string(),
+            author_username: "OpenAI".to_string(),
+            author_name: "OpenAI".to_string(),
+            text: "test".to_string(),
+            url: "https://x.com/openai/status/multi-1".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Utc::now(),
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    storage::save_delivery(
+        &pool,
+        "multi-1",
+        "telegram:111",
+        "delivered",
+        &serde_json::json!({}),
+        true,
+    )
+    .await
+    .unwrap();
+    storage::save_delivery(
+        &pool,
+        "multi-1",
+        "telegram:222",
+        "delivered",
+        &serde_json::json!({}),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE tweet_id = 'multi-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
 }
