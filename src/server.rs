@@ -40,8 +40,16 @@ pub async fn serve(config: AppConfig, pool: SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok();
+    if db_ok {
+        Json(json!({"status": "ok", "db": "ok"}))
+    } else {
+        Json(json!({"status": "degraded", "db": "error"}))
+    }
 }
 
 async fn json_all(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {

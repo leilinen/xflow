@@ -73,6 +73,7 @@ pub async fn upsert_source_enabled(
     enabled: bool,
 ) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
+    let value = source.value.trim_start_matches('@');
     sqlx::query(
         r#"
         INSERT INTO sources (source_type, value, label, fetch_limit, enabled, created_at, updated_at)
@@ -85,7 +86,7 @@ pub async fn upsert_source_enabled(
         "#,
     )
     .bind(source.source_type.as_str())
-    .bind(&source.value)
+    .bind(value)
     .bind(&source.label)
     .bind(source.limit)
     .bind(i64::from(enabled))
@@ -402,10 +403,21 @@ pub async fn get_auth_account(
     pool: &SqlitePool,
     label: &str,
 ) -> anyhow::Result<Option<AuthAccount>> {
-    Ok(list_auth_accounts(pool)
-        .await?
-        .into_iter()
-        .find(|a| a.label == label))
+    let row = sqlx::query(
+        "SELECT label, domain, auth_token, ct0, status, exported_at, updated_at FROM auth_accounts WHERE label = ?",
+    )
+    .bind(label)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| AuthAccount {
+        label: row.get("label"),
+        domain: row.get("domain"),
+        auth_token_masked: mask_token(row.get::<String, _>("auth_token").as_str()),
+        ct0_masked: mask_token(row.get::<String, _>("ct0").as_str()),
+        status: row.get("status"),
+        exported_at: row.get("exported_at"),
+        updated_at: row.get("updated_at"),
+    }))
 }
 
 pub async fn first_auth_account_secret(

@@ -103,6 +103,8 @@ struct AuthLabelArgs {
     config: PathBuf,
     #[arg(long)]
     label: String,
+    #[arg(long)]
+    live: bool,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -287,12 +289,25 @@ async fn auth_command(command: AuthCommand) -> anyhow::Result<()> {
             Ok(())
         }
         AuthCommand::Check(args) => {
-            let (_config, pool) = configured_pool(&args.config).await?;
+            let (config, pool) = configured_pool(&args.config).await?;
             let account = auth::check_account(&pool, &args.label).await?;
-            println!(
-                "{}: {} - stored token shape looks present",
-                account.label, account.status
-            );
+            if args.live {
+                let result = auth::check_account_live(&pool, &config).await?;
+                let status_msg = if result.ok {
+                    "ok".to_string()
+                } else {
+                    result.error.unwrap_or_else(|| "unknown error".to_string())
+                };
+                println!(
+                    "{}: {} - live check: {status_msg}",
+                    account.label, account.status,
+                );
+            } else {
+                println!(
+                    "{}: {} - stored token shape looks present",
+                    account.label, account.status
+                );
+            }
             println!(
                 "auth_token={} ct0={}",
                 account.auth_token_masked, account.ct0_masked
