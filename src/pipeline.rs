@@ -11,11 +11,21 @@ pub struct FetchResult {
     pub fetched: i64,
     pub analyzed: i64,
     pub sources: i64,
+    pub failed: i64,
+    pub errors: Vec<FetchSourceError>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FetchSourceError {
+    pub source_type: String,
+    pub source_value: String,
+    pub message: String,
 }
 
 pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<FetchResult> {
     let mut fetched = 0;
     let mut analyzed = 0;
+    let mut errors = Vec::new();
     let mut sources = storage::list_sources(pool, true).await?;
     if sources.is_empty() {
         sources = config.parsed_sources();
@@ -27,6 +37,7 @@ pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<
         }
         match fetch_source(config, pool, source).await {
             Ok(tweets) => {
+                let source_count = tweets.len() as i64;
                 for tweet in tweets {
                     storage::upsert_tweet(pool, &tweet).await?;
                     fetched += 1;
@@ -40,13 +51,18 @@ pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<
                     pool,
                     source,
                     "ok",
-                    Some(&format!("Fetched {fetched} tweets.")),
+                    Some(&format!("Fetched {source_count} tweets.")),
                 )
                 .await?;
             }
             Err(err) => {
-                storage::save_fetch_state(pool, source, "error", Some(&err.to_string())).await?;
-                return Err(err);
+                let message = err.to_string();
+                storage::save_fetch_state(pool, source, "error", Some(&message)).await?;
+                errors.push(FetchSourceError {
+                    source_type: source.source_type.as_str().to_string(),
+                    source_value: source.value.clone(),
+                    message,
+                });
             }
         }
     }
@@ -54,6 +70,8 @@ pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<
         fetched,
         analyzed,
         sources: sources.len() as i64,
+        failed: errors.len() as i64,
+        errors,
     })
 }
 

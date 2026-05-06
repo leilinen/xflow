@@ -55,6 +55,10 @@ struct DigestArgs {
 #[derive(Debug, Subcommand)]
 enum TelegramCommand {
     Send(TelegramSendArgs),
+    Commands {
+        #[command(subcommand)]
+        command: TelegramCommandsCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -63,6 +67,13 @@ struct TelegramSendArgs {
     config: PathBuf,
     #[arg(long, default_value_t = 100)]
     limit: i64,
+}
+
+#[derive(Debug, Subcommand)]
+enum TelegramCommandsCommand {
+    Set(ConfigOpt),
+    List(ConfigOpt),
+    Clear(ConfigOpt),
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,9 +113,18 @@ pub async fn run() -> anyhow::Result<()> {
             let (config, pool) = configured_pool(&args.config).await?;
             let result = pipeline::run_fetch(&config, &pool).await?;
             println!(
-                "Fetched {} tweets from {} sources; analyzed {}.",
-                result.fetched, result.sources, result.analyzed
+                "Fetched {} tweets from {} sources; analyzed {}; failed {}.",
+                result.fetched, result.sources, result.analyzed, result.failed
             );
+            if result.failed > 0 {
+                for error in &result.errors {
+                    eprintln!(
+                        "{}:{} failed: {}",
+                        error.source_type, error.source_value, error.message
+                    );
+                }
+                anyhow::bail!("fetch completed with {} failed sources", result.failed);
+            }
             Ok(())
         }
         Command::Serve(args) => {
@@ -142,8 +162,41 @@ pub async fn run() -> anyhow::Result<()> {
                 );
                 Ok(())
             }
+            TelegramCommand::Commands { command } => telegram_commands_command(command).await,
         },
         Command::Auth { command } => auth_command(command).await,
+    }
+}
+
+async fn telegram_commands_command(command: TelegramCommandsCommand) -> anyhow::Result<()> {
+    match command {
+        TelegramCommandsCommand::Set(args) => {
+            let config = load_config(&args.config)?;
+            let commands = telegram::set_bot_commands(&config.telegram).await?;
+            println!("Registered {} Telegram commands.", commands.len());
+            for command in commands {
+                println!("/{} - {}", command.command, command.description);
+            }
+            Ok(())
+        }
+        TelegramCommandsCommand::List(args) => {
+            let config = load_config(&args.config)?;
+            let commands = telegram::list_bot_commands(&config.telegram).await?;
+            if commands.is_empty() {
+                println!("No Telegram commands registered.");
+            } else {
+                for command in commands {
+                    println!("/{} - {}", command.command, command.description);
+                }
+            }
+            Ok(())
+        }
+        TelegramCommandsCommand::Clear(args) => {
+            let config = load_config(&args.config)?;
+            telegram::clear_bot_commands(&config.telegram).await?;
+            println!("Cleared Telegram commands.");
+            Ok(())
+        }
     }
 }
 
