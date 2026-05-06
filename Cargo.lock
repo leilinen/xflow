@@ -3067,6 +3067,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "rand 0.8.6",
  "reqwest",
  "rss",
  "serde",

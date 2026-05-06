@@ -127,14 +127,28 @@ struct XWebFetcher {
     user_tweets_query_id: String,
 }
 
+fn random_user_agent() -> &'static str {
+    use rand::seq::SliceRandom;
+    static AGENTS: &[&str] = &[
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
+    ];
+    AGENTS.choose(&mut rand::thread_rng()).unwrap()
+}
+
 impl XWebFetcher {
     async fn new(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<Self> {
-        let auth = storage::first_auth_account_secret(pool)
+        let auth = storage::next_auth_account_secret(pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("x_web fetcher requires an imported auth account"))?;
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .build()?;
+        let ua = random_user_agent();
+        tracing::debug!(user_agent = ua, "selected user agent");
+        let client = reqwest::Client::builder().user_agent(ua).build()?;
         Ok(Self {
             config: config.clone(),
             auth,
