@@ -198,3 +198,141 @@ cargo run -- auth delete --label account1
 - SQLite 数据库建议保持私有权限，例如 `chmod 600 data/xflow.db`。
 - CLI 和日志必须只显示脱敏 token。
 - 任何 Agent/LLM 代码都不应该接收 token、cookie 或 header 明文。
+
+## 生产部署
+
+### 二进制安装
+
+```bash
+# 在服务器或相同目标平台编译
+cargo build --release
+sudo cp target/release/xflow /usr/local/bin/
+
+# 在专用目录初始化
+sudo mkdir -p /opt/xflow/data
+cd /opt/xflow
+xflow init --config /opt/xflow/config.yaml
+# 编辑 config.yaml：设置 fetcher、sources、telegram 等
+```
+
+### 升级
+
+```bash
+# 编译新版本
+cargo build --release
+
+# 替换二进制后重启服务
+sudo systemctl restart xflow-serve xflow-worker
+```
+
+### systemd
+
+`/etc/systemd/system/xflow-serve.service`：
+
+```ini
+[Unit]
+Description=xFlow API Server
+After=network.target
+
+[Service]
+Type=simple
+User=xflow
+WorkingDirectory=/opt/xflow
+ExecStart=/usr/local/bin/xflow serve --config /opt/xflow/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# 环境变量
+EnvironmentFile=/opt/xflow/.env
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xflow/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/xflow-worker.service`：
+
+```ini
+[Unit]
+Description=xFlow Worker（抓取 + Telegram 推送）
+After=network.target
+
+[Service]
+Type=simple
+User=xflow
+WorkingDirectory=/opt/xflow
+ExecStart=/usr/local/bin/xflow worker --config /opt/xflow/config.yaml
+Restart=on-failure
+RestartSec=10
+
+# 环境变量
+EnvironmentFile=/opt/xflow/.env
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xflow/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+创建服务用户并启用：
+
+```bash
+sudo useradd -r -s /bin/false xflow
+sudo chown -R xflow:xflow /opt/xflow
+sudo systemctl daemon-reload
+sudo systemctl enable --now xflow-serve xflow-worker
+```
+
+环境变量文件（`/opt/xflow/.env`）：
+
+```bash
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
+```
+
+注册 Telegram slash commands（运行一次）：
+
+```bash
+cd /opt/xflow
+sudo -u xflow xflow telegram commands set --config /opt/xflow/config.yaml
+```
+
+### Docker 部署
+
+```bash
+cp .env.example .env
+# 编辑 .env 填入 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
+docker compose up --build -d
+
+# 注册 Telegram 命令菜单（运行一次）
+docker compose run --rm api xflow telegram commands set --config config.docker.yaml
+```
+
+### 备份
+
+```bash
+# 停止服务以获得一致性快照
+sudo systemctl stop xflow-worker xflow-serve
+
+# 备份数据库和配置
+sudo cp /opt/xflow/data/xflow.db /opt/xflow/data/xflow.db.bak
+sudo cp /opt/xflow/config.yaml /opt/xflow/config.yaml.bak
+
+# 重启
+sudo systemctl start xflow-serve xflow-worker
+```
+
+不停止服务也可以用 SQLite 的 `.backup` 命令获得一致性快照：
+
+```bash
+sqlite3 /opt/xflow/data/xflow.db ".backup /opt/xflow/data/xflow.db.bak"
+```

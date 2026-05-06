@@ -53,7 +53,7 @@ This document tracks the next engineering work after the Rust service migration.
 
 ## 7. Server Operations
 
-- Add a `systemd` service example for `xflow serve`.
-- Add a `systemd` service example for `xflow worker`.
-- Document binary install/update steps.
+- Add `systemd` service examples for `xflow serve` and `xflow worker`.
+- Document binary install, upgrade, and Docker deployment steps.
 - Add backup guidance for `config.yaml` and `data/xflow.db`.
+- Document Telegram command registration in production setup.

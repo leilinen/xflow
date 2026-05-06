@@ -262,3 +262,141 @@ Compose starts `api` and `worker` services sharing `./data`. The image contains 
 - Keep SQLite private, for example `chmod 600 data/xflow.db`.
 - CLI and logs must mask `auth_token` and `ct0`.
 - Agent/LLM code must never receive token, cookie, or header values.
+
+## Production Deployment
+
+### Binary Install
+
+```bash
+# Build on the server or a matching target
+cargo build --release
+sudo cp target/release/xflow /usr/local/bin/
+
+# Initialize in a dedicated directory
+sudo mkdir -p /opt/xflow/data
+cd /opt/xflow
+xflow init --config /opt/xflow/config.yaml
+# Edit config.yaml: set fetcher, sources, telegram, etc.
+```
+
+### Upgrade
+
+```bash
+# Build the new version
+cargo build --release
+
+# Restart services after replacing the binary
+sudo systemctl restart xflow-serve xflow-worker
+```
+
+### systemd
+
+`/etc/systemd/system/xflow-serve.service`:
+
+```ini
+[Unit]
+Description=xFlow API Server
+After=network.target
+
+[Service]
+Type=simple
+User=xflow
+WorkingDirectory=/opt/xflow
+ExecStart=/usr/local/bin/xflow serve --config /opt/xflow/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# Environment
+EnvironmentFile=/opt/xflow/.env
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xflow/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/xflow-worker.service`:
+
+```ini
+[Unit]
+Description=xFlow Worker (fetch + Telegram)
+After=network.target
+
+[Service]
+Type=simple
+User=xflow
+WorkingDirectory=/opt/xflow
+ExecStart=/usr/local/bin/xflow worker --config /opt/xflow/config.yaml
+Restart=on-failure
+RestartSec=10
+
+# Environment
+EnvironmentFile=/opt/xflow/.env
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/xflow/data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create the service user and enable:
+
+```bash
+sudo useradd -r -s /bin/false xflow
+sudo chown -R xflow:xflow /opt/xflow
+sudo systemctl daemon-reload
+sudo systemctl enable --now xflow-serve xflow-worker
+```
+
+Environment file (`/opt/xflow/.env`):
+
+```bash
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
+```
+
+Register Telegram slash commands (run once):
+
+```bash
+cd /opt/xflow
+sudo -u xflow xflow telegram commands set --config /opt/xflow/config.yaml
+```
+
+### Docker
+
+```bash
+cp .env.example .env
+# Edit .env with TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+docker compose up --build -d
+
+# Register Telegram commands (run once)
+docker compose run --rm api xflow telegram commands set --config config.docker.yaml
+```
+
+### Backup
+
+```bash
+# Stop services to get a consistent snapshot
+sudo systemctl stop xflow-worker xflow-serve
+
+# Backup database and config
+sudo cp /opt/xflow/data/xflow.db /opt/xflow/data/xflow.db.bak
+sudo cp /opt/xflow/config.yaml /opt/xflow/config.yaml.bak
+
+# Restart
+sudo systemctl start xflow-serve xflow-worker
+```
+
+For online backup without stopping services, SQLite's `.backup` command produces a consistent snapshot:
+
+```bash
+sqlite3 /opt/xflow/data/xflow.db ".backup /opt/xflow/data/xflow.db.bak"
+```
