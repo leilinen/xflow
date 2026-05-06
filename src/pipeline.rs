@@ -82,11 +82,13 @@ async fn delay_between_sources(config: &AppConfig) {
     let min = config.fetch.source_delay_min_seconds;
     let max = config.fetch.source_delay_max_seconds;
     let delay = if max > min {
-        min + ((max - min) / 2)
+        use rand::Rng;
+        rand::thread_rng().gen_range(min..=max)
     } else {
         min
     };
     if delay > 0 {
+        tracing::debug!(delay, "sleeping between sources");
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }

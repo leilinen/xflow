@@ -443,6 +443,30 @@ pub async fn first_auth_account_secret(
     }))
 }
 
+/// Select the least-recently-used auth account for round-robin rotation.
+pub async fn next_auth_account_secret(
+    pool: &SqlitePool,
+) -> anyhow::Result<Option<AuthAccountSecret>> {
+    let row = sqlx::query(
+        r#"
+        SELECT label, auth_token, ct0
+        FROM auth_accounts
+        WHERE status NOT IN ('rejected', 'deleted')
+          AND (limited_until IS NULL OR limited_until <= ?)
+        ORDER BY CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END, last_used_at ASC, label ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| AuthAccountSecret {
+        label: row.get("label"),
+        auth_token: row.get("auth_token"),
+        ct0: row.get("ct0"),
+    }))
+}
+
 pub async fn mark_auth_used(pool: &SqlitePool, label: &str) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -605,6 +629,33 @@ fn row_to_tweet(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<StoredTweet> {
         None
     };
     Ok(StoredTweet { tweet, analysis })
+}
+
+pub async fn check_token_freshness(
+    pool: &SqlitePool,
+    threshold_days: i64,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let cutoff = Utc::now() - chrono::Duration::days(threshold_days);
+    let rows = sqlx::query(
+        r#"
+        SELECT label, updated_at
+        FROM auth_accounts
+        WHERE status NOT IN ('rejected', 'deleted')
+          AND updated_at < ?
+        "#,
+    )
+    .bind(cutoff.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("label"),
+                row.get::<String, _>("updated_at"),
+            )
+        })
+        .collect())
 }
 
 pub fn delivery_payload<T: Serialize>(value: &T) -> Value {
