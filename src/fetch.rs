@@ -30,6 +30,49 @@ pub async fn fetch_source(
     }
 }
 
+pub async fn verify_auth(
+    _config: &AppConfig,
+    secret: &storage::AuthAccountSecret,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .build()?;
+    let bearer_token = std::env::var("XFLOW_X_WEB_BEARER_TOKEN")
+        .unwrap_or_else(|_| X_WEB_BEARER_TOKEN.to_string());
+    let query_id = std::env::var("XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID")
+        .unwrap_or_else(|_| DEFAULT_USER_BY_SCREEN_NAME_QUERY_ID.to_string());
+    let url = format!("https://x.com/i/api/graphql/{query_id}/UserByScreenName");
+    let variables = json!({"screen_name": "x", "withSafetyModeUserFields": true});
+    let features = common_features();
+    let response = client
+        .get(url)
+        .query(&[
+            ("variables", variables.to_string()),
+            ("features", features.to_string()),
+        ])
+        .header(header::AUTHORIZATION, format!("Bearer {bearer_token}"))
+        .header(
+            header::COOKIE,
+            format!("auth_token={}; ct0={}", secret.auth_token, secret.ct0),
+        )
+        .header("x-csrf-token", secret.ct0.as_str())
+        .header("x-twitter-active-user", "yes")
+        .header("x-twitter-auth-type", "OAuth2Session")
+        .header("x-twitter-client-language", "en")
+        .header(header::ACCEPT, "*/*")
+        .header(header::REFERER, "https://x.com/")
+        .send()
+        .await?;
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        anyhow::bail!("token rejected (HTTP {status})");
+    }
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status}");
+    }
+    Ok(())
+}
+
 fn mock_fetch_source(config: &AppConfig, source: &Source) -> anyhow::Result<Vec<Tweet>> {
     let limit = source.limit.unwrap_or(config.fetch.default_limit).max(0);
     let mut tweets = Vec::new();

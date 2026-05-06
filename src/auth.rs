@@ -1,6 +1,12 @@
+use crate::config::AppConfig;
 use crate::storage::{self, AuthAccount, TokenImport};
 use sqlx::SqlitePool;
 use std::path::Path;
+
+pub struct LiveCheckResult {
+    pub ok: bool,
+    pub error: Option<String>,
+}
 
 pub async fn import_token_json(pool: &SqlitePool, path: &Path) -> anyhow::Result<TokenImport> {
     let token: TokenImport = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -44,4 +50,27 @@ pub async fn check_account(pool: &SqlitePool, label: &str) -> anyhow::Result<Aut
     storage::get_auth_account(pool, label)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no auth account found for {label}"))
+}
+
+pub async fn check_account_live(
+    pool: &SqlitePool,
+    config: &AppConfig,
+) -> anyhow::Result<LiveCheckResult> {
+    let secret = storage::first_auth_account_secret(pool).await?;
+    let Some(secret) = secret else {
+        return Ok(LiveCheckResult {
+            ok: false,
+            error: Some("no auth account available".to_string()),
+        });
+    };
+    match crate::fetch::verify_auth(config, &secret).await {
+        Ok(()) => Ok(LiveCheckResult {
+            ok: true,
+            error: None,
+        }),
+        Err(err) => Ok(LiveCheckResult {
+            ok: false,
+            error: Some(err.to_string()),
+        }),
+    }
 }
