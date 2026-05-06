@@ -140,6 +140,9 @@ async fn set_bot_commands_to(
     Ok(())
 }
 
+const TELEGRAM_MESSAGE_LIMIT: usize = 4096;
+const TRUNCATION_MARKER: &str = "\n\n…";
+
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
     let mut parts = vec![
         format!("<b>@{}</b>", html_escape(&stored.tweet.author_username)),
@@ -153,11 +156,42 @@ pub fn format_tweet_message(stored: &StoredTweet) -> String {
             parts.push(format!("Tags: {}", html_escape(&analysis.tags.join(", "))));
         }
     }
-    parts.push(format!(
+    let footer = format!(
         "<a href=\"{}\">Open tweet</a>",
         html_escape(&stored.tweet.url)
-    ));
-    parts.join("\n\n")
+    );
+    parts.push(footer);
+    let message = parts.join("\n\n");
+    if message.len() <= TELEGRAM_MESSAGE_LIMIT {
+        return message;
+    }
+    truncate_message(parts, TELEGRAM_MESSAGE_LIMIT)
+}
+
+/// Truncate by removing middle parts (summary, tags) before the footer,
+/// then truncating the tweet text if still too long.
+fn truncate_message(mut parts: Vec<String>, limit: usize) -> String {
+    // Footer is always the last part and must be preserved.
+    let footer = parts.pop().unwrap_or_default();
+    // Build the skeleton: header + text + marker + footer
+    // Drop middle parts (summary, tags).
+    let header = parts.first().cloned().unwrap_or_default();
+    let mut text = parts.get(1).cloned().unwrap_or_default();
+    let marker = TRUNCATION_MARKER.to_string();
+    let sep = "\n\n";
+    // Calculate overhead: header + sep + marker + sep + footer + sep
+    let overhead = header.len() + sep.len() + marker.len() + sep.len() + footer.len() + sep.len();
+    let budget = limit.saturating_sub(overhead);
+    if text.len() > budget {
+        text.truncate(budget);
+        // Avoid splitting inside an HTML entity.
+        if let Some(pos) = text.rfind('&') {
+            if !text[pos..].contains(';') {
+                text.truncate(pos);
+            }
+        }
+    }
+    [header, text, marker, footer].join(sep)
 }
 
 impl DeliveryChannel for TelegramChannel {
@@ -297,7 +331,7 @@ fn telegram_api_url(bot_token: &str, method: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{SourceType, Tweet};
+    use crate::models::{SourceType, Tweet, TweetAnalysis};
     use chrono::Utc;
     use serde_json::json;
 
@@ -336,5 +370,64 @@ mod tests {
         assert!(commands
             .iter()
             .all(|command| !command.description.trim().is_empty()));
+    }
+
+    #[test]
+    fn truncates_long_message_to_telegram_limit() {
+        let long_text = "A".repeat(5000);
+        let stored = StoredTweet {
+            tweet: Tweet {
+                tweet_id: "2".to_string(),
+                source_type: SourceType::Account,
+                source_value: "openai".to_string(),
+                author_username: "openai".to_string(),
+                author_name: "OpenAI".to_string(),
+                text: long_text,
+                url: "https://x.com/openai/status/2".to_string(),
+                created_at: Utc::now(),
+                fetched_at: Utc::now(),
+                raw: json!({}),
+            },
+            analysis: Some(TweetAnalysis {
+                tweet_id: "2".to_string(),
+                relevance: 0.9,
+                importance_score: 0.8,
+                category: "research".to_string(),
+                tags: vec!["AI".to_string(), "LLM".to_string()],
+                chinese_summary: "这是一段很长的中文摘要".to_string(),
+                reason: "important".to_string(),
+                should_push: true,
+                analyzed_at: Utc::now(),
+            }),
+        };
+        let message = format_tweet_message(&stored);
+        assert!(message.len() <= TELEGRAM_MESSAGE_LIMIT);
+        assert!(message.contains("<b>@openai</b>"));
+        assert!(message.contains("Open tweet"));
+        assert!(message.contains(TRUNCATION_MARKER.trim()));
+        // Summary and tags should be dropped when truncated.
+        assert!(!message.contains("这是一段很长的中文摘要"));
+    }
+
+    #[test]
+    fn short_message_is_not_truncated() {
+        let stored = StoredTweet {
+            tweet: Tweet {
+                tweet_id: "3".to_string(),
+                source_type: SourceType::Account,
+                source_value: "openai".to_string(),
+                author_username: "openai".to_string(),
+                author_name: "OpenAI".to_string(),
+                text: "Short tweet".to_string(),
+                url: "https://x.com/openai/status/3".to_string(),
+                created_at: Utc::now(),
+                fetched_at: Utc::now(),
+                raw: json!({}),
+            },
+            analysis: None,
+        };
+        let message = format_tweet_message(&stored);
+        assert!(!message.contains(TRUNCATION_MARKER.trim()));
+        assert!(message.contains("Short tweet"));
     }
 }
