@@ -53,6 +53,16 @@ pub fn adjust_interval(
 }
 
 pub async fn run_forever(config: AppConfig, pool: SqlitePool) -> anyhow::Result<()> {
+    if config.telegram.enabled {
+        let bot_config = config.clone();
+        let bot_pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = crate::bot::run_poller(bot_config, bot_pool).await {
+                tracing::error!(?err, "bot poller crashed");
+            }
+        });
+    }
+
     let base_interval = config.fetch.interval_seconds;
     let mut current_interval = base_interval;
     let mut consecutive_successes: u32 = 0;

@@ -35,6 +35,7 @@ pub async fn verify_auth(
     secret: &storage::AuthAccountSecret,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build()?;
     let bearer_token = std::env::var("XFLOW_X_WEB_BEARER_TOKEN")
@@ -148,7 +149,10 @@ impl XWebFetcher {
             .ok_or_else(|| anyhow::anyhow!("x_web fetcher requires an imported auth account"))?;
         let ua = random_user_agent();
         tracing::debug!(user_agent = ua, "selected user agent");
-        let client = reqwest::Client::builder().user_agent(ua).build()?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(ua)
+            .build()?;
         Ok(Self {
             config: config.clone(),
             auth,

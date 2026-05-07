@@ -2,6 +2,10 @@
 
 This document tracks the next engineering work after the Rust service migration.
 
+## References
+
+- [zedeus/nitter](https://github.com/zedeus/nitter) — 成熟的 X/Twitter 替代前端，X 数据获取方案的参考项目。关注其反爬策略适配、GraphQL 端点变更、rate limit 处理等。
+
 ## 1. Real X Fetcher
 
 - Implemented first-pass `x_web` account timeline fetcher in Rust using `reqwest`.
@@ -9,6 +13,10 @@ This document tracks the next engineering work after the Rust service migration.
 - Keep cookie/header construction inside the fetcher boundary.
 - Ensure token, cookie, and header values are never logged or passed to agent code.
 - Next: add list/search support, stronger retry policy, live endpoint drift checks, and richer rate-limit handling.
+- **按时间范围回溯获取** — 支持获取某 username 近 N 天的所有推文。当前每次只拉最近 N 条，不支持翻页和时间过滤。需要：
+  - 翻页拉取：循环调用 X API 获取 timeline 直到覆盖目标时间范围。
+  - 时间过滤：按 `created_at` 过滤掉范围外的推文。
+  - 按需触发：TG 命令如 `/fetch @openai 7d` 或 CLI 参数。
 
 ## 2. Auth Improvements
 
@@ -17,22 +25,26 @@ This document tracks the next engineering work after the Rust service migration.
 - Mask tokens in all CLI output, logs, and error messages.
 - Add tests for malformed token JSON and manual token import arguments.
 
-## 3. Docker Deployment Verification
+## 3. Docker Deployment
 
-- Run `docker compose config` on a machine with Docker installed.
-- Build the Docker image from the Rust binary Dockerfile.
-- Verify `api` and `worker` services share `./data` correctly.
-- Document any required host permissions for `data/xflow.db`.
+- Verified `docker compose` build and run with shared `./data` volume.
+- Added `RUST_LOG=xflow=info` to docker-compose for proper log output.
+- Pinned Rust toolchain to 1.95.0 in Dockerfile for CI consistency.
+- **Next: optimize Docker build speed** — current full Rust recompile on every source change takes 3-4 min. Options:
+  - Use `cargo-chef` for layered dependency caching (compile deps once, only recompile app code).
+  - Cross-compile Linux binary on macOS host, COPY into slim image (build in seconds).
+  - Add `.dockerignore` to exclude `target/`, `data/`, `logs/`, `.env` from build context.
 
 ## 4. Telegram Integration
 
 - Test `xflow telegram send` against a real bot and channel.
 - Register Telegram slash command menus with `xflow telegram commands set` during production setup.
-- MVP scope: command menus are display-only; do not handle inbound Telegram commands yet.
 - Add retry behavior for transient Telegram API failures.
 - Add message length truncation for Telegram limits.
-- Post-MVP: add a Telegram command handler for `/status`, `/latest`, and `/digest` via polling or webhook.
-- Consider configurable message templates after the basic integration is stable.
+- **Implemented bot command handler via long-polling** — `/help`, `/add`, `/remove`, `/list`, `/status`, `/fetch`.
+- Poller runs as a `tokio::spawn` task alongside worker loop.
+- Source management (add/remove) operates directly on database at runtime.
+- **Next**: configurable message templates, `/latest` for recent tweets, `/digest` command.
 
 ## 5. API Enhancements
 
@@ -43,13 +55,10 @@ This document tracks the next engineering work after the Rust service migration.
 
 ## 6. CI/CD
 
-- Add GitHub Actions for:
-  - `cargo fmt --check`
-  - `cargo test`
-  - `cargo clippy --all-targets -- -D warnings`
-  - release build
-- Cache Cargo dependencies to keep CI fast.
-- Add release artifacts for Linux server deployment.
+- GitHub Actions CI: `cargo fmt --check`, `cargo clippy`, `cargo test`.
+- Pinned Rust toolchain to 1.95.0 via `rust-toolchain.toml`.
+- Cache Cargo dependencies with `Swatinem/rust-cache`.
+- **Next**: release build artifacts for Linux server deployment.
 
 ## 7. Server Operations
 
@@ -57,3 +66,23 @@ This document tracks the next engineering work after the Rust service migration.
 - Document binary install, upgrade, and Docker deployment steps.
 - Add backup guidance for `config.yaml` and `data/xflow.db`.
 - Document Telegram command registration in production setup.
+
+## 9. Agent Analysis Optimization
+
+- Current agent uses simple keyword matching (`src/agent.rs`) — importance score = `hits / 4`, category by hardcoded if-else, chinese_summary is a fixed template.
+- Default disabled (`agent.enabled: false`) due to low analysis quality.
+- **Next: improve analysis quality** — options:
+  - Call LLM API (Claude/GPT) for real relevance scoring, categorization, and Chinese summarization.
+  - Configurable analysis backend: `rule` (current) vs `llm` (API-based).
+  - Per-source importance threshold override (e.g., @openai is always important).
+  - Better keyword matching: support phrase matching, regex, negative keywords.
+  - User feedback loop: `/important` / `/ignore` commands to train preferences.
+
+## 8. Risk Control
+
+- Multi-account rotation via `next_auth_account_secret` (round-robin by `last_used_at`).
+- Adaptive worker interval based on failure ratio (backoff ×2, recovery ×2/3).
+- Token freshness warning (7-day threshold check).
+- Request randomization (User-Agent pool, source delay jitter).
+- HTTP client 30s timeout to prevent hung requests.
+- **Next: fetch 失败时发送 Telegram 告警** — 当前失败只写日志，用户无法及时发现异常。在 worker 每次周期结束后，如果有 source 失败或整体报错，发送告警消息到 TG，包含失败详情。

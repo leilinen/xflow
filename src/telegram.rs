@@ -88,19 +88,27 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
     vec![
         TelegramBotCommand {
             command: "help".to_string(),
-            description: "Show available xFlow commands".to_string(),
+            description: "Show available commands".to_string(),
+        },
+        TelegramBotCommand {
+            command: "add".to_string(),
+            description: "Add a source (e.g. /add @openai)".to_string(),
+        },
+        TelegramBotCommand {
+            command: "remove".to_string(),
+            description: "Remove a source".to_string(),
+        },
+        TelegramBotCommand {
+            command: "list".to_string(),
+            description: "List all sources".to_string(),
         },
         TelegramBotCommand {
             command: "status".to_string(),
-            description: "Show xFlow status".to_string(),
+            description: "Show system status".to_string(),
         },
         TelegramBotCommand {
-            command: "latest".to_string(),
-            description: "Show latest cached items".to_string(),
-        },
-        TelegramBotCommand {
-            command: "digest".to_string(),
-            description: "Generate latest digest".to_string(),
+            command: "fetch".to_string(),
+            description: "Trigger immediate fetch".to_string(),
         },
     ]
 }
@@ -152,7 +160,11 @@ enum TelegramSendError {
 
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
     let mut parts = vec![
-        format!("<b>@{}</b>", html_escape(&stored.tweet.author_username)),
+        format!(
+            "<b>@{}</b> · {}",
+            html_escape(&stored.tweet.author_username),
+            stored.tweet.created_at.format("%Y-%m-%d %H:%M UTC")
+        ),
         html_escape(&stored.tweet.text),
     ];
     if let Some(analysis) = &stored.analysis {
@@ -379,7 +391,7 @@ async fn parse_telegram_response<T: DeserializeOwned>(
     )
 }
 
-fn telegram_api_url(bot_token: &str, method: &str) -> String {
+pub fn telegram_api_url(bot_token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{bot_token}/{method}")
 }
 
@@ -420,7 +432,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "status", "latest", "digest"]
+            vec!["help", "add", "remove", "list", "status", "fetch"]
         );
         assert!(commands
             .iter()

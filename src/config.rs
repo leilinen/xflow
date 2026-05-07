@@ -48,7 +48,7 @@ impl Default for FetchConfig {
     fn default() -> Self {
         Self {
             interval_seconds: 900,
-            default_limit: 20,
+            default_limit: 5,
             fetcher: "mock".to_string(),
             rate_limit_safety_margin: 10,
             source_delay_min_seconds: 0,
@@ -100,7 +100,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             keywords: default_keywords(),
             importance_threshold: 0.45,
             push_threshold: 0.7,
