@@ -231,7 +231,7 @@ impl XWebFetcher {
         let mut seen = HashSet::new();
         let mut tweets = Vec::new();
         collect_tweets(&value, source, user, &mut seen, &mut tweets);
-        tweets.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        tweets.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         tweets.truncate(limit as usize);
         Ok(tweets)
     }
