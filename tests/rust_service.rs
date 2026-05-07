@@ -10,7 +10,6 @@ use xflow::pipeline;
 use xflow::rss_feed;
 use xflow::storage::{self, TokenImport, TweetFilter};
 use xflow::worker;
-
 async fn test_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("xflow.db");
@@ -700,4 +699,165 @@ async fn deliveries_unique_constraint_allows_different_channels() {
             .await
             .unwrap();
     assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn next_auth_rotates_by_last_used_at() {
+    let (_dir, pool) = test_pool().await;
+    let token_a = TokenImport {
+        label: "alpha".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "aaaa1111bbbb".to_string(),
+        ct0: "ct0alpha1234".to_string(),
+        exported_at: None,
+    };
+    let token_b = TokenImport {
+        label: "beta".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "bbbb2222cccc".to_string(),
+        ct0: "ct0beta12345".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token_a).await.unwrap();
+    storage::import_auth_account(&pool, &token_b).await.unwrap();
+
+    // Both never used, should pick by label order.
+    let first = storage::next_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.label, "alpha");
+
+    // Mark alpha as used, next should pick beta.
+    storage::mark_auth_used(&pool, "alpha").await.unwrap();
+    let second = storage::next_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.label, "beta");
+
+    // Mark beta as used, now alpha was used earlier, should pick alpha again.
+    storage::mark_auth_used(&pool, "beta").await.unwrap();
+    let third = storage::next_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.label, "alpha");
+}
+
+#[tokio::test]
+async fn next_auth_skips_limited_and_rejected() {
+    let (_dir, pool) = test_pool().await;
+    let token_a = TokenImport {
+        label: "alpha".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "aaaa1111bbbb".to_string(),
+        ct0: "ct0alpha1234".to_string(),
+        exported_at: None,
+    };
+    let token_b = TokenImport {
+        label: "beta".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "bbbb2222cccc".to_string(),
+        ct0: "ct0beta12345".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token_a).await.unwrap();
+    storage::import_auth_account(&pool, &token_b).await.unwrap();
+
+    storage::mark_auth_rejected(&pool, "alpha", "rejected")
+        .await
+        .unwrap();
+    let selected = storage::next_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.label, "beta");
+
+    storage::mark_auth_limited(&pool, "beta", "2999-01-01T00:00:00+00:00")
+        .await
+        .unwrap();
+    assert!(storage::next_auth_account_secret(&pool)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn check_token_freshness_detects_stale_tokens() {
+    let (_dir, pool) = test_pool().await;
+    // Import a token and manually set updated_at to 10 days ago.
+    let token = TokenImport {
+        label: "stale_one".to_string(),
+        domain: "x.com".to_string(),
+        auth_token: "aaaa1111bbbb".to_string(),
+        ct0: "ct0stale1234".to_string(),
+        exported_at: None,
+    };
+    storage::import_auth_account(&pool, &token).await.unwrap();
+    let ten_days_ago = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+    sqlx::query("UPDATE auth_accounts SET updated_at = ? WHERE label = ?")
+        .bind(&ten_days_ago)
+        .bind("stale_one")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stale = storage::check_token_freshness(&pool, 7).await.unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].0, "stale_one");
+
+    let fresh = storage::check_token_freshness(&pool, 14).await.unwrap();
+    assert!(fresh.is_empty());
+}
+
+#[test]
+fn adjust_interval_backs_off_on_all_failures() {
+    let base: u64 = 900;
+    // All sources failed: double interval.
+    let (interval, successes) = xflow::worker::adjust_interval(900, base, 0, 2, 2);
+    assert_eq!(interval, 1800);
+    assert_eq!(successes, 0);
+
+    // Back off again.
+    let (interval, _) = xflow::worker::adjust_interval(1800, base, 0, 1, 1);
+    assert_eq!(interval, 3600);
+
+    // Cap at base * 8.
+    let (interval, _) = xflow::worker::adjust_interval(base * 4, base, 0, 3, 3);
+    assert_eq!(interval, base * 8);
+}
+
+#[test]
+fn adjust_interval_moderate_on_partial_failure() {
+    let base: u64 = 900;
+    let (interval, successes) = xflow::worker::adjust_interval(900, base, 0, 1, 3);
+    assert_eq!(interval, 1350); // 900 * 3/2
+    assert_eq!(successes, 0);
+}
+
+#[test]
+fn adjust_interval_recovers_after_consecutive_successes() {
+    let base: u64 = 900;
+    // After backing off to 1800, first success doesn't reduce yet.
+    let (interval, successes) = xflow::worker::adjust_interval(1800, base, 0, 0, 1);
+    assert_eq!(interval, 1800);
+    assert_eq!(successes, 1);
+
+    // Second success triggers recovery.
+    let (interval, successes) = xflow::worker::adjust_interval(1800, base, 1, 0, 1);
+    assert_eq!(interval, 1200); // 1800 * 2/3
+    assert_eq!(successes, 2);
+
+    // Keeps recovering.
+    let (interval, _) = xflow::worker::adjust_interval(1200, base, 2, 0, 1);
+    assert_eq!(interval, 900); // 1200 * 2/3 = 800, max(800, 900) = 900
+}
+
+#[test]
+fn adjust_interval_stays_at_base_when_all_ok() {
+    let base: u64 = 900;
+    let (interval, successes) = xflow::worker::adjust_interval(900, base, 5, 0, 3);
+    assert_eq!(interval, 900);
+    assert_eq!(successes, 6);
 }
