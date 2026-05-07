@@ -202,7 +202,7 @@ fn truncate_message(mut parts: Vec<String>, limit: usize) -> String {
     let overhead = header.len() + sep.len() + marker.len() + sep.len() + footer.len() + sep.len();
     let budget = limit.saturating_sub(overhead);
     if text.len() > budget {
-        text.truncate(budget);
+        text.truncate(text.floor_char_boundary(budget));
         // Avoid splitting inside an HTML entity.
         if let Some(pos) = text.rfind('&') {
             if !text[pos..].contains(';') {

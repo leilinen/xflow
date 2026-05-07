@@ -30,6 +30,13 @@ pub async fn fetch_source(
     }
 }
 
+pub async fn validate_account(config: &AppConfig, pool: &SqlitePool, username: &str) -> bool {
+    match XWebFetcher::new(config, pool).await {
+        Ok(fetcher) => fetcher.lookup_user(username).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 pub async fn verify_auth(
     _config: &AppConfig,
     secret: &storage::AuthAccountSecret,

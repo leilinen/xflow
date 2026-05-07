@@ -46,6 +46,10 @@ This document tracks the next engineering work after the Rust service migration.
 - Poller runs as a `tokio::spawn` task alongside worker loop.
 - Source management (add/remove) operates directly on database at runtime.
 - **Next**: configurable message templates, `/latest` for recent tweets, `/digest` command.
+- **Bot 支持群组** — 当前 bot 仅支持私聊对话，不支持群组。需要：
+  - 识别群组消息（消息来源于群组 chat）。
+  - 群组中仅响应 bot 被回复或 @提及的消息，避免干扰正常群聊。
+  - 支持将群组设置为推送目标 channel（与现有 Telegram channel 对接）。
 
 ## 5. API Enhancements
 

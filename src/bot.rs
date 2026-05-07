@@ -1,5 +1,6 @@
 use crate::channel;
 use crate::config::AppConfig;
+use crate::fetch;
 use crate::models::{Source, SourceType};
 use crate::pipeline;
 use crate::storage;
@@ -122,7 +123,7 @@ async fn handle_command(
 
     let response = match command.as_str() {
         "/help" | "/start" => cmd_help(),
-        "/add" => cmd_add(pool, &args).await,
+        "/add" => cmd_add(config, pool, &args).await,
         "/remove" => cmd_remove(pool, &args).await,
         "/list" => cmd_list(pool).await,
         "/status" => cmd_status(pool, config).await,
@@ -201,10 +202,13 @@ fn cmd_help() -> anyhow::Result<String> {
     )
 }
 
-async fn cmd_add(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+async fn cmd_add(config: &AppConfig, pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
     let username = args.trim().trim_start_matches('@').to_string();
     if username.is_empty() {
         return Ok("Usage: /add @username".to_string());
+    }
+    if !fetch::validate_account(config, pool, &username).await {
+        return Ok(format!("@{username} not found on X, please check the username"));
     }
     let source = Source {
         source_type: SourceType::Account,
