@@ -117,6 +117,21 @@ pub async fn disable_source(
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn delete_source(
+    pool: &SqlitePool,
+    source_type: SourceType,
+    value: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "DELETE FROM sources WHERE source_type = ? AND value = ?",
+    )
+    .bind(source_type.as_str())
+    .bind(value.trim_start_matches('@'))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn list_sources(pool: &SqlitePool, enabled_only: bool) -> anyhow::Result<Vec<Source>> {
     let sql = if enabled_only {
         "SELECT source_type, value, label, fetch_limit FROM sources WHERE enabled = 1 ORDER BY source_type, value"

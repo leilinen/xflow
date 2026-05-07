@@ -1,11 +1,11 @@
-FROM rust:1.88-slim AS builder
+FROM rust:1.95-slim AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libsqlite3-dev pkg-config gcc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
 COPY src ./src
 RUN cargo build --release
 

@@ -5,8 +5,11 @@ storage:
   database: data/xflow.db
 fetch:
   interval_seconds: 900
-  default_limit: 20
-  fetcher: mock
+  default_limit: 5
+  fetcher: x_web
+  rate_limit_safety_margin: 10
+  source_delay_min_seconds: 60
+  source_delay_max_seconds: 120
 sources:
   accounts:
     - username: openai
@@ -14,7 +17,7 @@ sources:
   lists: []
   searches: []
 agent:
-  enabled: true
+  enabled: false
   importance_threshold: 0.45
   push_threshold: 0.7
 telegram:

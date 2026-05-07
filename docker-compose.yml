@@ -4,6 +4,8 @@ services:
     command: xflow serve --config config.docker.yaml
     env_file:
       - .env
+    environment:
+      - RUST_LOG=xflow=info
     ports:
       - "8000:8000"
     volumes:
@@ -14,5 +16,7 @@ services:
     command: xflow worker --config config.docker.yaml
     env_file:
       - .env
+    environment:
+      - RUST_LOG=xflow=info
     volumes:
       - ./data:/app/data
