@@ -72,7 +72,7 @@ This document tracks the next engineering work after the Rust service migration.
 - Add backup guidance for `config.yaml` and `data/xflow.db`.
 - Document Telegram command registration in production setup.
 
-## 9. Agent Analysis Optimization
+## 8. Agent Analysis Optimization
 
 - Current agent uses simple keyword matching (`src/agent.rs`) — importance score = `hits / 4`, category by hardcoded if-else, chinese_summary is a fixed template.
 - Default disabled (`agent.enabled: false`) due to low analysis quality.
@@ -83,7 +83,19 @@ This document tracks the next engineering work after the Rust service migration.
   - Better keyword matching: support phrase matching, regex, negative keywords.
   - User feedback loop: `/important` / `/ignore` commands to train preferences.
 
-## 8. Risk Control
+## 9. 项目结构重构
+
+- 当前 19 个 `.rs` 文件全部平铺在 `src/` 下，缺少按职责的模块划分。
+- **按领域拆分为目录模块**：
+  - `src/fetch/` — X 数据获取（fetch.rs, auth.rs）
+  - `src/channel/` — 推送通道（channel.rs, telegram.rs）
+  - `src/bot/` — Telegram bot 命令处理（bot.rs）
+  - `src/storage/` — 数据层（storage.rs, db.rs）
+  - `src/worker/` — 调度（worker.rs, pipeline.rs）
+  - `src/server/` — HTTP API（server.rs, rss_feed.rs）
+  - 顶层保留：main.rs, lib.rs, config.rs, models.rs, cli.rs, agent.rs, digest.rs, utils.rs
+
+## 10. Risk Control
 
 - Multi-account rotation via `next_auth_account_secret` (round-robin by `last_used_at`).
 - Adaptive worker interval based on failure ratio (backoff ×2, recovery ×2/3).
