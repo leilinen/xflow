@@ -2,227 +2,179 @@
 
 [English README](README.md)
 
-xFlow 是一个自托管 Rust 服务，用来把配置好的 X/Twitter 账号源抓取到本地 SQLite 缓存，并输出 RSS/JSON feed。它也包含简单的规则分析、Markdown 摘要和可选 Telegram 推送。
+xFlow 是一个自托管的 Rust 服务，用于抓取 X/Twitter 内容，缓存到 SQLite，并通过 RSS/JSON 和 Telegram 输出。支持多账号轮换、自适应频率控制、规则分析和 Telegram 机器人交互。
 
 ```text
-X sources -> Fetcher -> SQLite cache/dedupe -> RuleBasedAgent -> RSS/JSON/Telegram
+X 数据源 -> Fetcher（多账号轮换、自适应退避） -> SQLite 缓存/去重 -> Agent -> RSS/JSON/Telegram Bot
 ```
 
-默认 fetcher 是确定性的 `mock`。要读取真实 X 账号时间线，需要导入浏览器里的 `auth_token` 和 `ct0` cookie，并把 `fetch.fetcher` 设置为 `x_web`。
+## 功能特性
 
-## 安装和初始化
+- **X Web 抓取** — 通过 X Web API 抓取真实账号时间线，使用浏览器兼容的请求头
+- **多账号轮换** — 自动轮换 auth 账号，跳过被限制/拒绝的账号
+- **自适应频率控制** — 失败自动退避，成功逐步恢复，请求随机化（UA 池、抖动）
+- **Telegram Bot** — 交互式命令：`/add`、`/remove`、`/list`、`/status`、`/fetch`、`/help`
+- **Telegram 推送** — 自动推送新推文，支持重试和截断
+- **RSS/JSON Feed** — HTTP 服务器输出 feed，方便集成
+- **SQLite 存储** — 单文件数据库，无外部依赖
+- **Docker Compose** — 一键部署
+
+## 快速开始
+
+### Docker Compose（推荐）
+
+```bash
+cp .env.example .env
+# 编辑 .env：填入 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
+docker compose up --build -d
+
+# 导入 X auth token（首次运行）
+source .env
+cargo build --release
+./target/release/xflow init --config config.docker.yaml
+./target/release/xflow auth import --label main --auth-token TOKEN --ct0 CT0 --config config.docker.yaml
+
+# 注册 Telegram bot 命令菜单（首次运行）
+./target/release/xflow telegram commands set --config config.docker.yaml
+```
+
+### 从源码构建
 
 ```bash
 cargo build --release
 ./target/release/xflow init
-./target/release/xflow fetch
-./target/release/xflow serve
+./target/release/xflow auth import --label main --auth-token TOKEN --ct0 CT0
+# 编辑 config.yaml：设置 fetcher: x_web
+./target/release/xflow serve    # API 服务器（端口 8000）
+./target/release/xflow worker   # 抓取 + Telegram 推送循环
 ```
 
-开发时也可以直接运行：
+## 配置
 
-```bash
-cargo run -- init
-cargo run -- fetch
-cargo run -- serve
-```
-
-默认运行文件：
-
-- `config.yaml`
-- `data/xflow.db`
-
-如果 Cargo 访问 crates.io 很慢，可以配置国内镜像：
-
-```toml
-# ~/.cargo/config.toml
-[source.crates-io]
-replace-with = "ustc"
-
-[source.ustc]
-registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
-```
-
-## 手动获取 X Token
-
-不要把 `auth_token` 或 `ct0` 发到聊天、Issue、PR、日志或任何 LLM prompt 里。它们等价于登录态。
-
-1. 在浏览器里登录 `https://x.com`。
-2. 打开开发者工具：
-   - macOS Chrome/Edge：`Cmd + Option + I`
-   - Windows/Linux Chrome/Edge：`F12`
-   - 或右键页面，选择“检查”。
-3. 打开 cookie 表：
-   - 中文界面：应用 -> 存储 -> Cookie -> `https://x.com`
-   - 英文界面：Application -> Storage -> Cookies -> `https://x.com`
-   - 如果看不到“应用/Application”，点开发者工具顶部的 `>>` 展开更多面板。
-4. 在 cookie 表中找到名称为 `auth_token` 和 `ct0` 的两行。
-5. 只复制它们的“值/Value”，不要复制整行、`auth_token=` 前缀、引号或末尾分号。
-6. 在本机生成 xFlow 可导入的 JSON 文件：
-
-```bash
-python3 tools/xflow_token_json.py \
-  --label account1 \
-  --auth-token 'YOUR_AUTH_TOKEN' \
-  --ct0 'YOUR_CT0' \
-  --out /tmp/xflow-token.json
-```
-
-导入到本地数据库：
-
-```bash
-cargo run -- auth import /tmp/xflow-token.json
-cargo run -- auth list
-rm /tmp/xflow-token.json
-```
-
-`auth list` 只会显示脱敏 token。
-
-## 浏览器辅助导出
-
-也可以用 Playwright 打开浏览器辅助导出 cookie：
-
-```bash
-python3 -m pip install playwright
-python3 tools/xflow_auth_export.py --label account1 --out /tmp/xflow-token.json
-```
-
-如果 Playwright 自带浏览器下载慢，可以指定本机 Chrome/Edge：
-
-```bash
-python3 tools/xflow_auth_export.py \
-  --label account1 \
-  --out /tmp/xflow-token.json \
-  --executable-path "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-```
-
-## 真实读取 X 推文
-
-导入至少一个 auth account 后，编辑 `config.yaml`：
+默认 `config.yaml`：
 
 ```yaml
+server:
+  host: 127.0.0.1
+  port: 8000
+storage:
+  database: data/xflow.db
 fetch:
   interval_seconds: 900
   default_limit: 5
-  fetcher: x_web
+  fetcher: mock          # 改为 "x_web" 抓取真实数据
+  source_delay_min_seconds: 60
+  source_delay_max_seconds: 120
 sources:
   accounts:
     - username: openai
       limit: 5
-  lists: []
-  searches: []
+agent:
+  enabled: false         # 规则分析（默认关闭）
+  importance_threshold: 0.45
+  push_threshold: 0.7
+telegram:
+  enabled: true
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_id_env: TELEGRAM_CHAT_ID
+  send_all: true
+  parse_mode: HTML
 ```
 
-当前 `x_web` 只支持账号源，不支持 list/search。多个 auth account 存在时，xFlow 会按 label 排序使用第一个。
+数据源也可以通过 Telegram bot 命令在运行时动态管理。
 
-执行抓取：
+## Telegram Bot 命令
+
+Bot 通过长轮询接收和处理命令：
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示所有可用命令 |
+| `/add @username` | 添加监控源 |
+| `/remove @username` | 移除监控源 |
+| `/list` | 列出所有源及状态 |
+| `/status` | 查看系统状态 |
+| `/fetch` | 立即触发一次抓取 |
+
+## X Auth Token
+
+### 手动获取 Cookie
+
+1. 在浏览器登录 `https://x.com`
+2. 打开开发者工具（macOS: `Cmd+Option+I`，Windows: `F12`）
+3. 进入 Application → Cookies → `https://x.com`
+4. 复制 `auth_token` 和 `ct0` 的**值**
+5. 导入：
 
 ```bash
-cargo run -- fetch
+xflow auth import --label main --auth-token YOUR_TOKEN --ct0 YOUR_CT0
 ```
 
-成功时会看到类似输出：
-
-```text
-Fetched 5 tweets from 1 sources; analyzed 5.
-```
-
-如果返回 `Could not authenticate you`，请从同一个已登录浏览器会话重新复制 `auth_token` 和 `ct0`。如果认证通过后出现 GraphQL 错误，可能是 X Web query id 或响应结构发生变化。
-
-可以用环境变量覆盖 GraphQL query id：
+### Token 管理
 
 ```bash
-export XFLOW_X_WEB_BEARER_TOKEN=...
-export XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID=...
-export XFLOW_X_USER_TWEETS_QUERY_ID=...
+xflow auth list                              # 列出账号（脱敏显示）
+xflow auth check --label main                # 检查 token 格式
+xflow auth check --label main --live         # 在线验证（请求 X API）
+xflow auth delete --label main               # 删除账号
 ```
 
-为了降低连续请求特征，可以配置账号之间的抓取延迟：
+## RSS/JSON 端点
 
-```yaml
-fetch:
-  source_delay_min_seconds: 5
-  source_delay_max_seconds: 20
+```
+http://127.0.0.1:8000/rss/all              # 所有推文
+http://127.0.0.1:8000/rss/account/openai   # 按账号
+http://127.0.0.1:8000/rss/important        # 重要推文
+http://127.0.0.1:8000/json/all             # JSON 格式
+http://127.0.0.1:8000/health               # 健康检查
 ```
 
-## 访问 RSS/JSON
+## 风控策略
 
-启动服务：
+- **账号轮换** — 按 `last_used_at` 轮换，自动跳过被限制/拒绝的账号
+- **自适应间隔** — 失败退避（最高 ×8），成功逐步恢复
+- **请求随机化** — 随机 User-Agent 池，随机 source 间隔
+- **Token 新鲜度** — Token 超过 7 天未更新时发出警告
+- **HTTP 超时** — 30 秒超时防止请求挂起
+
+## CLI 命令
 
 ```bash
-cargo run -- serve
-```
-
-RSS：
-
-- `http://127.0.0.1:8000/rss/all`
-- `http://127.0.0.1:8000/rss/account/openai`
-- `http://127.0.0.1:8000/rss/important`
-
-JSON：
-
-- `http://127.0.0.1:8000/json/all`
-- `http://127.0.0.1:8000/json/important`
-
-## 常用命令
-
-```bash
-cargo run -- init
-cargo run -- fetch
-cargo run -- serve
-cargo run -- worker
-cargo run -- digest --output digest.md
-cargo run -- telegram send
-cargo run -- telegram commands set
-cargo run -- telegram commands list
-cargo run -- telegram commands clear
-```
-
-生产环境首次部署或 Telegram 菜单变更后，运行一次
-`cargo run -- telegram commands set` 注册 bot 对话里的 slash command 菜单。正常
-`worker` 启动不会重复注册菜单。
-
-鉴权命令：
-
-```bash
-cargo run -- auth import /tmp/xflow-token.json
-cargo run -- auth list
-cargo run -- auth check --label account1
-cargo run -- auth delete --label account1
+xflow init                                 # 初始化配置和数据库
+xflow fetch                                # 一次性抓取
+xflow serve                                # 启动 HTTP API 服务器
+xflow worker                               # 抓取 + Telegram 循环（含 bot poller）
+xflow digest --output digest.md            # 生成 Markdown 摘要
+xflow auth import /path/to/token.json      # 从 JSON 文件导入
+xflow auth import --label L --auth-token X --ct0 Y  # 直接导入
+xflow auth list                            # 列出账号
+xflow auth check --label L                 # 检查账号
+xflow auth delete --label L                # 删除账号
+xflow telegram commands set                # 注册 bot 命令菜单
+xflow telegram commands list               # 查看已注册命令
+xflow telegram commands clear              # 清除命令
 ```
 
 ## 安全注意事项
 
-- 不要提交 `data/`、SQLite 数据库、`.env`、`xflow-token.json`、`*.token.json` 或浏览器 profile。
-- 导入后立即删除 token JSON。
-- SQLite 数据库建议保持私有权限，例如 `chmod 600 data/xflow.db`。
-- CLI 和日志必须只显示脱敏 token。
-- 任何 Agent/LLM 代码都不应该接收 token、cookie 或 header 明文。
+- 不要提交 `auth_token`、`ct0`、`.env`、`*.token.json` 文件
+- 导入后立即删除 token 文件
+- 保持 SQLite 私有：`chmod 600 data/xflow.db`
+- CLI 和日志中 token 均脱敏显示
+- Agent/分析代码不会接收原始 token
 
 ## 生产部署
 
 ### 二进制安装
 
 ```bash
-# 在服务器或相同目标平台编译
 cargo build --release
 sudo cp target/release/xflow /usr/local/bin/
-
-# 在专用目录初始化
 sudo mkdir -p /opt/xflow/data
 cd /opt/xflow
-xflow init --config /opt/xflow/config.yaml
-# 编辑 config.yaml：设置 fetcher、sources、telegram 等
-```
-
-### 升级
-
-```bash
-# 编译新版本
-cargo build --release
-
-# 替换二进制后重启服务
-sudo systemctl restart xflow-serve xflow-worker
+xflow init
+# 编辑 config.yaml，创建 .env 填入 Telegram token
+xflow telegram commands set
 ```
 
 ### systemd
@@ -241,11 +193,7 @@ WorkingDirectory=/opt/xflow
 ExecStart=/usr/local/bin/xflow serve --config /opt/xflow/config.yaml
 Restart=on-failure
 RestartSec=5
-
-# 环境变量
 EnvironmentFile=/opt/xflow/.env
-
-# 安全加固
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -259,7 +207,7 @@ WantedBy=multi-user.target
 
 ```ini
 [Unit]
-Description=xFlow Worker（抓取 + Telegram 推送）
+Description=xFlow Worker (fetch + Telegram)
 After=network.target
 
 [Service]
@@ -269,11 +217,7 @@ WorkingDirectory=/opt/xflow
 ExecStart=/usr/local/bin/xflow worker --config /opt/xflow/config.yaml
 Restart=on-failure
 RestartSec=10
-
-# 环境变量
 EnvironmentFile=/opt/xflow/.env
-
-# 安全加固
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -299,40 +243,22 @@ TELEGRAM_BOT_TOKEN=your-bot-token
 TELEGRAM_CHAT_ID=your-chat-id
 ```
 
-注册 Telegram slash commands（运行一次）：
-
-```bash
-cd /opt/xflow
-sudo -u xflow xflow telegram commands set --config /opt/xflow/config.yaml
-```
-
-### Docker 部署
+### Docker
 
 ```bash
 cp .env.example .env
-# 编辑 .env 填入 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
+# 编辑 .env
 docker compose up --build -d
-
-# 注册 Telegram 命令菜单（运行一次）
-docker compose run --rm api xflow telegram commands set --config config.docker.yaml
 ```
+
+数据持久化在宿主机 `./data/` 目录，`docker compose down` 不会删除数据。
 
 ### 备份
 
 ```bash
-# 停止服务以获得一致性快照
-sudo systemctl stop xflow-worker xflow-serve
-
-# 备份数据库和配置
-sudo cp /opt/xflow/data/xflow.db /opt/xflow/data/xflow.db.bak
-sudo cp /opt/xflow/config.yaml /opt/xflow/config.yaml.bak
-
-# 重启
-sudo systemctl start xflow-serve xflow-worker
-```
-
-不停止服务也可以用 SQLite 的 `.backup` 命令获得一致性快照：
-
-```bash
 sqlite3 /opt/xflow/data/xflow.db ".backup /opt/xflow/data/xflow.db.bak"
 ```
+
+## License
+
+MIT

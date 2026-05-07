@@ -17,6 +17,7 @@ This document tracks the next engineering work after the Rust service migration.
   - 翻页拉取：循环调用 X API 获取 timeline 直到覆盖目标时间范围。
   - 时间过滤：按 `created_at` 过滤掉范围外的推文。
   - 按需触发：TG 命令如 `/fetch @openai 7d` 或 CLI 参数。
+- **获取 Likes 推文** — 支持获取某 username 点赞的推文，作为新的 source type（如 `SourceType::Likes`）。通过 X 的 Likes API 端点获取，可用于追踪某用户关注的内容。
 
 ## 2. Auth Improvements
 

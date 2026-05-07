@@ -2,199 +2,56 @@
 
 [中文文档](README.zh-CN.md)
 
-xFlow is a self-hosted Rust service that turns configured X/Twitter-like sources into cached RSS and JSON feeds, with optional analysis, Markdown digests, and Telegram delivery. The server runs as a Rust binary with SQLite and `config.yaml`; it does not require Playwright, Chromium, Python browser dependencies, or a GUI environment.
+xFlow is a self-hosted Rust service that fetches X/Twitter content, caches it in SQLite, and outputs via RSS/JSON feeds and Telegram delivery. It includes multi-account rotation, adaptive rate control, rule-based analysis, and an interactive Telegram bot.
 
 ```text
-X sources -> Fetcher -> SQLite cache/dedupe -> RuleBasedAgent -> RSS/JSON/Telegram
+X sources -> Fetcher (multi-account rotation, adaptive backoff) -> SQLite cache/dedupe -> Agent -> RSS/JSON/Telegram Bot
 ```
 
-The default fetcher is a deterministic `MockFetcher`. Set `fetch.fetcher: x_web` to fetch real account timelines with imported X `auth_token`/`ct0` cookies.
+## Features
 
-## Server Installation
+- **X Web Fetcher** — Fetches real account timelines via X Web API with browser-compatible headers
+- **Multi-account Rotation** — Round-robin across auth accounts, auto-skips limited/rejected ones
+- **Adaptive Rate Control** — Auto-backoff on failures, recovery on success, request randomization (UA pool, jitter)
+- **Telegram Bot** — Interactive commands: `/add`, `/remove`, `/list`, `/status`, `/fetch`, `/help`
+- **Telegram Push** — Auto-delivers new tweets with retry and truncation
+- **RSS/JSON Feeds** — HTTP server for feed readers and integrations
+- **SQLite Storage** — Single-file database, no external dependencies
+- **Docker Compose** — One-command deployment
+
+## Quick Start
+
+### Docker Compose (Recommended)
+
+```bash
+cp .env.example .env
+# Edit .env: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+docker compose up --build -d
+
+# Import X auth token (run once)
+source .env
+cargo build --release
+./target/release/xflow init --config config.docker.yaml
+./target/release/xflow auth import --label main --auth-token TOKEN --ct0 CT0 --config config.docker.yaml
+
+# Register Telegram bot commands (run once)
+./target/release/xflow telegram commands set --config config.docker.yaml
+```
+
+### Build from Source
 
 ```bash
 cargo build --release
 ./target/release/xflow init
-./target/release/xflow fetch
-./target/release/xflow serve
+./target/release/xflow auth import --label main --auth-token TOKEN --ct0 CT0
+# Edit config.yaml: set fetcher: x_web
+./target/release/xflow serve    # API server (port 8000)
+./target/release/xflow worker   # Fetch + Telegram delivery loop
 ```
-
-Default files:
-
-- `config.yaml`
-- `data/xflow.db`
-
-If Cargo cannot reach crates.io reliably, configure a mirror before building:
-
-```toml
-# ~/.cargo/config.toml
-[source.crates-io]
-replace-with = "ustc"
-
-[source.ustc]
-registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
-```
-
-RSS URLs:
-
-- `http://127.0.0.1:8000/rss/all`
-- `http://127.0.0.1:8000/rss/account/openai`
-- `http://127.0.0.1:8000/rss/important`
-
-JSON URLs:
-
-- `http://127.0.0.1:8000/json/all`
-- `http://127.0.0.1:8000/json/important`
-
-## Local Token Export
-
-Run token export on your own computer, not on the server. Token files contain sensitive login state and should be deleted after import.
-
-Browser-assisted export uses Playwright. On macOS, the script can use an installed Chrome, Edge, or Chromium instead of Playwright's bundled browser:
-
-```bash
-python3 -m pip install playwright
-python3 tools/xflow_auth_export.py --label account1 --out /tmp/xflow-token.json
-```
-
-If browser download is slow or unavailable, point the script at an installed browser:
-
-```bash
-python3 tools/xflow_auth_export.py \
-  --label account1 \
-  --out /tmp/xflow-token.json \
-  --executable-path "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-```
-
-Windows example:
-
-```bat
-python -m venv .venv
-.venv\Scripts\activate
-pip install playwright
-playwright install chromium
-python tools\xflow_auth_export.py --label account1 --out xflow-token.json
-```
-
-Manual cookie fallback:
-
-1. Log in to `https://x.com`.
-2. Open DevTools:
-   - Chrome/Edge on macOS: `Cmd + Option + I`
-   - Chrome/Edge on Windows/Linux: `F12`
-   - Or right-click the page and choose Inspect.
-3. Open the cookies table:
-   - English UI: Application -> Storage -> Cookies -> `https://x.com`
-   - Chinese UI: 应用 -> 存储 -> Cookie -> `https://x.com`
-   - If the Application/应用 tab is hidden, click the `>>` overflow menu in DevTools.
-4. In the cookie table, copy only the Value/值 for these cookie names:
-   - `auth_token`
-   - `ct0`
-5. Do not copy the whole row, the `auth_token=` prefix, quotes, or a trailing semicolon.
-6. Generate the import file without printing token values:
-
-```bash
-python3 tools/xflow_token_json.py \
-  --label account1 \
-  --auth-token 'YOUR_AUTH_TOKEN' \
-  --ct0 'YOUR_CT0' \
-  --out /tmp/xflow-token.json
-```
-
-Upload and import on the server:
-
-```bash
-scp xflow-token.json user@server:/tmp/xflow-token.json
-xflow auth import /tmp/xflow-token.json
-rm /tmp/xflow-token.json
-```
-
-For local testing from the repository:
-
-```bash
-cargo run -- auth import /tmp/xflow-token.json
-cargo run -- auth list
-rm /tmp/xflow-token.json
-```
-
-Token JSON format:
-
-```json
-{
-  "label": "account1",
-  "domain": "x.com",
-  "auth_token": "...",
-  "ct0": "...",
-  "exported_at": "2026-05-02T09:30:00Z"
-}
-```
-
-Manual fallback:
-
-```bash
-xflow auth import --label account1 --auth-token xxx --ct0 yyy
-```
-
-Other auth commands:
-
-```bash
-xflow auth list
-xflow auth check --label account1
-xflow auth delete --label account1
-```
-
-## Real X Fetching
-
-After importing at least one auth account, enable the X Web fetcher. `x_web` has been verified with a real `auth_token`/`ct0` pair against account timelines.
-
-```yaml
-fetch:
-  interval_seconds: 900
-  default_limit: 20
-  fetcher: x_web
-sources:
-  accounts:
-    - username: openai
-      limit: 20
-  lists: []
-  searches: []
-```
-
-`x_web` currently supports account sources only. If multiple auth accounts are stored, xFlow uses the first account by label. The fetcher keeps cookie/header construction inside Rust fetch code and never passes token values to analysis, RSS, JSON, or Telegram code.
-
-Run a fetch:
-
-```bash
-cargo run -- fetch
-```
-
-Expected success output:
-
-```text
-Fetched 5 tweets from 1 sources; analyzed 5.
-```
-
-X Web internals can change. The fetcher uses browser-compatible headers, the `x.com/i/api/graphql` endpoint, and current defaults based on the public web client behavior. GraphQL query ids can be overridden without rebuilding:
-
-```bash
-export XFLOW_X_WEB_BEARER_TOKEN=...
-export XFLOW_X_USER_BY_SCREEN_NAME_QUERY_ID=...
-export XFLOW_X_USER_TWEETS_QUERY_ID=...
-```
-
-For conservative scheduling, configure a delay between account sources:
-
-```yaml
-fetch:
-  source_delay_min_seconds: 5
-  source_delay_max_seconds: 20
-```
-
-If X returns `Could not authenticate you`, refresh `auth_token` and `ct0` from the same logged-in browser session. If X returns GraphQL errors after authentication succeeds, the query ids or response shape may need updating.
 
 ## Configuration
 
-Edit `config.yaml`:
+Default `config.yaml`:
 
 ```yaml
 server:
@@ -204,199 +61,142 @@ storage:
   database: data/xflow.db
 fetch:
   interval_seconds: 900
-  default_limit: 20
-  fetcher: mock
+  default_limit: 5
+  fetcher: mock          # Change to "x_web" for real data
+  source_delay_min_seconds: 60
+  source_delay_max_seconds: 120
 sources:
   accounts:
     - username: openai
       limit: 5
-  lists: []
-  searches: []
 agent:
-  enabled: true
-  keywords: [AI, agent, LLM, OpenAI, coding, model, paper, GitHub]
+  enabled: false         # Rule-based analysis (disabled by default)
   importance_threshold: 0.45
   push_threshold: 0.7
 telegram:
-  enabled: false
+  enabled: true
   bot_token_env: TELEGRAM_BOT_TOKEN
   chat_id_env: TELEGRAM_CHAT_ID
   send_all: true
   parse_mode: HTML
-  disable_web_page_preview: false
 ```
 
-## Commands
+Sources can also be managed at runtime via Telegram bot commands.
+
+## Telegram Bot Commands
+
+The bot uses long-polling to receive and respond to commands:
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/add @username` | Add a source to monitor |
+| `/remove @username` | Remove a source |
+| `/list` | List all sources and status |
+| `/status` | Show system status |
+| `/fetch` | Trigger immediate fetch |
+
+## X Auth Token
+
+### Manual Cookie Export
+
+1. Log in to `https://x.com`
+2. Open DevTools (`Cmd+Option+I` on macOS, `F12` on Windows)
+3. Go to Application → Cookies → `https://x.com`
+4. Copy the **Value** for `auth_token` and `ct0`
+5. Import:
 
 ```bash
-xflow init
-xflow fetch
-xflow serve
-xflow worker
-xflow digest --output digest.md
-xflow telegram send
-xflow telegram commands set
-xflow telegram commands list
-xflow telegram commands clear
+xflow auth import --label main --auth-token YOUR_TOKEN --ct0 YOUR_CT0
 ```
 
-`xflow worker` runs fetch plus Telegram delivery every `fetch.interval_seconds`.
-Run `xflow telegram commands set` once during production setup, or whenever the
-bot command menu changes. It registers the Telegram slash command menu only; the
-worker does not repeat command registration on every start.
-
-## Docker Compose
+### Token Management
 
 ```bash
-cp .env.example .env
-docker compose up --build
+xflow auth list                              # List accounts (masked tokens)
+xflow auth check --label main                # Check stored token shape
+xflow auth check --label main --live         # Live validation against X API
+xflow auth delete --label main               # Remove account
 ```
 
-Compose starts `api` and `worker` services sharing `./data`. The image contains the Rust binary only; it does not install Playwright or Chromium.
+## RSS/JSON Endpoints
+
+```
+http://127.0.0.1:8000/rss/all              # All tweets
+http://127.0.0.1:8000/rss/account/openai   # Per-account
+http://127.0.0.1:8000/rss/important        # Important only
+http://127.0.0.1:8000/json/all             # JSON format
+http://127.0.0.1:8000/health               # Health check
+```
+
+## Risk Control
+
+- **Account Rotation** — Round-robin by `last_used_at`, skips limited/rejected accounts
+- **Adaptive Interval** — Backoff on failures (up to ×8), recovery on success
+- **Request Randomization** — Random User-Agent pool, variable source delays
+- **Token Freshness** — Warns when tokens haven't been updated in 7+ days
+- **HTTP Timeout** — 30s timeout to prevent hung connections
+
+## CLI Commands
+
+```bash
+xflow init                                 # Initialize config + database
+xflow fetch                                # One-time fetch
+xflow serve                                # Start HTTP API server
+xflow worker                               # Fetch + Telegram loop with bot poller
+xflow digest --output digest.md            # Generate Markdown digest
+xflow auth import /path/to/token.json      # Import from JSON file
+xflow auth import --label L --auth-token X --ct0 Y  # Import directly
+xflow auth list                            # List accounts
+xflow auth check --label L                 # Check account
+xflow auth delete --label L                # Delete account
+xflow telegram commands set                # Register bot command menu
+xflow telegram commands list               # List registered commands
+xflow telegram commands clear              # Clear commands
+```
 
 ## Security
 
-- Token JSON files are sensitive login state. Do not commit them.
-- Never paste `auth_token` or `ct0` into issues, PRs, chat, logs, or prompts.
-- Delete uploaded token JSON immediately after `xflow auth import`.
-- Keep SQLite private, for example `chmod 600 data/xflow.db`.
-- CLI and logs must mask `auth_token` and `ct0`.
-- Agent/LLM code must never receive token, cookie, or header values.
+- Never commit `auth_token`, `ct0`, `.env`, or `*.token.json` files
+- Delete token files immediately after import
+- Keep SQLite private: `chmod 600 data/xflow.db`
+- All CLI output and logs mask token values
+- Agent/analysis code never receives raw tokens
 
 ## Production Deployment
 
 ### Binary Install
 
 ```bash
-# Build on the server or a matching target
 cargo build --release
 sudo cp target/release/xflow /usr/local/bin/
-
-# Initialize in a dedicated directory
 sudo mkdir -p /opt/xflow/data
 cd /opt/xflow
-xflow init --config /opt/xflow/config.yaml
-# Edit config.yaml: set fetcher, sources, telegram, etc.
-```
-
-### Upgrade
-
-```bash
-# Build the new version
-cargo build --release
-
-# Restart services after replacing the binary
-sudo systemctl restart xflow-serve xflow-worker
+xflow init
+# Edit config.yaml, create .env with Telegram tokens
+xflow telegram commands set
 ```
 
 ### systemd
 
-`/etc/systemd/system/xflow-serve.service`:
-
-```ini
-[Unit]
-Description=xFlow API Server
-After=network.target
-
-[Service]
-Type=simple
-User=xflow
-WorkingDirectory=/opt/xflow
-ExecStart=/usr/local/bin/xflow serve --config /opt/xflow/config.yaml
-Restart=on-failure
-RestartSec=5
-
-# Environment
-EnvironmentFile=/opt/xflow/.env
-
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/xflow/data
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`/etc/systemd/system/xflow-worker.service`:
-
-```ini
-[Unit]
-Description=xFlow Worker (fetch + Telegram)
-After=network.target
-
-[Service]
-Type=simple
-User=xflow
-WorkingDirectory=/opt/xflow
-ExecStart=/usr/local/bin/xflow worker --config /opt/xflow/config.yaml
-Restart=on-failure
-RestartSec=10
-
-# Environment
-EnvironmentFile=/opt/xflow/.env
-
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/xflow/data
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Create the service user and enable:
-
-```bash
-sudo useradd -r -s /bin/false xflow
-sudo chown -R xflow:xflow /opt/xflow
-sudo systemctl daemon-reload
-sudo systemctl enable --now xflow-serve xflow-worker
-```
-
-Environment file (`/opt/xflow/.env`):
-
-```bash
-TELEGRAM_BOT_TOKEN=your-bot-token
-TELEGRAM_CHAT_ID=your-chat-id
-```
-
-Register Telegram slash commands (run once):
-
-```bash
-cd /opt/xflow
-sudo -u xflow xflow telegram commands set --config /opt/xflow/config.yaml
-```
+See `README.zh-CN.md` for full systemd unit files.
 
 ### Docker
 
 ```bash
 cp .env.example .env
-# Edit .env with TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+# Edit .env
 docker compose up --build -d
-
-# Register Telegram commands (run once)
-docker compose run --rm api xflow telegram commands set --config config.docker.yaml
 ```
+
+Data persists in `./data/` on the host. `docker compose down` does not delete data.
 
 ### Backup
 
 ```bash
-# Stop services to get a consistent snapshot
-sudo systemctl stop xflow-worker xflow-serve
-
-# Backup database and config
-sudo cp /opt/xflow/data/xflow.db /opt/xflow/data/xflow.db.bak
-sudo cp /opt/xflow/config.yaml /opt/xflow/config.yaml.bak
-
-# Restart
-sudo systemctl start xflow-serve xflow-worker
-```
-
-For online backup without stopping services, SQLite's `.backup` command produces a consistent snapshot:
-
-```bash
 sqlite3 /opt/xflow/data/xflow.db ".backup /opt/xflow/data/xflow.db.bak"
 ```
+
+## License
+
+MIT
