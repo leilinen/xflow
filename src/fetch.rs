@@ -560,7 +560,7 @@ fn parse_x_datetime(value: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_tweets, parse_user, XUser};
+    use super::{collect_tweets, parse_user, random_user_agent, XUser};
     use crate::models::{Source, SourceType};
     use serde_json::json;
     use std::collections::HashSet;
@@ -645,5 +645,20 @@ mod tests {
         assert_eq!(tweets[0].tweet_id, "100");
         assert_eq!(tweets[0].text, "hello from xFlow");
         assert_eq!(tweets[0].author_username, "openai");
+    }
+
+    #[test]
+    fn random_user_agent_returns_valid_strings() {
+        for _ in 0..20 {
+            let ua = random_user_agent();
+            assert!(ua.starts_with("Mozilla/5.0"));
+            assert!(ua.contains("Chrome") || ua.contains("Firefox"));
+        }
+    }
+
+    #[test]
+    fn random_user_agent_varies_across_calls() {
+        let agents: HashSet<&str> = (0..50).map(|_| random_user_agent()).collect();
+        assert!(agents.len() > 1, "user agent should vary across calls");
     }
 }

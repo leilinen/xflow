@@ -10,3 +10,4 @@ target/
 xflow-token.json
 *.token.json
 .xflow-auth-profile/
+logs/
