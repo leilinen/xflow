@@ -18,16 +18,45 @@ struct TelegramUpdate {
 struct TelegramMessage {
     chat: TelegramChat,
     text: Option<String>,
+    #[serde(default)]
+    reply_to_message: Option<Box<TelegramMessage>>,
+    #[serde(default)]
+    entities: Vec<TelegramEntity>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    from: Option<TelegramUser>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TelegramChat {
     id: i64,
+    #[serde(default, rename = "type")]
+    chat_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct TelegramUser {
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramEntity {
+    #[serde(rename = "type")]
+    entity_type: String,
+    offset: i64,
+    length: i64,
+}
+
+fn is_group_chat(chat: &TelegramChat) -> bool {
+    chat.chat_type == "group" || chat.chat_type == "supergroup"
 }
 
 pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<()> {
     let bot_token = telegram::load_bot_token(&config.telegram)?;
     let allowed_chat_id = std::env::var(&config.telegram.chat_id_env).ok();
+    let bot_username = get_bot_username(&bot_token).await;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .build()?;
@@ -41,26 +70,41 @@ pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<(
                 for update in updates {
                     offset = Some(update.update_id + 1);
                     if let Some(message) = update.message {
-                        if let Some(ref allowed) = allowed_chat_id {
-                            if message.chat.id.to_string() != *allowed {
-                                tracing::warn!(
-                                    chat_id = message.chat.id,
-                                    "ignoring message from unauthorized chat"
-                                );
-                                continue;
+                        let is_group = is_group_chat(&message.chat);
+
+                        // In private chat: check authorization
+                        if !is_group {
+                            if let Some(ref allowed) = allowed_chat_id {
+                                if message.chat.id.to_string() != *allowed {
+                                    tracing::warn!(
+                                        chat_id = message.chat.id,
+                                        "ignoring message from unauthorized chat"
+                                    );
+                                    continue;
+                                }
                             }
                         }
-                        if let Some(text) = message.text {
-                            handle_command(
-                                &config,
-                                &pool,
-                                &client,
-                                &bot_token,
-                                message.chat.id,
-                                &text,
-                            )
-                            .await;
+
+                        let Some(text) = message.text else {
+                            continue;
+                        };
+
+                        // In groups: only respond to replies to bot or @mentions
+                        if is_group
+                            && !is_bot_addressed(&text, &message.entities, &message.reply_to_message, bot_username.as_deref())
+                        {
+                            continue;
                         }
+
+                        handle_command(
+                            &config,
+                            &pool,
+                            &client,
+                            &bot_token,
+                            message.chat.id,
+                            &text,
+                        )
+                        .await;
                     }
                 }
             }
@@ -70,6 +114,65 @@ pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<(
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
+}
+
+async fn get_bot_username(bot_token: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(telegram::telegram_api_url(bot_token, "getMe"))
+        .send()
+        .await
+        .ok()?;
+
+    #[derive(Debug, Deserialize)]
+    struct BotInfo {
+        username: Option<String>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct ApiResponse {
+        ok: bool,
+        result: Option<BotInfo>,
+    }
+
+    let body: ApiResponse = response.json().await.ok()?;
+    if body.ok {
+        body.result.and_then(|r| r.username)
+    } else {
+        None
+    }
+}
+
+/// In a group, the bot should only respond when:
+/// 1. The message is a reply to one of the bot's messages, OR
+/// 2. The message starts with @bot_username mention before the command
+fn is_bot_addressed(
+    text: &str,
+    entities: &[TelegramEntity],
+    reply_to: &Option<Box<TelegramMessage>>,
+    bot_username: Option<&str>,
+) -> bool {
+    // Check if replying to a message (likely from the bot)
+    if reply_to.is_some() {
+        return true;
+    }
+
+    // Check if the text contains a mention entity pointing to the bot
+    if let Some(username) = bot_username {
+        for entity in entities {
+            if entity.entity_type == "mention" {
+                let mention = text
+                    .chars()
+                    .skip(entity.offset as usize)
+                    .take(entity.length as usize)
+                    .collect::<String>();
+                if mention == format!("@{username}") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 async fn poll_updates(
@@ -128,6 +231,8 @@ async fn handle_command(
         "/list" => cmd_list(pool).await,
         "/status" => cmd_status(pool, config).await,
         "/fetch" => cmd_fetch(config, pool).await,
+        "/latest" => cmd_latest(pool, &args).await,
+        "/digest" => cmd_digest(pool, config).await,
         _ => return,
     };
 
@@ -197,7 +302,9 @@ fn cmd_help() -> anyhow::Result<String> {
          /remove @username - Remove a source\n\
          /list - List all sources and status\n\
          /status - Show system status\n\
-         /fetch - Trigger an immediate fetch"
+         /fetch - Trigger an immediate fetch\n\
+         /latest [@user] - Show recent tweets (default 5)\n\
+         /digest - Show analyzed digest summary"
             .to_string(),
     )
 }
@@ -268,11 +375,7 @@ async fn cmd_list(pool: &SqlitePool) -> anyhow::Result<String> {
         };
         let key = format!("{}:{}", source.source_type.as_str(), source.value);
         let fetch_info = state_map.get(&key).map(|(lat, st)| {
-            let time = lat
-                .as_deref()
-                .unwrap_or("-")
-                .get(..19)
-                .unwrap_or("-");
+            let time = crate::utils::format_db_timestamp(lat.as_deref());
             format!(" | {st} @ {time}")
         });
         lines.push(format!(
@@ -301,16 +404,19 @@ async fn cmd_status(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<Str
     .await?
     .flatten();
 
+    let last_fetch_display = match &last_fetch {
+        Some(s) => crate::utils::format_db_timestamp(Some(s)),
+        None => "never".to_string(),
+    };
     let mut status = format!(
         "xFlow Status\n\n\
          Tweets: {total_tweets}\n\
          Sources: {} (enabled)\n\
          Interval: {}s\n\
-         Last fetch: {}\n\
+         Last fetch: {last_fetch_display}\n\
          Fetcher: {}\n",
         sources.len(),
         config.fetch.interval_seconds,
-        last_fetch.as_deref().unwrap_or("never"),
         config.fetch.fetcher,
     );
 
@@ -332,7 +438,7 @@ async fn cmd_status(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<Str
             let lat: Option<String> = row.get("last_fetch_at");
             status.push_str(&format!(
                 "  {stype}:{sval} - {lst} ({})\n",
-                lat.as_deref().unwrap_or("-")
+                crate::utils::format_db_timestamp(lat.as_deref())
             ));
         }
     }
@@ -371,6 +477,73 @@ async fn cmd_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<Stri
     }
 
     Ok(msg)
+}
+
+async fn cmd_latest(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+    let username = args.trim().trim_start_matches('@').to_string();
+    let filter = if username.is_empty() {
+        storage::TweetFilter {
+            limit: 5,
+            ..Default::default()
+        }
+    } else {
+        storage::TweetFilter {
+            username: Some(username.clone()),
+            limit: 5,
+            ..Default::default()
+        }
+    };
+    let tweets = storage::list_tweets(pool, filter).await?;
+    if tweets.is_empty() {
+        return Ok(if username.is_empty() {
+            "No tweets found.".to_string()
+        } else {
+            format!("No tweets found for @{username}.")
+        });
+    }
+    let mut lines = vec!["Latest tweets:\n".to_string()];
+    for stored in &tweets {
+        let time = crate::utils::format_utc8(&stored.tweet.created_at);
+        lines.push(format!(
+            "@{} [{}] {}\n{}",
+            stored.tweet.author_username,
+            time,
+            stored.tweet.text.chars().take(100).collect::<String>(),
+            stored.tweet.url,
+        ));
+    }
+    Ok(lines.join("\n\n"))
+}
+
+async fn cmd_digest(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<String> {
+    if !config.agent.enabled {
+        return Ok("Digest requires agent analysis to be enabled.".to_string());
+    }
+    let tweets =
+        storage::list_analyzed_for_digest(pool, config.agent.importance_threshold, 20).await?;
+    if tweets.is_empty() {
+        return Ok("No analyzed tweets found for digest.".to_string());
+    }
+    let mut lines = vec!["xFlow Digest:\n".to_string()];
+    let mut current_category = String::new();
+    for stored in &tweets {
+        let Some(ref analysis) = stored.analysis else {
+            continue;
+        };
+        if analysis.category != current_category {
+            current_category = analysis.category.clone();
+            lines.push(format!("\n[{}]", current_category));
+        }
+        let time = crate::utils::format_utc8(&stored.tweet.created_at);
+        lines.push(format!(
+            "  @{}/{} | {}\n  {}",
+            stored.tweet.author_username,
+            time,
+            analysis.chinese_summary.chars().take(80).collect::<String>(),
+            stored.tweet.url,
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use crate::models::StoredTweet;
+use chrono::FixedOffset;
 use rss::{ChannelBuilder, Item, ItemBuilder};
 
 pub fn generate_rss(
@@ -7,6 +8,7 @@ pub fn generate_rss(
     description: &str,
     tweets: &[StoredTweet],
 ) -> anyhow::Result<String> {
+    let utc8 = FixedOffset::east_opt(8 * 3600).expect("UTC+8 is a valid offset");
     let items: Vec<Item> = tweets
         .iter()
         .map(|stored| {
@@ -33,7 +35,7 @@ pub fn generate_rss(
                     value: tweet.tweet_id.clone(),
                     permalink: false,
                 }))
-                .pub_date(Some(tweet.created_at.to_rfc2822()))
+                .pub_date(Some(tweet.created_at.with_timezone(&utc8).to_rfc2822()))
                 .description(Some(description))
                 .build()
         })

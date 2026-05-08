@@ -61,6 +61,7 @@ pub struct TweetFilter {
     pub username: Option<String>,
     pub important_only: bool,
     pub limit: i64,
+    pub offset: i64,
 }
 
 pub async fn upsert_source(pool: &SqlitePool, source: &Source) -> anyhow::Result<()> {
@@ -268,12 +269,13 @@ pub async fn list_tweets(
         sql.push_str(" WHERE ");
         sql.push_str(&where_parts.join(" AND "));
     }
-    sql.push_str(" ORDER BY t.created_at DESC LIMIT ?");
+    sql.push_str(" ORDER BY t.created_at DESC LIMIT ? OFFSET ?");
     let mut query = sqlx::query(&sql);
     if let Some(username) = filter.username {
         query = query.bind(username.trim_start_matches('@').to_string());
     }
     query = query.bind(if filter.limit > 0 { filter.limit } else { 100 });
+    query = query.bind(if filter.offset > 0 { filter.offset } else { 0 });
     let rows = query.fetch_all(pool).await?;
     rows.into_iter().map(row_to_tweet).collect()
 }

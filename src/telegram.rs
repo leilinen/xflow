@@ -110,6 +110,14 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
             command: "fetch".to_string(),
             description: "Trigger immediate fetch".to_string(),
         },
+        TelegramBotCommand {
+            command: "latest".to_string(),
+            description: "Show recent tweets (e.g. /latest @openai)".to_string(),
+        },
+        TelegramBotCommand {
+            command: "digest".to_string(),
+            description: "Show analyzed digest summary".to_string(),
+        },
     ]
 }
 
@@ -161,9 +169,9 @@ enum TelegramSendError {
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
     let mut parts = vec![
         format!(
-            "<b>@{}</b> · {}",
+            "<b>@{}</b> · {} UTC+8",
             html_escape(&stored.tweet.author_username),
-            stored.tweet.created_at.format("%Y-%m-%d %H:%M UTC")
+            crate::utils::format_utc8(&stored.tweet.created_at)
         ),
         html_escape(&stored.tweet.text),
     ];
@@ -395,6 +403,68 @@ pub fn telegram_api_url(bot_token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{bot_token}/{method}")
 }
 
+/// Send a fetch failure alert via Telegram. Best-effort: errors are logged but not propagated.
+pub async fn send_fetch_alert(
+    config: &TelegramConfig,
+    errors: &[crate::pipeline::FetchSourceError],
+) -> anyhow::Result<()> {
+    if !config.enabled || errors.is_empty() {
+        return Ok(());
+    }
+    let bot_token = match load_bot_token(config) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let chat_id = match std::env::var(&config.chat_id_env) {
+        Ok(id) => id,
+        Err(_) => return Ok(()),
+    };
+
+    let now = crate::utils::format_utc8_full(&chrono::Utc::now());
+    let mut lines = vec![
+        format!("xFlow Fetch Alert ({now} UTC+8)"),
+        format!("{} source(s) failed:", errors.len()),
+        String::new(),
+    ];
+    for err in errors {
+        lines.push(format!(
+            "  {}:{} - {}",
+            err.source_type, err.source_value, err.message
+        ));
+    }
+    let text = lines.join("\n");
+    let text = if text.len() > TELEGRAM_MESSAGE_LIMIT {
+        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
+    } else {
+        text
+    };
+
+    let client = Client::new();
+    let payload = SendMessagePayload {
+        chat_id,
+        text,
+        parse_mode: None,
+        disable_web_page_preview: true,
+    };
+
+    match client
+        .post(telegram_api_url(&bot_token, "sendMessage"))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(response) if !response.status().is_success() => {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(?body, "failed to send fetch alert via Telegram");
+        }
+        Err(err) => {
+            tracing::warn!(?err, "failed to send fetch alert via Telegram");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,7 +502,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "add", "remove", "list", "status", "fetch"]
+            vec!["help", "add", "remove", "list", "status", "fetch", "latest", "digest"]
         );
         assert!(commands
             .iter()

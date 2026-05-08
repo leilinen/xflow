@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::pipeline::{self, FetchResult};
 use crate::storage;
+use crate::telegram;
 use crate::{channel, telegram::TelegramResult};
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -81,11 +82,34 @@ pub async fn run_forever(config: AppConfig, pool: SqlitePool) -> anyhow::Result<
                 );
                 current_interval = next;
                 consecutive_successes = successes;
+                if result.fetch.failed > 0 {
+                    if let Err(err) = telegram::send_fetch_alert(
+                        &config.telegram,
+                        &result.fetch.errors,
+                    )
+                    .await
+                    {
+                        tracing::warn!(?err, "failed to send fetch alert");
+                    }
+                }
             }
             Err(err) => {
                 tracing::error!(?err, "worker cycle failed");
                 current_interval = (current_interval * 2).min(base_interval * 8);
                 consecutive_successes = 0;
+                let generic_error = pipeline::FetchSourceError {
+                    source_type: "worker".to_string(),
+                    source_value: "cycle".to_string(),
+                    message: err.to_string(),
+                };
+                if let Err(alert_err) = telegram::send_fetch_alert(
+                    &config.telegram,
+                    &[generic_error],
+                )
+                .await
+                {
+                    tracing::warn!(?alert_err, "failed to send cycle failure alert");
+                }
             }
         }
 
