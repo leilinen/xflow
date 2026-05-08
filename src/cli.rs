@@ -1,11 +1,11 @@
-use crate::auth;
+use crate::fetch::auth;
 use crate::config::{load_config, write_default_config};
-use crate::db;
+use crate::storage::db;
 use crate::digest;
-use crate::pipeline;
+use crate::worker::pipeline;
 use crate::server;
 use crate::storage;
-use crate::telegram;
+use crate::channel::telegram;
 use crate::utils::{mask_token, DEFAULT_CONFIG_PATH, DEFAULT_DATA_DIR};
 use crate::worker;
 use clap::{Args, Parser, Subcommand};

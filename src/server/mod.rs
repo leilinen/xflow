@@ -1,5 +1,6 @@
+pub mod rss_feed;
+
 use crate::config::AppConfig;
-use crate::rss_feed;
 use crate::storage::{self, TweetFilter};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

@@ -1,13 +1,13 @@
 use chrono::Utc;
 use tempfile::tempdir;
-use xflow::auth;
+use xflow::fetch::auth;
 use xflow::channel::{self, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use xflow::config::{load_config, AppConfig};
-use xflow::db;
+use xflow::storage::db;
 use xflow::digest;
 use xflow::models::{Source, SourceType, StoredTweet, Tweet};
-use xflow::pipeline;
-use xflow::rss_feed;
+use xflow::worker::pipeline;
+use xflow::server::rss_feed;
 use xflow::storage::{self, TokenImport, TweetFilter};
 use xflow::worker;
 async fn test_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {

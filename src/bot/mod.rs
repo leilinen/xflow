@@ -2,9 +2,9 @@ use crate::channel;
 use crate::config::AppConfig;
 use crate::fetch;
 use crate::models::{Source, SourceType};
-use crate::pipeline;
+use crate::worker::pipeline;
 use crate::storage;
-use crate::telegram;
+use crate::channel::telegram;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 

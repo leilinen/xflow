@@ -1,8 +1,11 @@
+pub mod pipeline;
+
 use crate::config::AppConfig;
-use crate::pipeline::{self, FetchResult};
 use crate::storage;
-use crate::telegram;
-use crate::{channel, telegram::TelegramResult};
+use crate::channel;
+use crate::channel::telegram;
+use crate::channel::telegram::TelegramResult;
+use self::pipeline::FetchResult;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use std::time::Duration;

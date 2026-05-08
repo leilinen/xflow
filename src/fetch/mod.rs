@@ -1,3 +1,5 @@
+pub mod auth;
+
 use crate::config::AppConfig;
 use crate::models::{Source, SourceType, Tweet};
 use crate::storage::{self, AuthAccountSecret};

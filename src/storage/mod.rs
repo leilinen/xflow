@@ -1,3 +1,5 @@
+pub mod db;
+
 use crate::models::{Source, SourceType, StoredTweet, Tweet, TweetAnalysis};
 use crate::utils::{mask_token, to_json_value};
 use chrono::{DateTime, Utc};

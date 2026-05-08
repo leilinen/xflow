@@ -1,8 +1,9 @@
-use crate::channel::{
+use super::{
     ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel,
 };
 use crate::config::TelegramConfig;
 use crate::models::StoredTweet;
+use crate::worker::pipeline::FetchSourceError;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -332,7 +333,7 @@ pub async fn send_undelivered(
             skipped: 0,
         });
     }
-    crate::channel::send_undelivered(
+    super::send_undelivered(
         pool,
         &[Box::new(TelegramChannel::from_config(config)?)],
         limit,
@@ -406,7 +407,7 @@ pub fn telegram_api_url(bot_token: &str, method: &str) -> String {
 /// Send a fetch failure alert via Telegram. Best-effort: errors are logged but not propagated.
 pub async fn send_fetch_alert(
     config: &TelegramConfig,
-    errors: &[crate::pipeline::FetchSourceError],
+    errors: &[FetchSourceError],
 ) -> anyhow::Result<()> {
     if !config.enabled || errors.is_empty() {
         return Ok(());

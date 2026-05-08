@@ -1,7 +1,9 @@
+pub mod telegram;
+
 use crate::config::AppConfig;
 use crate::models::StoredTweet;
 use crate::storage::{self, delivery_payload};
-use crate::telegram::TelegramChannel;
+use self::telegram::TelegramChannel;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
