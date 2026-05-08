@@ -23,7 +23,6 @@ struct TelegramMessage {
     #[serde(default)]
     entities: Vec<TelegramEntity>,
     #[serde(default)]
-    #[allow(dead_code)]
     from: Option<TelegramUser>,
 }
 
@@ -35,10 +34,22 @@ struct TelegramChat {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct TelegramUser {
+    first_name: String,
     #[serde(default)]
+    last_name: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
     username: Option<String>,
+}
+
+impl TelegramUser {
+    fn display_name(&self) -> String {
+        match &self.last_name {
+            Some(last) => format!("{} {}", self.first_name, last),
+            None => self.first_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +107,7 @@ pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<(
                             continue;
                         }
 
+                        let sender_name = message.from.as_ref().map(|u| u.display_name());
                         handle_command(
                             &config,
                             &pool,
@@ -103,6 +115,7 @@ pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<(
                             &bot_token,
                             message.chat.id,
                             &text,
+                            sender_name.as_deref(),
                         )
                         .await;
                     }
@@ -220,9 +233,12 @@ async fn handle_command(
     bot_token: &str,
     chat_id: i64,
     text: &str,
+    sender: Option<&str>,
 ) {
     let (command, args) = parse_command(text);
     let chat_id_str = chat_id.to_string();
+
+    tracing::info!(command = %command, sender = sender.unwrap_or("unknown"), "processing command");
 
     let response = match command.as_str() {
         "/help" | "/start" => cmd_help(),
