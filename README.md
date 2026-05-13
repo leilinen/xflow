@@ -24,6 +24,7 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 - **Private by default**: tokens and cached tweets stay in local SQLite.
 - **RSS and JSON output**: use any feed reader or custom integration.
 - **Telegram delivery**: push new posts to a chat or channel, with retry and delivery tracking.
+- **Rich media in Telegram**: images, videos, animated GIFs, external link previews, quoted/replied tweet threading, and Twitter Articles.
 - **Interactive Telegram bot**: manage sources and trigger fetches from Telegram.
 - **Multi-account auth rotation**: rotate imported X auth accounts and skip limited or rejected ones.
 - **Adaptive rate control**: record X rate-limit headers, back off on failures, and recover after success.
@@ -48,7 +49,13 @@ Cached posts can be consumed through:
 
 - RSS feeds for all posts, important posts, or one account.
 - JSON endpoints with pagination.
-- Telegram push delivery.
+- Telegram push delivery with rich media support:
+  - **Images** — sent as photos or albums via `sendPhoto` / `sendMediaGroup`.
+  - **Videos & GIFs** — sent inline via `sendVideo`.
+  - **External links** — shown with link preview cards.
+  - **Quoted/replied tweets** — displayed as a threaded conversation (quoted tweet first, reply linked via Telegram `reply_parameters`).
+  - **Twitter Articles** — rendered with title, text, and article link.
+  - **Fallback** — if media delivery fails, falls back to text-only to ensure no posts are lost.
 - Markdown digest output from the CLI.
 
 ## Quick Start

@@ -14,7 +14,7 @@ X 数据源 -> Fetcher（多账号轮换、自适应退避） -> SQLite 缓存/�
 - **多账号轮换** — 自动轮换 auth 账号，跳过被限制/拒绝的账号
 - **自适应频率控制** — 失败自动退避，成功逐步恢复，请求随机化（UA 池、抖动）
 - **Telegram Bot** — 交互式命令：`/add`、`/remove`、`/list`、`/status`、`/fetch`、`/help`
-- **Telegram 推送** — 自动推送新推文，支持重试和截断
+- **Telegram 推送** — 自动推送新推文，支持图片、视频、GIF、链接预览、引用/回复推文线程、Twitter 文章，媒体发送失败自动降级为纯文本
 - **RSS/JSON Feed** — HTTP 服务器输出 feed，方便集成
 - **SQLite 存储** — 单文件数据库，无外部依赖
 - **Docker Compose** — 一键部署
@@ -84,6 +84,24 @@ telegram:
 数据源也可以通过 Telegram bot 命令在运行时动态管理。
 
 ## Telegram Bot 命令
+
+### 富媒体推送
+
+xFlow 在推送推文到 Telegram 时自动识别内容类型，使用对应的 Telegram API：
+
+| 内容类型 | 发送方式 |
+|---------|---------|
+| 单张图片 | `sendPhoto` + caption |
+| 多张图片 | `sendMediaGroup`（相册，最多 10 张） |
+| 视频 / GIF | `sendVideo` |
+| 外部链接 | `sendMessage` + 链接预览卡片 |
+| 引用/回复推文 | 先发被引用推文（引用块样式 `▎`），再用 Telegram `reply_parameters` 形成对话线程 |
+| Twitter 文章 | `sendMessage` + `[Article]` 标记 + 链接预览 |
+| 媒体发送失败 | 自动降级为纯文本，确保推文不丢失 |
+
+如果 caption 内容超过 1024 字符限制，会自动追加一条 `sendMessage` 补充完整文本。
+
+### 交互式命令
 
 Bot 通过长轮询接收和处理命令：
 

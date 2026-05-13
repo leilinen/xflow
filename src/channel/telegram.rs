@@ -2,6 +2,10 @@ use super::{
     ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel,
 };
 use crate::config::TelegramConfig;
+use crate::fetch::media::{
+    extract_article, extract_external_links, extract_media, extract_reply_context,
+    ArticleContent, ExternalLink, QuotedTweet, ReplyContext, TweetMedium,
+};
 use crate::models::StoredTweet;
 use crate::worker::pipeline::FetchSourceError;
 use reqwest::Client;
@@ -21,13 +25,81 @@ impl TelegramCredentials {
     }
 }
 
+// --- Payload structs ---
+
 #[derive(Debug, Clone, Serialize)]
 struct SendMessagePayload {
     chat_id: String,
     text: String,
     parse_mode: Option<String>,
-    disable_web_page_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_preview_options: Option<LinkPreviewOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<ReplyParameters>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+struct SendPhotoPayload {
+    chat_id: String,
+    photo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<ReplyParameters>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SendVideoPayload {
+    chat_id: String,
+    video: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_streaming: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<ReplyParameters>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SendMediaGroupPayload {
+    chat_id: String,
+    media: Vec<InputMedia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<ReplyParameters>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InputMedia {
+    #[serde(rename = "type")]
+    type_: String,
+    media: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReplyParameters {
+    message_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LinkPreviewOptions {
+    is_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefer_small_media: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    show_above_text: Option<bool>,
+}
+
+// --- Response types ---
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
@@ -65,6 +137,14 @@ impl TelegramChannel {
             disable_web_page_preview: config.disable_web_page_preview,
             client: Client::new(),
         })
+    }
+
+    fn effective_parse_mode(&self) -> Option<String> {
+        if self.parse_mode.is_empty() {
+            None
+        } else {
+            Some(self.parse_mode.clone())
+        }
     }
 }
 
@@ -158,14 +238,18 @@ async fn set_bot_commands_to(
 }
 
 const TELEGRAM_MESSAGE_LIMIT: usize = 4096;
+const TELEGRAM_CAPTION_LIMIT: usize = 1024;
 const TRUNCATION_MARKER: &str = "\n\n…";
 const MAX_RETRIES: u32 = 2;
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const QUOTED_TWEET_MAX_CHARS: usize = 200;
 
 enum TelegramSendError {
     Transient(anyhow::Error),
     Permanent(anyhow::Error),
 }
+
+// --- Message formatting ---
 
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
     let mut parts = vec![
@@ -196,6 +280,106 @@ pub fn format_tweet_message(stored: &StoredTweet) -> String {
     truncate_message(parts, TELEGRAM_MESSAGE_LIMIT)
 }
 
+/// Compact caption for photo/video (1024-char limit).
+pub fn format_tweet_caption(stored: &StoredTweet) -> String {
+    let header = format!(
+        "<b>@{}</b>",
+        html_escape(&stored.tweet.author_username)
+    );
+    let footer = format!(
+        "<a href=\"{}\">Open tweet</a>",
+        html_escape(&stored.tweet.url)
+    );
+    let sep = "\n\n";
+    let overhead = header.len() + sep.len() + sep.len() + footer.len();
+    let budget = TELEGRAM_CAPTION_LIMIT.saturating_sub(overhead);
+
+    let mut text = html_escape(&stored.tweet.text);
+    if text.len() > budget {
+        text.truncate(text.floor_char_boundary(budget));
+        if let Some(pos) = text.rfind('&') {
+            if !text[pos..].contains(';') {
+                text.truncate(pos);
+            }
+        }
+    }
+
+    [header, text, footer].join(sep)
+}
+
+/// Format a quoted/replied-to tweet as a block message.
+pub fn format_quoted_tweet_block(quoted: &QuotedTweet) -> String {
+    let text = truncate_str(&quoted.text, QUOTED_TWEET_MAX_CHARS);
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| format!("▎ {l}"))
+        .collect();
+    let block = lines.join("\n");
+    format!(
+        "▎ <b>@{}</b>:\n{}\n▎ 🔗 {}",
+        html_escape(&quoted.author_username),
+        block,
+        html_escape(&quoted.url)
+    )
+}
+
+/// Format a reply-context message (replying to @user or quoting a tweet).
+fn format_reply_context_message(reply_ctx: &ReplyContext) -> Option<String> {
+    // Prefer the quoted tweet block (richer info)
+    if let Some(qt) = &reply_ctx.quoted_tweet {
+        return Some(format_quoted_tweet_block(qt));
+    }
+    // Simple reply (no quoted tweet data, just the username/id reference)
+    if let Some(username) = &reply_ctx.reply_to_username {
+        let mut msg = format!("Replying to <b>@{}</b>", html_escape(username));
+        if let Some(id) = &reply_ctx.reply_to_tweet_id {
+            msg.push_str(&format!(
+                "\n▎ 🔗 https://x.com/{username}/status/{id}"
+            ));
+        }
+        return Some(msg);
+    }
+    None
+}
+
+/// Format article message.
+fn format_article_message(stored: &StoredTweet, article: &ArticleContent) -> String {
+    let header = format!(
+        "<b>@{}</b> · {} UTC+8 · [Article]",
+        html_escape(&stored.tweet.author_username),
+        crate::utils::format_utc8(&stored.tweet.created_at)
+    );
+
+    let mut parts = vec![header];
+
+    if let Some(title) = &article.title {
+        parts.push(format!("<b>{}</b>", html_escape(title)));
+    }
+
+    // Article text (may be long)
+    if let Some(text) = &article.text {
+        parts.push(html_escape(text));
+    } else {
+        parts.push(html_escape(&stored.tweet.text));
+    }
+
+    // Footer with both article link and tweet link
+    let mut footer = String::new();
+    footer.push_str(&format!("<a href=\"{}\">Open article</a>", html_escape(&article.url)));
+    footer.push_str(&format!(
+        " · <a href=\"{}\">Open tweet</a>",
+        html_escape(&stored.tweet.url)
+    ));
+    parts.push(footer);
+
+    let message = parts.join("\n\n");
+    if message.len() <= TELEGRAM_MESSAGE_LIMIT {
+        return message;
+    }
+    // Truncate: keep header + truncated text + footer
+    truncate_message(parts, TELEGRAM_MESSAGE_LIMIT)
+}
+
 /// Truncate by removing middle parts (summary, tags) before the footer,
 /// then truncating the tweet text if still too long.
 fn truncate_message(mut parts: Vec<String>, limit: usize) -> String {
@@ -222,6 +406,17 @@ fn truncate_message(mut parts: Vec<String>, limit: usize) -> String {
     [header, text, marker, footer].join(sep)
 }
 
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let mut truncated = s[..s.floor_char_boundary(max_chars.saturating_sub(1))].to_string();
+    truncated.push('…');
+    truncated
+}
+
+// --- DeliveryChannel impl ---
+
 impl DeliveryChannel for TelegramChannel {
     fn id(&self) -> String {
         self.credentials.channel()
@@ -233,47 +428,306 @@ impl DeliveryChannel for TelegramChannel {
 
     fn send_tweet<'a>(&'a self, tweet: &'a StoredTweet) -> ChannelSendFuture<'a> {
         Box::pin(async move {
-            let payload = SendMessagePayload {
-                chat_id: self.credentials.chat_id.clone(),
-                text: format_tweet_message(tweet),
-                parse_mode: if self.parse_mode.is_empty() {
-                    None
-                } else {
-                    Some(self.parse_mode.clone())
-                },
-                disable_web_page_preview: self.disable_web_page_preview,
-            };
-            let mut last_err = None;
-            for attempt in 0..=MAX_RETRIES {
-                if attempt > 0 {
-                    tokio::time::sleep(RETRY_DELAY * attempt).await;
-                }
-                match self.try_send(&payload).await {
-                    Ok(receipt) => return Ok(receipt),
-                    Err(TelegramSendError::Transient(err)) => {
-                        tracing::warn!(
-                            attempt,
-                            tweet_id = %tweet.tweet.tweet_id,
-                            "Telegram transient error, will retry: {err}"
-                        );
-                        last_err = Some(err);
-                    }
-                    Err(TelegramSendError::Permanent(err)) => return Err(err),
-                }
+            let media = extract_media(&tweet.tweet.raw);
+            let links = extract_external_links(&tweet.tweet.raw);
+            let reply_ctx = extract_reply_context(&tweet.tweet.raw);
+            let article = extract_article(&tweet.tweet.raw);
+
+            // Step 1: Send reply context if present
+            let reply_to_msg_id = self.send_reply_context(tweet, reply_ctx.as_ref()).await?;
+
+            // Step 2: Route by content type
+            if !media.is_empty() {
+                self.send_media_tweet(tweet, &media, reply_to_msg_id).await
+            } else if article.is_some() {
+                self.send_article_tweet(tweet, article.as_ref().unwrap(), reply_to_msg_id).await
+            } else if !links.is_empty() {
+                self.send_link_tweet(tweet, &links, reply_to_msg_id).await
+            } else {
+                self.send_text_tweet(tweet, reply_to_msg_id).await
             }
-            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
         })
     }
 }
 
+// --- Send methods ---
+
 impl TelegramChannel {
-    async fn try_send(
+    /// Send the reply/quote context as a separate message, return its message_id for reply threading.
+    async fn send_reply_context(
         &self,
-        payload: &SendMessagePayload,
+        _tweet: &StoredTweet,
+        reply_ctx: Option<&ReplyContext>,
+    ) -> anyhow::Result<Option<i64>> {
+        let Some(ctx) = reply_ctx else {
+            return Ok(None);
+        };
+        let Some(text) = format_reply_context_message(ctx) else {
+            return Ok(None);
+        };
+        let payload = SendMessagePayload {
+            chat_id: self.credentials.chat_id.clone(),
+            text,
+            parse_mode: self.effective_parse_mode(),
+            link_preview_options: Some(LinkPreviewOptions {
+                is_disabled: true,
+                url: None,
+                prefer_small_media: None,
+                show_above_text: None,
+            }),
+            reply_parameters: None,
+        };
+        let result = self.send_with_retry("sendMessage", &payload).await?;
+        Ok(extract_message_id(&result))
+    }
+
+    /// Send a tweet with media (photos/videos).
+    async fn send_media_tweet(
+        &self,
+        tweet: &StoredTweet,
+        media: &[TweetMedium],
+        reply_to_msg_id: Option<i64>,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let result = match self.try_send_media(tweet, media, reply_to_msg_id).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(?err, "media send failed, falling back to text-only");
+                return self.send_text_tweet(tweet, reply_to_msg_id).await;
+            }
+        };
+
+        // If caption was truncated, send full text as a follow-up reply
+        let full_msg = format_tweet_message(tweet);
+        let caption = format_tweet_caption(tweet);
+        if caption.len() < full_msg.len() {
+            let reply_params = extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
+            let _ = self
+                .send_text_message(&full_msg, reply_params, true)
+                .await;
+        }
+
+        Ok(result)
+    }
+
+    async fn try_send_media(
+        &self,
+        tweet: &StoredTweet,
+        media: &[TweetMedium],
+        reply_to_msg_id: Option<i64>,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let caption = format_tweet_caption(tweet);
+        let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
+
+        // Separate photos and videos
+        let photos: Vec<&TweetMedium> = media
+            .iter()
+            .filter(|m| matches!(m, TweetMedium::Photo { .. }))
+            .collect();
+        let videos: Vec<&TweetMedium> = media
+            .iter()
+            .filter(|m| matches!(m, TweetMedium::Video { .. } | TweetMedium::AnimatedGif { .. }))
+            .collect();
+
+        // Single photo
+        if photos.len() == 1 && videos.is_empty() {
+            let url = match photos[0] {
+                TweetMedium::Photo { url } => url.clone(),
+                _ => unreachable!(),
+            };
+            let payload = SendPhotoPayload {
+                chat_id: self.credentials.chat_id.clone(),
+                photo: url,
+                caption: Some(caption),
+                parse_mode: self.effective_parse_mode(),
+                reply_parameters: reply_params,
+            };
+            return self.send_with_retry("sendPhoto", &payload).await;
+        }
+
+        // Multiple photos (album)
+        if photos.len() > 1 && videos.is_empty() {
+            let items: Vec<InputMedia> = photos
+                .iter()
+                .take(10) // Telegram limit
+                .enumerate()
+                .map(|(i, m)| {
+                    let url = match m {
+                        TweetMedium::Photo { url } => url.clone(),
+                        _ => unreachable!(),
+                    };
+                    InputMedia {
+                        type_: "photo".to_string(),
+                        media: url,
+                        caption: if i == 0 { Some(caption.clone()) } else { None },
+                        parse_mode: if i == 0 { self.effective_parse_mode() } else { None },
+                    }
+                })
+                .collect();
+            let payload = SendMediaGroupPayload {
+                chat_id: self.credentials.chat_id.clone(),
+                media: items,
+                reply_parameters: reply_params,
+            };
+            return self.send_with_retry("sendMediaGroup", &payload).await;
+        }
+
+        // Single video or GIF
+        if !videos.is_empty() && photos.is_empty() {
+            let url = match videos[0] {
+                TweetMedium::Video { url } | TweetMedium::AnimatedGif { url } => url.clone(),
+                _ => unreachable!(),
+            };
+            let payload = SendVideoPayload {
+                chat_id: self.credentials.chat_id.clone(),
+                video: url,
+                caption: Some(caption),
+                parse_mode: self.effective_parse_mode(),
+                supports_streaming: Some(true),
+                reply_parameters: reply_params,
+            };
+            return self.send_with_retry("sendVideo", &payload).await;
+        }
+
+        // Mixed: video first with caption, then remaining photos as album
+        if !videos.is_empty() {
+            let url = match videos[0] {
+                TweetMedium::Video { url } | TweetMedium::AnimatedGif { url } => url.clone(),
+                _ => unreachable!(),
+            };
+            let video_payload = SendVideoPayload {
+                chat_id: self.credentials.chat_id.clone(),
+                video: url,
+                caption: Some(caption),
+                parse_mode: self.effective_parse_mode(),
+                supports_streaming: Some(true),
+                reply_parameters: reply_params.clone(),
+            };
+            let video_result = self.send_with_retry("sendVideo", &video_payload).await?;
+            let video_msg_id = extract_message_id(&video_result);
+
+            if !photos.is_empty() {
+                let items: Vec<InputMedia> = photos
+                    .iter()
+                    .take(10)
+                    .map(|m| {
+                        let url = match m {
+                            TweetMedium::Photo { url } => url.clone(),
+                            _ => unreachable!(),
+                        };
+                        InputMedia {
+                            type_: "photo".to_string(),
+                            media: url,
+                            caption: None,
+                            parse_mode: None,
+                        }
+                    })
+                    .collect();
+                let photo_reply = video_msg_id.map(|id| ReplyParameters { message_id: id });
+                let photo_payload = SendMediaGroupPayload {
+                    chat_id: self.credentials.chat_id.clone(),
+                    media: items,
+                    reply_parameters: photo_reply,
+                };
+                let _ = self.send_with_retry("sendMediaGroup", &photo_payload).await;
+            }
+            return Ok(video_result);
+        }
+
+        // Fallback to text
+        self.send_text_tweet(tweet, reply_to_msg_id).await
+    }
+
+    /// Send an article tweet.
+    async fn send_article_tweet(
+        &self,
+        tweet: &StoredTweet,
+        article: &ArticleContent,
+        reply_to_msg_id: Option<i64>,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let text = format_article_message(tweet, article);
+        let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
+        self.send_text_message(&text, reply_params, false).await
+    }
+
+    /// Send a tweet with external links (enable link preview).
+    async fn send_link_tweet(
+        &self,
+        tweet: &StoredTweet,
+        _links: &[ExternalLink],
+        reply_to_msg_id: Option<i64>,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let text = format_tweet_message(tweet);
+        let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
+        self.send_text_message(&text, reply_params, false)
+            .await
+    }
+
+    /// Send a plain text tweet (original behavior).
+    async fn send_text_tweet(
+        &self,
+        tweet: &StoredTweet,
+        reply_to_msg_id: Option<i64>,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let text = format_tweet_message(tweet);
+        let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
+        self.send_text_message(&text, reply_params, self.disable_web_page_preview)
+            .await
+    }
+
+    /// Low-level: send a text message via sendMessage.
+    async fn send_text_message(
+        &self,
+        text: &str,
+        reply_parameters: Option<ReplyParameters>,
+        disable_preview: bool,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let payload = SendMessagePayload {
+            chat_id: self.credentials.chat_id.clone(),
+            text: text.to_string(),
+            parse_mode: self.effective_parse_mode(),
+            link_preview_options: Some(LinkPreviewOptions {
+                is_disabled: disable_preview,
+                url: None,
+                prefer_small_media: None,
+                show_above_text: None,
+            }),
+            reply_parameters,
+        };
+        self.send_with_retry("sendMessage", &payload).await
+    }
+
+    /// Generic retry wrapper for any Telegram API method.
+    async fn send_with_retry<T: Serialize + Clone>(
+        &self,
+        method: &str,
+        payload: &T,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_DELAY * attempt).await;
+            }
+            match self.try_api_call(method, payload).await {
+                Ok(receipt) => return Ok(receipt),
+                Err(TelegramSendError::Transient(err)) => {
+                    tracing::warn!(attempt, method, "Telegram transient error, will retry: {err}");
+                    last_err = Some(err);
+                }
+                Err(TelegramSendError::Permanent(err)) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
+    }
+
+    /// Single API call attempt.
+    async fn try_api_call<T: Serialize + Clone>(
+        &self,
+        method: &str,
+        payload: &T,
     ) -> Result<ChannelSendReceipt, TelegramSendError> {
         let response = self
             .client
-            .post(telegram_api_url(&self.credentials.bot_token, "sendMessage"))
+            .post(telegram_api_url(&self.credentials.bot_token, method))
             .json(payload)
             .send()
             .await;
@@ -311,7 +765,7 @@ impl TelegramChannel {
         } else {
             Err(TelegramSendError::Permanent(anyhow::anyhow!(
                 "{}",
-                serde_json::json!({"request": payload, "response": body})
+                serde_json::json!({"method": method, "response": body})
             )))
         }
     }
@@ -319,6 +773,15 @@ impl TelegramChannel {
 
 fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request()
+}
+
+/// Extract the `message_id` from a Telegram API response receipt.
+fn extract_message_id(receipt: &ChannelSendReceipt) -> Option<i64> {
+    receipt
+        .payload
+        .get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(serde_json::Value::as_i64)
 }
 
 pub async fn send_undelivered(
@@ -445,7 +908,13 @@ pub async fn send_fetch_alert(
         chat_id,
         text,
         parse_mode: None,
-        disable_web_page_preview: true,
+        link_preview_options: Some(LinkPreviewOptions {
+            is_disabled: true,
+            url: None,
+            prefer_small_media: None,
+            show_above_text: None,
+        }),
+        reply_parameters: None,
     };
 
     match client
@@ -470,8 +939,27 @@ pub async fn send_fetch_alert(
 mod tests {
     use super::*;
     use crate::models::{SourceType, Tweet, TweetAnalysis};
+    use crate::fetch::media::{ArticleContent, QuotedTweet};
     use chrono::Utc;
     use serde_json::json;
+
+    fn make_stored(text: &str, raw: serde_json::Value) -> StoredTweet {
+        StoredTweet {
+            tweet: Tweet {
+                tweet_id: "1".to_string(),
+                source_type: SourceType::Account,
+                source_value: "openai".to_string(),
+                author_username: "openai".to_string(),
+                author_name: "OpenAI".to_string(),
+                text: text.to_string(),
+                url: "https://x.com/openai/status/1".to_string(),
+                created_at: Utc::now(),
+                fetched_at: Utc::now(),
+                raw,
+            },
+            analysis: None,
+        }
+    }
 
     #[test]
     fn escapes_html() {
@@ -567,5 +1055,87 @@ mod tests {
         let message = format_tweet_message(&stored);
         assert!(!message.contains(TRUNCATION_MARKER.trim()));
         assert!(message.contains("Short tweet"));
+    }
+
+    #[test]
+    fn caption_fits_within_1024_chars() {
+        let stored = make_stored(&"x".repeat(2000), json!({}));
+        let caption = format_tweet_caption(&stored);
+        assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
+        assert!(caption.contains("<b>@openai</b>"));
+        assert!(caption.contains("Open tweet"));
+    }
+
+    #[test]
+    fn short_caption_not_truncated() {
+        let stored = make_stored("hello world", json!({}));
+        let caption = format_tweet_caption(&stored);
+        assert!(caption.contains("hello world"));
+        assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
+    }
+
+    #[test]
+    fn quoted_tweet_block_format() {
+        let qt = QuotedTweet {
+            tweet_id: "123".to_string(),
+            author_username: "openai".to_string(),
+            text: "We are launching GPT-5 today!".to_string(),
+            url: "https://x.com/openai/status/123".to_string(),
+        };
+        let block = format_quoted_tweet_block(&qt);
+        assert!(block.contains("▎ <b>@openai</b>:"));
+        assert!(block.contains("▎ We are launching GPT-5 today!"));
+        assert!(block.contains("▎ 🔗"));
+    }
+
+    #[test]
+    fn quoted_tweet_block_truncates_long_text() {
+        let qt = QuotedTweet {
+            tweet_id: "123".to_string(),
+            author_username: "openai".to_string(),
+            text: "A".repeat(500),
+            url: "https://x.com/openai/status/123".to_string(),
+        };
+        let block = format_quoted_tweet_block(&qt);
+        // Should be reasonably short
+        assert!(block.len() < 400);
+    }
+
+    #[test]
+    fn article_message_format() {
+        let stored = make_stored("check this article", json!({}));
+        let article = ArticleContent {
+            url: "https://x.com/i/article/123".to_string(),
+            title: Some("My Article Title".to_string()),
+            text: Some("Full article text here.".to_string()),
+        };
+        let msg = format_article_message(&stored, &article);
+        assert!(msg.contains("[Article]"));
+        assert!(msg.contains("My Article Title"));
+        assert!(msg.contains("Full article text here."));
+        assert!(msg.contains("Open article"));
+        assert!(msg.contains("Open tweet"));
+    }
+
+    #[test]
+    fn extract_message_id_from_receipt() {
+        let receipt = ChannelSendReceipt {
+            payload: serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 1234567890
+                }
+            }),
+        };
+        assert_eq!(extract_message_id(&receipt), Some(42));
+    }
+
+    #[test]
+    fn extract_message_id_returns_none_when_missing() {
+        let receipt = ChannelSendReceipt {
+            payload: serde_json::json!({"ok": true}),
+        };
+        assert_eq!(extract_message_id(&receipt), None);
     }
 }

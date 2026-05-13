@@ -103,6 +103,7 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<SqlitePool> {
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
         .await?;
+    tracing::info!(path = %db_path.display(), "connected to database");
     Ok(pool)
 }
 
@@ -116,6 +117,7 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
     migrate_sources(pool).await?;
     migrate_auth_accounts(pool).await?;
     migrate_deliveries(pool).await?;
+    tracing::debug!("database schema initialized");
     Ok(())
 }
 

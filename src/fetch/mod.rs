@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod media;
 
 use crate::config::AppConfig;
 use crate::models::{Source, SourceType, Tweet};

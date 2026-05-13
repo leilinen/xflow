@@ -73,7 +73,7 @@ async fn json_all(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let tweets = storage::list_tweets(
+    let tweets: Vec<_> = storage::list_tweets(
         &state.pool,
         TweetFilter {
             limit: params.limit,
@@ -89,7 +89,7 @@ async fn json_important(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let tweets = storage::list_tweets(
+    let tweets: Vec<_> = storage::list_tweets(
         &state.pool,
         TweetFilter {
             important_only: true,
@@ -106,7 +106,7 @@ async fn rss_all(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Response, AppError> {
-    let tweets = storage::list_tweets(
+    let tweets: Vec<_> = storage::list_tweets(
         &state.pool,
         TweetFilter {
             limit: params.limit,
@@ -128,7 +128,7 @@ async fn rss_account(
     Path(username): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Response, AppError> {
-    let tweets = storage::list_tweets(
+    let tweets: Vec<_> = storage::list_tweets(
         &state.pool,
         TweetFilter {
             username: Some(username.clone()),
@@ -150,7 +150,7 @@ async fn rss_important(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Response, AppError> {
-    let tweets = storage::list_tweets(
+    let tweets: Vec<_> = storage::list_tweets(
         &state.pool,
         TweetFilter {
             important_only: true,

@@ -395,6 +395,7 @@ pub async fn import_auth_account(pool: &SqlitePool, token: &TokenImport) -> anyh
     .bind(&now)
     .execute(pool)
     .await?;
+    tracing::debug!(label = %token.label, "upserted auth account");
     Ok(())
 }
 
