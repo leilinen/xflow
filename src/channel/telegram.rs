@@ -254,7 +254,8 @@ enum TelegramSendError {
 pub fn format_tweet_message(stored: &StoredTweet) -> String {
     let mut parts = vec![
         format!(
-            "<b>@{}</b> · {} UTC+8",
+            "<b>{}</b> (@{}) · {} UTC+8",
+            html_escape(&stored.tweet.author_name),
             html_escape(&stored.tweet.author_username),
             crate::utils::format_utc8(&stored.tweet.created_at)
         ),
@@ -283,7 +284,8 @@ pub fn format_tweet_message(stored: &StoredTweet) -> String {
 /// Compact caption for photo/video (1024-char limit).
 pub fn format_tweet_caption(stored: &StoredTweet) -> String {
     let header = format!(
-        "<b>@{}</b>",
+        "<b>{}</b> (@{})",
+        html_escape(&stored.tweet.author_name),
         html_escape(&stored.tweet.author_username)
     );
     let footer = format!(
@@ -345,7 +347,8 @@ fn format_reply_context_message(reply_ctx: &ReplyContext) -> Option<String> {
 /// Format article message.
 fn format_article_message(stored: &StoredTweet, article: &ArticleContent) -> String {
     let header = format!(
-        "<b>@{}</b> · {} UTC+8 · [Article]",
+        "<b>{}</b> (@{}) · {} UTC+8 · [Article]",
+        html_escape(&stored.tweet.author_name),
         html_escape(&stored.tweet.author_username),
         crate::utils::format_utc8(&stored.tweet.created_at)
     );
@@ -1028,7 +1031,7 @@ mod tests {
         };
         let message = format_tweet_message(&stored);
         assert!(message.len() <= TELEGRAM_MESSAGE_LIMIT);
-        assert!(message.contains("<b>@openai</b>"));
+        assert!(message.contains("<b>OpenAI</b> (@openai)"));
         assert!(message.contains("Open tweet"));
         assert!(message.contains(TRUNCATION_MARKER.trim()));
         // Summary and tags should be dropped when truncated.
@@ -1062,7 +1065,7 @@ mod tests {
         let stored = make_stored(&"x".repeat(2000), json!({}));
         let caption = format_tweet_caption(&stored);
         assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
-        assert!(caption.contains("<b>@openai</b>"));
+        assert!(caption.contains("<b>OpenAI</b> (@openai)"));
         assert!(caption.contains("Open tweet"));
     }
 
