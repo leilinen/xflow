@@ -6,6 +6,7 @@ use crate::models::{Source, SourceType, Tweet};
 use crate::storage::{self, AuthAccountSecret};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use reqwest::{header, Response};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -13,6 +14,48 @@ use std::collections::HashSet;
 const X_WEB_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 const DEFAULT_USER_BY_SCREEN_NAME_QUERY_ID: &str = "-oaLodhGbbnzJBACb1kk2Q";
 const DEFAULT_USER_TWEETS_QUERY_ID: &str = "oRJs8SLCRNRbQzuZG93_oA";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillResult {
+    pub total: usize,
+    pub new: usize,
+    pub duplicate: usize,
+    pub pages: usize,
+}
+
+pub async fn backfill_user(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    username: &str,
+    max_pages: usize,
+    page_delay: u64,
+) -> anyhow::Result<BackfillResult> {
+    let fetcher = XWebFetcher::new(config, pool).await?;
+    let username = username.trim_start_matches('@');
+    let user = fetcher.lookup_user(username).await?;
+    let source = Source {
+        source_type: SourceType::Account,
+        value: username.to_string(),
+        label: None,
+        limit: None,
+    };
+    let (tweets, pages) = fetcher
+        .fetch_user_tweets_paginated(&source, &user, max_pages, page_delay)
+        .await?;
+    let total = tweets.len();
+    let mut new = 0;
+    for tweet in &tweets {
+        if storage::upsert_tweet(pool, tweet).await? {
+            new += 1;
+        }
+    }
+    Ok(BackfillResult {
+        total,
+        new,
+        duplicate: total - new,
+        pages,
+    })
+}
 
 pub async fn fetch_source(
     config: &AppConfig,
@@ -248,6 +291,81 @@ impl XWebFetcher {
         tweets.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         tweets.truncate(limit as usize);
         Ok(tweets)
+    }
+
+    async fn fetch_user_tweets_paginated(
+        &self,
+        source: &Source,
+        user: &XUser,
+        max_pages: usize,
+        page_delay: u64,
+    ) -> anyhow::Result<(Vec<Tweet>, usize)> {
+        let mut all_seen = HashSet::new();
+        let mut all_tweets = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+
+        loop {
+            let mut variables = json!({
+                "userId": user.id,
+                "count": 100,
+                "includePromotedContent": false,
+                "withQuickPromoteEligibilityTweetFields": false,
+                "withVoice": false,
+                "withV2Timeline": true
+            });
+            if let Some(ref c) = cursor {
+                variables["cursor"] = json!(c);
+            }
+            let features = common_features();
+            let field_toggles = json!({
+                "withArticlePlainText": false
+            });
+            let value = match self
+                .graphql_get(
+                    &self.user_tweets_query_id,
+                    "UserTweets",
+                    variables,
+                    features,
+                    Some(field_toggles),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(?err, "backfill page request failed, stopping pagination");
+                    break;
+                }
+            };
+            pages += 1;
+            let page_count_before = all_tweets.len();
+            collect_tweets(&value, source, user, &mut all_seen, &mut all_tweets);
+            let page_new = all_tweets.len() - page_count_before;
+            tracing::info!(
+                page = pages,
+                page_new,
+                total = all_tweets.len(),
+                "backfill page collected"
+            );
+            if page_new == 0 {
+                tracing::info!("backfill: page returned 0 new tweets, stopping");
+                break;
+            }
+            cursor = extract_cursor(&value, "Bottom");
+            if cursor.is_none() {
+                tracing::info!("backfill: no bottom cursor found, reached end");
+                break;
+            }
+            if max_pages > 0 && pages >= max_pages {
+                tracing::info!(max_pages, "backfill: reached max pages limit");
+                break;
+            }
+            if page_delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(page_delay)).await;
+            }
+        }
+        all_tweets.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        Ok((all_tweets, pages))
     }
 
     async fn graphql_get(
@@ -570,6 +688,35 @@ fn parse_x_datetime(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_str(value, "%a %b %d %H:%M:%S %z %Y")
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn extract_cursor(value: &Value, cursor_type: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(content) = map.get("content") {
+                if let Some(ct) = content.get("cursorType").and_then(Value::as_str) {
+                    if ct == cursor_type {
+                        return content.get("value").and_then(Value::as_str).map(String::from);
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(cursor) = extract_cursor(child, cursor_type) {
+                    return Some(cursor);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(cursor) = extract_cursor(item, cursor_type) {
+                    return Some(cursor);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

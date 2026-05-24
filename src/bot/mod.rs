@@ -247,6 +247,7 @@ async fn handle_command(
         "/list" => cmd_list(pool).await,
         "/status" => cmd_status(pool, config).await,
         "/fetch" => cmd_fetch(config, pool).await,
+        "/backfill" => cmd_backfill(config, pool, &args).await,
         "/latest" => cmd_latest(pool, &args).await,
         "/digest" => cmd_digest(pool, config).await,
         _ => return,
@@ -319,6 +320,7 @@ fn cmd_help() -> anyhow::Result<String> {
          /list - List all sources and status\n\
          /status - Show system status\n\
          /fetch - Trigger an immediate fetch\n\
+         /backfill @username - Backfill all historical tweets\n\
          /latest [@user] - Show recent tweets (default 5)\n\
          /digest - Show analyzed digest summary"
             .to_string(),
@@ -493,6 +495,22 @@ async fn cmd_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<Stri
     }
 
     Ok(msg)
+}
+
+async fn cmd_backfill(config: &AppConfig, pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+    let username = args.trim().trim_start_matches('@').to_string();
+    if username.is_empty() {
+        return Ok("Usage: /backfill @username".to_string());
+    }
+    let result = fetch::backfill_user(config, pool, &username, 0, 2).await?;
+    Ok(format!(
+        "Backfill @{} complete:\n\
+         Total: {} tweets\n\
+         New: {}\n\
+         Existing: {}\n\
+         Pages: {}",
+        username, result.total, result.new, result.duplicate, result.pages
+    ))
 }
 
 async fn cmd_latest(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {

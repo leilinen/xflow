@@ -192,6 +192,10 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
             description: "Trigger immediate fetch".to_string(),
         },
         TelegramBotCommand {
+            command: "backfill".to_string(),
+            description: "Backfill all tweets from a user (e.g. /backfill @openai)".to_string(),
+        },
+        TelegramBotCommand {
             command: "latest".to_string(),
             description: "Show recent tweets (e.g. /latest @openai)".to_string(),
         },
@@ -994,7 +998,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "add", "remove", "list", "status", "fetch", "latest", "digest"]
+            vec!["help", "add", "remove", "list", "status", "fetch", "backfill", "latest", "digest"]
         );
         assert!(commands
             .iter()

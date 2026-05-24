@@ -27,6 +27,7 @@ enum Command {
     Fetch(ConfigOpt),
     Serve(ConfigOpt),
     Worker(ConfigOpt),
+    Backfill(BackfillArgs),
     Digest(DigestArgs),
     Telegram {
         #[command(subcommand)]
@@ -50,6 +51,18 @@ struct DigestArgs {
     config: PathBuf,
     #[arg(short, long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct BackfillArgs {
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+    #[arg(long)]
+    username: String,
+    #[arg(long, default_value_t = 0)]
+    max_pages: usize,
+    #[arg(long, default_value_t = 2)]
+    page_delay: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +153,17 @@ pub async fn run() -> anyhow::Result<()> {
                 config.fetch.interval_seconds
             );
             worker::run_forever(config, pool).await
+        }
+        Command::Backfill(args) => {
+            let (config, pool) = configured_pool(&args.config).await?;
+            let result =
+                crate::fetch::backfill_user(&config, &pool, &args.username, args.max_pages, args.page_delay)
+                    .await?;
+            println!(
+                "Backfill @{} complete: {} total, {} new, {} existing, {} pages.",
+                args.username, result.total, result.new, result.duplicate, result.pages
+            );
+            Ok(())
         }
         Command::Digest(args) => {
             let (config, pool) = configured_pool(&args.config).await?;
