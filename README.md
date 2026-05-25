@@ -25,7 +25,9 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 - **RSS and JSON output**: use any feed reader or custom integration.
 - **Telegram delivery**: push new posts to a chat or channel, with retry and delivery tracking.
 - **Rich media in Telegram**: images, videos, animated GIFs, external link previews, quoted/replied tweet threading, and Twitter Articles.
+- **Display name in Telegram**: shows author's display name alongside @username.
 - **Interactive Telegram bot**: manage sources and trigger fetches from Telegram.
+- **Historical backfill**: fetch all past tweets from any monitored account via cursor pagination.
 - **Multi-account auth rotation**: rotate imported X auth accounts and skip limited or rejected ones.
 - **Adaptive rate control**: record X rate-limit headers, back off on failures, and recover after success.
 - **Digest generation**: render a Markdown digest from cached and analyzed posts.
@@ -35,7 +37,7 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 
 ### 1. Fetch
 
-The production fetcher, `x_web`, uses browser-compatible X Web API requests with imported `auth_token` and `ct0` cookies. It currently supports account timelines.
+The production fetcher, `x_web`, uses browser-compatible X Web API requests with imported `auth_token` and `ct0` cookies. It currently supports account timelines. Use the backfill command to fetch all historical tweets from an account via cursor-based pagination.
 
 The mock fetcher is useful for local setup and tests because it does not call X.
 
@@ -246,6 +248,7 @@ Supported bot commands:
 | `/list` | List sources |
 | `/status` | Show service status |
 | `/fetch` | Trigger a fetch |
+| `/backfill @openai` | Backfill all historical tweets |
 | `/latest @openai` | Show recent posts |
 | `/digest` | Show digest summary |
 
@@ -262,6 +265,7 @@ xflow init
 xflow fetch
 xflow serve
 xflow worker
+xflow backfill --username openai --max-pages 10 --page-delay 2
 xflow digest --output digest.md
 
 xflow auth import /path/to/token.json
