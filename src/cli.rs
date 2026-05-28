@@ -181,7 +181,7 @@ pub async fn run() -> anyhow::Result<()> {
             TelegramCommand::Send(args) => {
                 let (config, pool) = configured_pool(&args.config).await?;
                 let result =
-                    telegram::send_undelivered(&pool, &config.telegram, args.limit).await?;
+                    telegram::send_undelivered(&pool, &config.telegram, &config.comments, args.limit).await?;
                 println!(
                     "Telegram delivery: sent {}, failed {}, skipped {}.",
                     result.sent, result.failed, result.skipped

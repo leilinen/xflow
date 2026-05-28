@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
     FOREIGN KEY(tweet_id) REFERENCES tweets(tweet_id) ON DELETE SET NULL,
     UNIQUE(tweet_id, channel)
 );
+
+CREATE TABLE IF NOT EXISTS spam_keywords (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 pub async fn connect(db_path: &Path) -> anyhow::Result<SqlitePool> {

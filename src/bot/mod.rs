@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +59,21 @@ struct TelegramEntity {
     entity_type: String,
     offset: i64,
     length: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    #[allow(dead_code)]
+    from: TelegramUser,
+    message: Option<TelegramCallbackMessage>,
+    data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackMessage {
+    message_id: i64,
+    chat: TelegramChat,
 }
 
 fn is_group_chat(chat: &TelegramChat) -> bool {
@@ -116,6 +132,17 @@ pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<(
                             message.chat.id,
                             &text,
                             sender_name.as_deref(),
+                        )
+                        .await;
+                    }
+
+                    if let Some(callback) = update.callback_query {
+                        handle_callback_query(
+                            &config,
+                            &pool,
+                            &client,
+                            &bot_token,
+                            callback,
                         )
                         .await;
                     }
@@ -203,7 +230,7 @@ async fn poll_updates(
     let payload = GetUpdatesPayload {
         offset,
         timeout: 30,
-        allowed_updates: vec!["message".to_string()],
+        allowed_updates: vec!["message".to_string(), "callback_query".to_string()],
     };
 
     let response = client
@@ -250,6 +277,7 @@ async fn handle_command(
         "/backfill" => cmd_backfill(config, pool, &args).await,
         "/latest" => cmd_latest(pool, &args).await,
         "/digest" => cmd_digest(pool, config).await,
+        "/spam" => cmd_spam(pool, &args).await,
         _ => return,
     };
 
@@ -311,6 +339,150 @@ async fn send_reply(
     Ok(())
 }
 
+async fn send_reply_to_message(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    reply_to_message_id: i64,
+    text: &str,
+) -> anyhow::Result<()> {
+    #[derive(Debug, serde::Serialize)]
+    struct ReplyParams {
+        message_id: i64,
+    }
+    #[derive(Debug, serde::Serialize)]
+    struct SendMessageWithReply {
+        chat_id: String,
+        text: String,
+        parse_mode: String,
+        reply_parameters: ReplyParams,
+    }
+
+    let text = if text.len() > 4096 {
+        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
+    } else {
+        text.to_string()
+    };
+
+    let response = client
+        .post(telegram::telegram_api_url(bot_token, "sendMessage"))
+        .json(&SendMessageWithReply {
+            chat_id: chat_id.to_string(),
+            text,
+            parse_mode: "HTML".to_string(),
+            reply_parameters: ReplyParams {
+                message_id: reply_to_message_id,
+            },
+        })
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("sendMessage failed: {status} {body}");
+    }
+    Ok(())
+}
+
+// --- Callback query handling ---
+
+async fn handle_callback_query(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    callback: TelegramCallbackQuery,
+) {
+    // Always answer the callback to remove the loading spinner
+    let _ = answer_callback_query(client, bot_token, &callback.id).await;
+
+    let Some(data) = &callback.data else { return };
+    let Some(msg) = &callback.message else { return };
+
+    // Parse callback data: "comments:{tweet_id}"
+    let Some(tweet_id) = data.strip_prefix("comments:") else { return };
+
+    if !config.comments.enabled {
+        let _ = send_reply(client, bot_token, &msg.chat.id.to_string(), "Comment fetching is disabled.").await;
+        return;
+    }
+
+    tracing::info!(tweet_id = %tweet_id, "fetching comments on demand");
+
+    match fetch::fetch_tweet_comments(
+        config,
+        pool,
+        tweet_id,
+        config.comments.max_comments,
+    )
+    .await
+    {
+        Ok(comments) => {
+            if comments.is_empty() {
+                let _ = send_reply_to_message(
+                    client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+                    "No comments found (all may have been filtered as spam).",
+                ).await;
+            } else {
+                let text = format_comments_message(tweet_id, &comments);
+                let _ = send_reply_to_message(
+                    client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text,
+                ).await;
+            }
+        }
+        Err(err) => {
+            tracing::error!(?err, tweet_id = %tweet_id, "failed to fetch comments");
+            let _ = send_reply_to_message(
+                client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+                &format!("Failed to fetch comments: {err}"),
+            ).await;
+        }
+    }
+}
+
+async fn answer_callback_query(
+    client: &reqwest::Client,
+    bot_token: &str,
+    callback_query_id: &str,
+) -> anyhow::Result<()> {
+    #[derive(Debug, serde::Serialize)]
+    struct AnswerCallbackPayload {
+        callback_query_id: String,
+    }
+    let response = client
+        .post(telegram::telegram_api_url(bot_token, "answerCallbackQuery"))
+        .json(&AnswerCallbackPayload {
+            callback_query_id: callback_query_id.to_string(),
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("answerCallbackQuery failed: {status} {body}");
+    }
+    Ok(())
+}
+
+fn format_comments_message(tweet_id: &str, comments: &[crate::models::TweetComment]) -> String {
+    let mut lines = vec![format!("Comments ({} shown):\n", comments.len())];
+    for (i, comment) in comments.iter().enumerate() {
+        lines.push(format!(
+            "{}. <b>{}</b> (@{}): {}",
+            i + 1,
+            telegram::html_escape(&comment.author_name),
+            telegram::html_escape(&comment.author_username),
+            telegram::html_escape(&comment.text),
+        ));
+    }
+    lines.push(format!(
+        "\n<a href=\"https://x.com/i/status/{}\">View full conversation</a>",
+        tweet_id
+    ));
+    lines.join("\n")
+}
+
 fn cmd_help() -> anyhow::Result<String> {
     Ok(
         "xFlow Bot Commands:\n\n\
@@ -322,7 +494,8 @@ fn cmd_help() -> anyhow::Result<String> {
          /fetch - Trigger an immediate fetch\n\
          /backfill @username - Backfill all historical tweets\n\
          /latest [@user] - Show recent tweets (default 5)\n\
-         /digest - Show analyzed digest summary"
+         /digest - Show analyzed digest summary\n\
+         /spam [list|add|remove] - Manage spam keywords"
             .to_string(),
     )
 }
@@ -578,6 +751,47 @@ async fn cmd_digest(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<Str
         ));
     }
     Ok(lines.join("\n"))
+}
+
+async fn cmd_spam(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+    let (subcmd, keyword) = parse_command(args);
+    match subcmd.as_str() {
+        "list" => {
+            let keywords = storage::list_spam_keywords(pool).await?;
+            if keywords.is_empty() {
+                Ok("No spam keywords configured.\nUse /spam add <keyword> to add one.".to_string())
+            } else {
+                let items: Vec<String> = keywords.iter().map(|k| format!("  - {}", k)).collect();
+                Ok(format!("Spam keywords ({}):\n{}", keywords.len(), items.join("\n")))
+            }
+        }
+        "add" => {
+            if keyword.is_empty() {
+                return Ok("Usage: /spam add <keyword>".to_string());
+            }
+            let success = storage::add_spam_keyword(pool, &keyword).await?;
+            if success {
+                Ok(format!("Added spam keyword: {}", keyword))
+            } else {
+                Ok(format!("Keyword already exists or is empty: {}", keyword))
+            }
+        }
+        "remove" => {
+            if keyword.is_empty() {
+                return Ok("Usage: /spam remove <keyword>".to_string());
+            }
+            let success = storage::remove_spam_keyword(pool, &keyword).await?;
+            if success {
+                Ok(format!("Removed spam keyword: {}", keyword))
+            } else {
+                Ok(format!("Keyword not found: {}", keyword))
+            }
+        }
+        _ => Ok(
+            "Usage:\n  /spam list - List all spam keywords\n  /spam add <keyword> - Add a keyword\n  /spam remove <keyword> - Remove a keyword"
+                .to_string(),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use super::{
     ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel,
 };
-use crate::config::TelegramConfig;
+use crate::config::{CommentsConfig, TelegramConfig};
 use crate::fetch::media::{
     extract_article, extract_external_links, extract_media, extract_reply_context,
     ArticleContent, ExternalLink, QuotedTweet, ReplyContext, TweetMedium,
@@ -36,6 +36,8 @@ struct SendMessagePayload {
     link_preview_options: Option<LinkPreviewOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_parameters: Option<ReplyParameters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +50,8 @@ struct SendPhotoPayload {
     parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_parameters: Option<ReplyParameters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +66,8 @@ struct SendVideoPayload {
     supports_streaming: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_parameters: Option<ReplyParameters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +105,26 @@ struct LinkPreviewOptions {
     show_above_text: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct InlineKeyboardButton {
+    text: String,
+    callback_data: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InlineKeyboardMarkup {
+    inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+}
+
+fn comment_button_markup(tweet_id: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "Load comments".to_string(),
+            callback_data: format!("comments:{}", tweet_id),
+        }]],
+    }
+}
+
 // --- Response types ---
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,16 +151,18 @@ pub struct TelegramChannel {
     send_all: bool,
     parse_mode: String,
     disable_web_page_preview: bool,
+    comments_enabled: bool,
     client: Client,
 }
 
 impl TelegramChannel {
-    pub fn from_config(config: &TelegramConfig) -> anyhow::Result<Self> {
+    pub fn from_config(config: &TelegramConfig, comments: &CommentsConfig) -> anyhow::Result<Self> {
         Ok(Self {
             credentials: load_credentials(config)?,
             send_all: config.send_all,
             parse_mode: config.parse_mode.clone(),
             disable_web_page_preview: config.disable_web_page_preview,
+            comments_enabled: comments.enabled,
             client: Client::new(),
         })
     }
@@ -202,6 +230,10 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
         TelegramBotCommand {
             command: "digest".to_string(),
             description: "Show analyzed digest summary".to_string(),
+        },
+        TelegramBotCommand {
+            command: "spam".to_string(),
+            description: "Manage spam keywords (list/add/remove)".to_string(),
         },
     ]
 }
@@ -439,19 +471,20 @@ impl DeliveryChannel for TelegramChannel {
             let links = extract_external_links(&tweet.tweet.raw);
             let reply_ctx = extract_reply_context(&tweet.tweet.raw);
             let article = extract_article(&tweet.tweet.raw);
+            let reply_markup = self.comment_markup(&tweet.tweet.tweet_id);
 
             // Step 1: Send reply context if present
             let reply_to_msg_id = self.send_reply_context(tweet, reply_ctx.as_ref()).await?;
 
             // Step 2: Route by content type
             if !media.is_empty() {
-                self.send_media_tweet(tweet, &media, reply_to_msg_id).await
+                self.send_media_tweet(tweet, &media, reply_to_msg_id, reply_markup).await
             } else if article.is_some() {
-                self.send_article_tweet(tweet, article.as_ref().unwrap(), reply_to_msg_id).await
+                self.send_article_tweet(tweet, article.as_ref().unwrap(), reply_to_msg_id, reply_markup).await
             } else if !links.is_empty() {
-                self.send_link_tweet(tweet, &links, reply_to_msg_id).await
+                self.send_link_tweet(tweet, &links, reply_to_msg_id, reply_markup).await
             } else {
-                self.send_text_tweet(tweet, reply_to_msg_id).await
+                self.send_text_tweet(tweet, reply_to_msg_id, reply_markup).await
             }
         })
     }
@@ -483,6 +516,7 @@ impl TelegramChannel {
                 show_above_text: None,
             }),
             reply_parameters: None,
+            reply_markup: None,
         };
         let result = self.send_with_retry("sendMessage", &payload).await?;
         Ok(extract_message_id(&result))
@@ -494,12 +528,13 @@ impl TelegramChannel {
         tweet: &StoredTweet,
         media: &[TweetMedium],
         reply_to_msg_id: Option<i64>,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> anyhow::Result<ChannelSendReceipt> {
-        let result = match self.try_send_media(tweet, media, reply_to_msg_id).await {
+        let result = match self.try_send_media(tweet, media, reply_to_msg_id, reply_markup.clone()).await {
             Ok(r) => r,
             Err(err) => {
                 tracing::warn!(?err, "media send failed, falling back to text-only");
-                return self.send_text_tweet(tweet, reply_to_msg_id).await;
+                return self.send_text_tweet(tweet, reply_to_msg_id, reply_markup).await;
             }
         };
 
@@ -509,7 +544,7 @@ impl TelegramChannel {
         if caption.len() < full_msg.len() {
             let reply_params = extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
             let _ = self
-                .send_text_message(&full_msg, reply_params, true)
+                .send_text_message(&full_msg, reply_params, true, None)
                 .await;
         }
 
@@ -521,6 +556,7 @@ impl TelegramChannel {
         tweet: &StoredTweet,
         media: &[TweetMedium],
         reply_to_msg_id: Option<i64>,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> anyhow::Result<ChannelSendReceipt> {
         let caption = format_tweet_caption(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
@@ -547,6 +583,7 @@ impl TelegramChannel {
                 caption: Some(caption),
                 parse_mode: self.effective_parse_mode(),
                 reply_parameters: reply_params,
+                reply_markup,
             };
             return self.send_with_retry("sendPhoto", &payload).await;
         }
@@ -591,6 +628,7 @@ impl TelegramChannel {
                 parse_mode: self.effective_parse_mode(),
                 supports_streaming: Some(true),
                 reply_parameters: reply_params,
+                reply_markup,
             };
             return self.send_with_retry("sendVideo", &payload).await;
         }
@@ -608,6 +646,7 @@ impl TelegramChannel {
                 parse_mode: self.effective_parse_mode(),
                 supports_streaming: Some(true),
                 reply_parameters: reply_params.clone(),
+                reply_markup,
             };
             let video_result = self.send_with_retry("sendVideo", &video_payload).await?;
             let video_msg_id = extract_message_id(&video_result);
@@ -641,7 +680,7 @@ impl TelegramChannel {
         }
 
         // Fallback to text
-        self.send_text_tweet(tweet, reply_to_msg_id).await
+        self.send_text_tweet(tweet, reply_to_msg_id, reply_markup).await
     }
 
     /// Send an article tweet.
@@ -650,10 +689,11 @@ impl TelegramChannel {
         tweet: &StoredTweet,
         article: &ArticleContent,
         reply_to_msg_id: Option<i64>,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> anyhow::Result<ChannelSendReceipt> {
         let text = format_article_message(tweet, article);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
-        self.send_text_message(&text, reply_params, false).await
+        self.send_text_message(&text, reply_params, false, reply_markup).await
     }
 
     /// Send a tweet with external links (enable link preview).
@@ -662,10 +702,11 @@ impl TelegramChannel {
         tweet: &StoredTweet,
         _links: &[ExternalLink],
         reply_to_msg_id: Option<i64>,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> anyhow::Result<ChannelSendReceipt> {
         let text = format_tweet_message(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
-        self.send_text_message(&text, reply_params, false)
+        self.send_text_message(&text, reply_params, false, reply_markup)
             .await
     }
 
@@ -674,10 +715,11 @@ impl TelegramChannel {
         &self,
         tweet: &StoredTweet,
         reply_to_msg_id: Option<i64>,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> anyhow::Result<ChannelSendReceipt> {
         let text = format_tweet_message(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
-        self.send_text_message(&text, reply_params, self.disable_web_page_preview)
+        self.send_text_message(&text, reply_params, self.disable_web_page_preview, reply_markup)
             .await
     }
 
@@ -687,6 +729,7 @@ impl TelegramChannel {
         text: &str,
         reply_parameters: Option<ReplyParameters>,
         disable_preview: bool,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> anyhow::Result<ChannelSendReceipt> {
         let payload = SendMessagePayload {
             chat_id: self.credentials.chat_id.clone(),
@@ -699,8 +742,17 @@ impl TelegramChannel {
                 show_above_text: None,
             }),
             reply_parameters,
+            reply_markup,
         };
         self.send_with_retry("sendMessage", &payload).await
+    }
+
+    fn comment_markup(&self, tweet_id: &str) -> Option<InlineKeyboardMarkup> {
+        if self.comments_enabled {
+            Some(comment_button_markup(tweet_id))
+        } else {
+            None
+        }
     }
 
     /// Generic retry wrapper for any Telegram API method.
@@ -794,6 +846,7 @@ fn extract_message_id(receipt: &ChannelSendReceipt) -> Option<i64> {
 pub async fn send_undelivered(
     pool: &SqlitePool,
     config: &TelegramConfig,
+    comments: &CommentsConfig,
     limit: i64,
 ) -> anyhow::Result<TelegramResult> {
     if !config.enabled {
@@ -805,13 +858,13 @@ pub async fn send_undelivered(
     }
     super::send_undelivered(
         pool,
-        &[Box::new(TelegramChannel::from_config(config)?)],
+        &[Box::new(TelegramChannel::from_config(config, comments)?)],
         limit,
     )
     .await
 }
 
-fn html_escape(value: &str) -> String {
+pub(crate) fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -922,6 +975,7 @@ pub async fn send_fetch_alert(
             show_above_text: None,
         }),
         reply_parameters: None,
+        reply_markup: None,
     };
 
     match client
@@ -998,7 +1052,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "add", "remove", "list", "status", "fetch", "backfill", "latest", "digest"]
+            vec!["help", "add", "remove", "list", "status", "fetch", "backfill", "latest", "digest", "spam"]
         );
         assert!(commands
             .iter()

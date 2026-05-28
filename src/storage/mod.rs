@@ -681,3 +681,42 @@ pub async fn check_token_freshness(
 pub fn delivery_payload<T: Serialize>(value: &T) -> Value {
     to_json_value(value)
 }
+
+// --- Spam keywords ---
+
+pub async fn list_spam_keywords(pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query("SELECT keyword FROM spam_keywords ORDER BY keyword")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("keyword"))
+        .collect())
+}
+
+pub async fn add_spam_keyword(pool: &SqlitePool, keyword: &str) -> anyhow::Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let keyword = keyword.trim().to_lowercase();
+    if keyword.is_empty() {
+        return Ok(false);
+    }
+    let result = sqlx::query(
+        "INSERT INTO spam_keywords (keyword, created_at, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(keyword) DO NOTHING",
+    )
+    .bind(&keyword)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn remove_spam_keyword(pool: &SqlitePool, keyword: &str) -> anyhow::Result<bool> {
+    let keyword = keyword.trim().to_lowercase();
+    let result = sqlx::query("DELETE FROM spam_keywords WHERE keyword = ?")
+        .bind(&keyword)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}

@@ -2,7 +2,7 @@ pub mod auth;
 pub mod media;
 
 use crate::config::AppConfig;
-use crate::models::{Source, SourceType, Tweet};
+use crate::models::{Source, SourceType, Tweet, TweetComment};
 use crate::storage::{self, AuthAccountSecret};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use reqwest::{header, Response};
@@ -81,6 +81,24 @@ pub async fn validate_account(config: &AppConfig, pool: &SqlitePool, username: &
         Ok(fetcher) => fetcher.lookup_user(username).await.is_ok(),
         Err(_) => false,
     }
+}
+
+pub async fn fetch_tweet_comments(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    tweet_id: &str,
+    max_comments: usize,
+) -> anyhow::Result<Vec<TweetComment>> {
+    let fetcher = XWebFetcher::new(config, pool).await?;
+    let mut spam_keywords = storage::list_spam_keywords(pool).await?;
+    // Merge config keywords as fallback
+    for kw in &config.comments.spam_keywords {
+        let lower = kw.to_lowercase();
+        if !spam_keywords.iter().any(|k| k.to_lowercase() == lower) {
+            spam_keywords.push(lower);
+        }
+    }
+    fetcher.fetch_comments(tweet_id, max_comments, &spam_keywords).await
 }
 
 pub async fn verify_auth(
@@ -179,6 +197,7 @@ struct XWebFetcher {
     bearer_token: String,
     user_by_screen_name_query_id: String,
     user_tweets_query_id: String,
+    tweet_detail_query_id: String,
 }
 
 fn random_user_agent() -> &'static str {
@@ -217,6 +236,8 @@ impl XWebFetcher {
                 .unwrap_or_else(|_| DEFAULT_USER_BY_SCREEN_NAME_QUERY_ID.to_string()),
             user_tweets_query_id: std::env::var("XFLOW_X_USER_TWEETS_QUERY_ID")
                 .unwrap_or_else(|_| DEFAULT_USER_TWEETS_QUERY_ID.to_string()),
+            tweet_detail_query_id: std::env::var("XFLOW_X_TWEET_DETAIL_QUERY_ID")
+                .unwrap_or_else(|_| config.comments.tweet_detail_query_id.clone()),
         })
     }
 
@@ -366,6 +387,41 @@ impl XWebFetcher {
         }
         all_tweets.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         Ok((all_tweets, pages))
+    }
+
+    async fn fetch_comments(
+        &self,
+        tweet_id: &str,
+        max_comments: usize,
+        spam_keywords: &[String],
+    ) -> anyhow::Result<Vec<TweetComment>> {
+        let variables = json!({
+            "focalTweetId": tweet_id,
+            "withBirdwatchNotes": false,
+            "includePromotedContent": false,
+            "withVoice": false,
+            "withV2Timeline": true
+        });
+        let features = common_features();
+        let field_toggles = json!({
+            "withArticlePlainText": false,
+            "withArticleRichContentState": false
+        });
+        let value = self
+            .graphql_get(
+                &self.tweet_detail_query_id,
+                "TweetDetail",
+                variables,
+                features,
+                Some(field_toggles),
+            )
+            .await?;
+        let mut comments = collect_comments(&value, tweet_id);
+        // Filter spam
+        let lower_keywords: Vec<String> = spam_keywords.iter().map(|k| k.to_lowercase()).collect();
+        comments.retain(|c| !is_spam(&c.text, &lower_keywords));
+        comments.truncate(max_comments);
+        Ok(comments)
     }
 
     async fn graphql_get(
@@ -717,6 +773,109 @@ fn extract_cursor(value: &Value, cursor_type: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn collect_comments(value: &Value, focal_tweet_id: &str) -> Vec<TweetComment> {
+    let mut comments = Vec::new();
+    let mut seen = HashSet::new();
+    collect_comments_recursive(value, focal_tweet_id, &mut seen, &mut comments);
+    comments.sort_by_key(|a| a.created_at);
+    comments
+}
+
+fn collect_comments_recursive(
+    value: &Value,
+    focal_tweet_id: &str,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<TweetComment>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(tweet_results) = map.get("tweet_results") {
+                if let Some(result) = tweet_results.get("result") {
+                    if let Some(comment) = parse_comment_result(result, focal_tweet_id) {
+                        if seen.insert(comment.tweet_id.clone()) {
+                            out.push(comment);
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_comments_recursive(child, focal_tweet_id, seen, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_comments_recursive(item, focal_tweet_id, seen, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_comment_result(result: &Value, focal_tweet_id: &str) -> Option<TweetComment> {
+    let tweet = result.get("tweet").unwrap_or(result);
+    let legacy = tweet.get("legacy")?;
+
+    // Only include direct replies to the focal tweet
+    let reply_to = legacy
+        .get("in_reply_to_status_id_str")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if reply_to != focal_tweet_id {
+        return None;
+    }
+
+    let tweet_id = tweet
+        .get("rest_id")
+        .or_else(|| legacy.get("id_str"))
+        .and_then(Value::as_str)?
+        .to_string();
+
+    let text = note_tweet_text(tweet)
+        .or_else(|| {
+            legacy
+                .get("full_text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            legacy
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })?;
+
+    let created_at = legacy
+        .get("created_at")
+        .and_then(Value::as_str)
+        .and_then(parse_x_datetime)
+        .unwrap_or_else(Utc::now);
+
+    let user = tweet
+        .pointer("/core/user_results/result")
+        .and_then(parse_user_result)
+        .unwrap_or_else(|| XUser {
+            id: String::new(),
+            username: "unknown".to_string(),
+            name: "Unknown".to_string(),
+        });
+
+    Some(TweetComment {
+        tweet_id,
+        author_username: user.username,
+        author_name: user.name,
+        text,
+        created_at,
+    })
+}
+
+fn is_spam(text: &str, lower_keywords: &[String]) -> bool {
+    if lower_keywords.is_empty() {
+        return false;
+    }
+    let text_lower = text.to_lowercase();
+    lower_keywords.iter().any(|kw| text_lower.contains(kw))
 }
 
 #[cfg(test)]

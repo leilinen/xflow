@@ -118,6 +118,37 @@ pub struct TelegramConfig {
     pub disable_web_page_preview: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_comment_max")]
+    pub max_comments: usize,
+    #[serde(default)]
+    pub spam_keywords: Vec<String>,
+    #[serde(default = "default_tweet_detail_query_id")]
+    pub tweet_detail_query_id: String,
+}
+
+impl Default for CommentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_comments: 20,
+            spam_keywords: Vec::new(),
+            tweet_detail_query_id: default_tweet_detail_query_id(),
+        }
+    }
+}
+
+fn default_comment_max() -> usize {
+    20
+}
+
+fn default_tweet_detail_query_id() -> String {
+    "bP4FsJMv-HMjGB2nZOjgOQ".to_string()
+}
+
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
@@ -145,6 +176,8 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     #[serde(default)]
     pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub comments: CommentsConfig,
 }
 
 impl Default for AppConfig {
@@ -172,6 +205,7 @@ impl Default for AppConfig {
             },
             agent: AgentConfig::default(),
             telegram: TelegramConfig::default(),
+            comments: CommentsConfig::default(),
         }
     }
 }

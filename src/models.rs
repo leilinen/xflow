@@ -69,6 +69,15 @@ pub struct TweetAnalysis {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TweetComment {
+    pub tweet_id: String,
+    pub author_username: String,
+    pub author_name: String,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredTweet {
     #[serde(flatten)]
     pub tweet: Tweet,

@@ -13,8 +13,9 @@ X 数据源 -> Fetcher（多账号轮换、自适应退避） -> SQLite 缓存/�
 - **X Web 抓取** — 通过 X Web API 抓取真实账号时间线，使用浏览器兼容的请求头
 - **多账号轮换** — 自动轮换 auth 账号，跳过被限制/拒绝的账号
 - **自适应频率控制** — 失败自动退避，成功逐步恢复，请求随机化（UA 池、抖动）
-- **Telegram Bot** — 交互式命令：`/add`、`/remove`、`/list`、`/status`、`/fetch`、`/help`
+- **Telegram Bot** — 交互式命令：`/add`、`/remove`、`/list`、`/status`、`/fetch`、`/spam`、`/help`
 - **Telegram 推送** — 自动推送新推文，支持图片、视频、GIF、链接预览、引用/回复推文线程、Twitter 文章，媒体发送失败自动降级为纯文本
+- **推文评论** — 点击 "Load comments" 按钮按需获取推文评论，支持垃圾关键词过滤
 - **RSS/JSON Feed** — HTTP 服务器输出 feed，方便集成
 - **SQLite 存储** — 单文件数据库，无外部依赖
 - **Docker Compose** — 一键部署
@@ -101,6 +102,30 @@ xFlow 在推送推文到 Telegram 时自动识别内容类型，使用对应的 
 
 如果 caption 内容超过 1024 字符限制，会自动追加一条 `sendMessage` 补充完整文本。
 
+### 推文评论
+
+每条推文消息底部附带 "Load comments" 按钮。点击后 bot 会通过 X API `TweetDetail` 接口获取该推文的直接回复，经过垃圾关键词过滤后以 HTML 格式回复到原消息下方。
+
+垃圾关键词通过 `/spam` 命令动态管理，存储在数据库中，无需重启即可生效：
+
+| 命令 | 说明 |
+|------|------|
+| `/spam` | 显示用法 |
+| `/spam list` | 列出所有过滤关键词 |
+| `/spam add <关键词>` | 添加过滤关键词 |
+| `/spam remove <关键词>` | 删除过滤关键词 |
+
+也可以在 `config.yaml` 中配置初始关键词（作为 fallback）：
+
+```yaml
+comments:
+  enabled: true
+  max_comments: 20
+  spam_keywords:
+    - "follow me"
+    - "free crypto"
+```
+
 ### 交互式命令
 
 Bot 通过长轮询接收和处理命令：
@@ -113,6 +138,13 @@ Bot 通过长轮询接收和处理命令：
 | `/list` | 列出所有源及状态 |
 | `/status` | 查看系统状态 |
 | `/fetch` | 立即触发一次抓取 |
+| `/backfill @username` | 回溯获取所有历史推文 |
+| `/latest [@user]` | 查看最近推文 |
+| `/digest` | 查看分析摘要 |
+| `/spam` | 显示垃圾关键词用法 |
+| `/spam list` | 列出所有过滤关键词 |
+| `/spam add <关键词>` | 添加过滤关键词 |
+| `/spam remove <关键词>` | 删除过滤关键词 |
 
 ## X Auth Token
 

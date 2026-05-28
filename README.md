@@ -26,7 +26,8 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 - **Telegram delivery**: push new posts to a chat or channel, with retry and delivery tracking.
 - **Rich media in Telegram**: images, videos, animated GIFs, external link previews, quoted/replied tweet threading, and Twitter Articles.
 - **Display name in Telegram**: shows author's display name alongside @username.
-- **Interactive Telegram bot**: manage sources and trigger fetches from Telegram.
+- **Tweet comments**: on-demand comment fetching with inline "Load comments" button and spam keyword filtering.
+- **Interactive Telegram bot**: manage sources, spam keywords, and trigger fetches from Telegram.
 - **Historical backfill**: fetch all past tweets from any monitored account via cursor pagination.
 - **Multi-account auth rotation**: rotate imported X auth accounts and skip limited or rejected ones.
 - **Adaptive rate control**: record X rate-limit headers, back off on failures, and recover after success.
@@ -58,6 +59,7 @@ Cached posts can be consumed through:
   - **Quoted/replied tweets** — displayed as a threaded conversation (quoted tweet first, reply linked via Telegram `reply_parameters`).
   - **Twitter Articles** — rendered with title, text, and article link.
   - **Fallback** — if media delivery fails, falls back to text-only to ensure no posts are lost.
+- **Tweet comments**: click "Load comments" on any delivered tweet to fetch and display replies. Comments are filtered through a configurable spam keyword list managed via the bot (`/spam add`, `/spam remove`, `/spam list`). Keywords are stored in the database and take effect immediately without restart.
 - Markdown digest output from the CLI.
 
 ## Quick Start
@@ -187,6 +189,14 @@ telegram:
   send_all: true
   parse_mode: HTML
   disable_web_page_preview: false
+
+comments:
+  enabled: true
+  max_comments: 20
+  spam_keywords:
+    - "follow me"
+    - "free crypto"
+    - "airdrop"
 ```
 
 Notes:
@@ -251,6 +261,10 @@ Supported bot commands:
 | `/backfill @openai` | Backfill all historical tweets |
 | `/latest @openai` | Show recent posts |
 | `/digest` | Show digest summary |
+| `/spam` | Show spam keyword usage |
+| `/spam list` | List all spam keywords |
+| `/spam add <keyword>` | Add a spam keyword |
+| `/spam remove <keyword>` | Remove a spam keyword |
 
 You can also manually send undelivered posts:
 
