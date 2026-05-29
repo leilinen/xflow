@@ -861,12 +861,42 @@ fn parse_comment_result(result: &Value, focal_tweet_id: &str) -> Option<TweetCom
             name: "Unknown".to_string(),
         });
 
+    // Extract media URLs from extended_entities
+    let media_urls: Vec<String> = legacy
+        .pointer("/extended_entities/media")
+        .and_then(Value::as_array)
+        .map(|media| {
+            media
+                .iter()
+                .filter_map(|m| m.get("media_url_https").and_then(Value::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Extract external links from entities.urls, filtering out x.com/twitter.com internal links
+    let external_links: Vec<String> = legacy
+        .pointer("/entities/urls")
+        .and_then(Value::as_array)
+        .map(|urls| {
+            urls.iter()
+                .filter_map(|u| u.get("expanded_url").and_then(Value::as_str).map(String::from))
+                .filter(|url| {
+                    !url.starts_with("https://x.com/")
+                        && !url.starts_with("https://twitter.com/")
+                        && !url.starts_with("https://t.co/")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(TweetComment {
         tweet_id,
         author_username: user.username,
         author_name: user.name,
         text,
         created_at,
+        media_urls,
+        external_links,
     })
 }
 

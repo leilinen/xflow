@@ -248,6 +248,32 @@ pub async fn save_analysis(pool: &SqlitePool, analysis: &TweetAnalysis) -> anyho
     Ok(())
 }
 
+pub async fn count_tweets(
+    pool: &SqlitePool,
+    filter: &TweetFilter,
+) -> anyhow::Result<i64> {
+    let mut sql = String::from("SELECT COUNT(*) FROM tweets t");
+    let mut where_parts = Vec::new();
+    if filter.username.is_some() {
+        where_parts.push("LOWER(t.author_username) = LOWER(?)");
+    }
+    if filter.important_only {
+        where_parts.push(
+            "EXISTS (SELECT 1 FROM tweet_analysis a WHERE a.tweet_id = t.tweet_id AND a.should_push = 1)",
+        );
+    }
+    if !where_parts.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_parts.join(" AND "));
+    }
+    let mut query = sqlx::query_scalar::<_, i64>(&sql);
+    if let Some(ref username) = filter.username {
+        query = query.bind(username.trim_start_matches('@').to_string());
+    }
+    let count = query.fetch_one(pool).await?;
+    Ok(count)
+}
+
 pub async fn list_tweets(
     pool: &SqlitePool,
     filter: TweetFilter,

@@ -274,8 +274,10 @@ async fn handle_command(
         "/list" => cmd_list(pool).await,
         "/status" => cmd_status(pool, config).await,
         "/fetch" => cmd_fetch(config, pool).await,
-        "/backfill" => cmd_backfill(config, pool, &args).await,
-        "/latest" => cmd_latest(pool, &args).await,
+        "/latest" => {
+            cmd_latest(config, pool, client, bot_token, chat_id, &args).await;
+            return;
+        }
         "/digest" => cmd_digest(pool, config).await,
         "/spam" => cmd_spam(pool, &args).await,
         _ => return,
@@ -400,44 +402,43 @@ async fn handle_callback_query(
     let Some(data) = &callback.data else { return };
     let Some(msg) = &callback.message else { return };
 
-    // Parse callback data: "comments:{tweet_id}"
-    let Some(tweet_id) = data.strip_prefix("comments:") else { return };
-
-    if !config.comments.enabled {
-        let _ = send_reply(client, bot_token, &msg.chat.id.to_string(), "Comment fetching is disabled.").await;
-        return;
-    }
-
-    tracing::info!(tweet_id = %tweet_id, "fetching comments on demand");
-
-    match fetch::fetch_tweet_comments(
-        config,
-        pool,
-        tweet_id,
-        config.comments.max_comments,
-    )
-    .await
-    {
-        Ok(comments) => {
-            if comments.is_empty() {
-                let _ = send_reply_to_message(
-                    client, bot_token, &msg.chat.id.to_string(), msg.message_id,
-                    "No comments found (all may have been filtered as spam).",
-                ).await;
-            } else {
-                let text = format_comments_message(tweet_id, &comments);
-                let _ = send_reply_to_message(
-                    client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text,
-                ).await;
-            }
+    if let Some(rest) = data.strip_prefix("latest:") {
+        // Parse username:page
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return;
         }
-        Err(err) => {
-            tracing::error!(?err, tweet_id = %tweet_id, "failed to fetch comments");
-            let _ = send_reply_to_message(
-                client, bot_token, &msg.chat.id.to_string(), msg.message_id,
-                &format!("Failed to fetch comments: {err}"),
-            ).await;
+        let username = parts[0].to_string();
+        let page: i64 = match parts[1].parse::<i64>() {
+            Ok(p) => p.max(1),
+            Err(_) => return,
+        };
+
+        handle_latest_callback(config, pool, client, bot_token, msg, &username, page).await;
+    } else if let Some(rest) = data.strip_prefix("latest_more:") {
+        // Parse username:current_page — trigger backfill then show next page
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return;
         }
+        let username = parts[0].to_string();
+        let current_page: i64 = match parts[1].parse::<i64>() {
+            Ok(p) => p.max(1),
+            Err(_) => return,
+        };
+
+        handle_latest_more_callback(config, pool, client, bot_token, msg, &username, current_page).await;
+    } else if let Some(rest) = data.strip_prefix("comments:") {
+        // Parse tweet_id:page
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        let tweet_id = parts[0];
+        let page: usize = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(1).max(1)
+        } else {
+            1
+        };
+
+        handle_comments_callback(config, pool, client, bot_token, msg, tweet_id, page).await;
     }
 }
 
@@ -465,22 +466,354 @@ async fn answer_callback_query(
     Ok(())
 }
 
-fn format_comments_message(tweet_id: &str, comments: &[crate::models::TweetComment]) -> String {
-    let mut lines = vec![format!("Comments ({} shown):\n", comments.len())];
-    for (i, comment) in comments.iter().enumerate() {
+async fn edit_message_text(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    message_id: i64,
+    text: &str,
+    reply_markup: Option<&telegram::InlineKeyboardMarkup>,
+) -> anyhow::Result<()> {
+    #[derive(Debug, serde::Serialize)]
+    struct EditMessagePayload {
+        chat_id: String,
+        message_id: i64,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_markup: Option<telegram::InlineKeyboardMarkup>,
+    }
+
+    let response = client
+        .post(telegram::telegram_api_url(bot_token, "editMessageText"))
+        .json(&EditMessagePayload {
+            chat_id: chat_id.to_string(),
+            message_id,
+            text: text.to_string(),
+            reply_markup: reply_markup.cloned(),
+        })
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("editMessageText failed: {status} {body}");
+    }
+    Ok(())
+}
+
+async fn send_reply_with_keyboard(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    reply_markup: Option<&telegram::InlineKeyboardMarkup>,
+) -> anyhow::Result<()> {
+    #[derive(Debug, serde::Serialize)]
+    struct SendMessageWithKeyboard {
+        chat_id: String,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_markup: Option<telegram::InlineKeyboardMarkup>,
+    }
+
+    let text = if text.len() > 4096 {
+        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
+    } else {
+        text.to_string()
+    };
+
+    let response = client
+        .post(telegram::telegram_api_url(bot_token, "sendMessage"))
+        .json(&SendMessageWithKeyboard {
+            chat_id: chat_id.to_string(),
+            text,
+            reply_markup: reply_markup.cloned(),
+        })
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("sendMessage failed: {status} {body}");
+    }
+    Ok(())
+}
+
+async fn handle_latest_callback(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    msg: &TelegramCallbackMessage,
+    username: &str,
+    page: i64,
+) {
+    let per_page = config.fetch.default_limit.max(1);
+    let filter = storage::TweetFilter {
+        username: if username.is_empty() { None } else { Some(username.to_string()) },
+        limit: per_page,
+        offset: (page - 1) * per_page,
+        ..Default::default()
+    };
+
+    let tweets = match storage::list_tweets(pool, filter.clone()).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::error!(?err, "failed to list tweets for latest callback");
+            return;
+        }
+    };
+
+    if tweets.is_empty() {
+        let _ = edit_message_text(client, bot_token, &msg.chat.id.to_string(), msg.message_id, "No more tweets.", None).await;
+        return;
+    }
+
+    let total = match storage::count_tweets(pool, &filter).await {
+        Ok(c) => c,
+        Err(_) => (page - 1) * per_page + tweets.len() as i64,
+    };
+
+    let can_load_older = !username.is_empty();
+    let (text, reply_markup) = format_latest_message(&tweets, username, page, total, per_page, can_load_older);
+
+    if let Err(err) = edit_message_text(client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text, reply_markup.as_ref()).await {
+        tracing::error!(?err, "failed to edit latest message");
+    }
+}
+
+async fn handle_latest_more_callback(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    msg: &TelegramCallbackMessage,
+    username: &str,
+    current_page: i64,
+) {
+    // Show loading state
+    let _ = edit_message_text(
+        client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+        &format!("Loading older tweets for @{username}..."), None,
+    ).await;
+
+    // Trigger backfill (fetch a few pages of older tweets)
+    let backfill_pages = 3;
+    match fetch::backfill_user(config, pool, username, backfill_pages, 2).await {
+        Ok(result) => {
+            tracing::info!(
+                username = %username,
+                new = result.new,
+                total = result.total,
+                "backfill for /latest load older"
+            );
+        }
+        Err(err) => {
+            tracing::error!(?err, username = %username, "backfill failed for /latest load older");
+            let _ = edit_message_text(
+                client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+                &format!("Failed to load older tweets: {err}"), None,
+            ).await;
+            return;
+        }
+    }
+
+    // Now show the next page after the current one
+    let next_page = current_page + 1;
+    let per_page = config.fetch.default_limit.max(1);
+    let filter = storage::TweetFilter {
+        username: Some(username.to_string()),
+        limit: per_page,
+        offset: (next_page - 1) * per_page,
+        ..Default::default()
+    };
+
+    let tweets = match storage::list_tweets(pool, filter.clone()).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::error!(?err, "failed to list tweets after backfill");
+            return;
+        }
+    };
+
+    if tweets.is_empty() {
+        let _ = edit_message_text(
+            client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+            "No older tweets found.", None,
+        ).await;
+        return;
+    }
+
+    let total = match storage::count_tweets(pool, &filter).await {
+        Ok(c) => c,
+        Err(_) => (next_page - 1) * per_page + tweets.len() as i64,
+    };
+
+    let (text, reply_markup) = format_latest_message(&tweets, username, next_page, total, per_page, true);
+
+    if let Err(err) = edit_message_text(client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text, reply_markup.as_ref()).await {
+        tracing::error!(?err, "failed to edit latest message after backfill");
+    }
+}
+
+async fn handle_comments_callback(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    msg: &TelegramCallbackMessage,
+    tweet_id: &str,
+    page: usize,
+) {
+    if !config.comments.enabled {
+        let _ = send_reply(client, bot_token, &msg.chat.id.to_string(), "Comment fetching is disabled.").await;
+        return;
+    }
+
+    tracing::info!(tweet_id = %tweet_id, page, "fetching comments on demand");
+
+    match fetch::fetch_tweet_comments(
+        config,
+        pool,
+        tweet_id,
+        config.comments.max_comments,
+    )
+    .await
+    {
+        Ok(comments) => {
+            if comments.is_empty() {
+                let _ = send_reply_to_message(
+                    client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+                    "No comments found (all may have been filtered as spam).",
+                ).await;
+                return;
+            }
+
+            let per_page = 5;
+            let total = comments.len();
+            let start = (page - 1) * per_page;
+            if start >= total {
+                return;
+            }
+            let end = (start + per_page).min(total);
+            let page_comments = &comments[start..end];
+            let has_more = end < total;
+
+            // Send each comment as a reply to the tweet message
+            for comment in page_comments {
+                let text = format_single_comment(comment);
+                let _ = send_reply_to_message(
+                    client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text,
+                ).await;
+            }
+
+            // If there are more comments, send a "Next page" button
+            if has_more {
+                let callback_data = format!("comments:{tweet_id}:{}", page + 1);
+                let _ = send_reply_with_keyboard(
+                    client,
+                    bot_token,
+                    &msg.chat.id.to_string(),
+                    &format!("Page {}/{} — Load more:", page, total.div_ceil(per_page)),
+                    Some(&telegram::comment_button_markup_with_text("Next page >", &callback_data)),
+                ).await;
+            }
+        }
+        Err(err) => {
+            tracing::error!(?err, tweet_id = %tweet_id, "failed to fetch comments");
+            let _ = send_reply_to_message(
+                client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+                &format!("Failed to fetch comments: {err}"),
+            ).await;
+        }
+    }
+}
+
+fn format_single_comment(comment: &crate::models::TweetComment) -> String {
+    let mut parts = vec![format!(
+        "<b>{}</b> (@{}): {}",
+        telegram::html_escape(&comment.author_name),
+        telegram::html_escape(&comment.author_username),
+        telegram::html_escape(&comment.text),
+    )];
+
+    for url in &comment.media_urls {
+        parts.push(format!("\n  <a href=\"{}\">[image]</a>", url));
+    }
+    for url in &comment.external_links {
+        parts.push(format!("\n  <a href=\"{}\">{}</a>", url, url));
+    }
+
+    parts.join("")
+}
+
+fn format_latest_message(
+    tweets: &[crate::models::StoredTweet],
+    username: &str,
+    page: i64,
+    total: i64,
+    per_page: i64,
+    can_load_older: bool,
+) -> (String, Option<telegram::InlineKeyboardMarkup>) {
+    let mut lines = vec![];
+    if username.is_empty() {
+        lines.push("Latest tweets:\n".to_string());
+    } else {
+        lines.push(format!("Latest tweets @{username}:\n"));
+    }
+
+    for stored in tweets {
+        let time = crate::utils::format_utc8(&stored.tweet.created_at);
         lines.push(format!(
-            "{}. <b>{}</b> (@{}): {}",
-            i + 1,
-            telegram::html_escape(&comment.author_name),
-            telegram::html_escape(&comment.author_username),
-            telegram::html_escape(&comment.text),
+            "@{} [{}] {}\n{}",
+            stored.tweet.author_username,
+            time,
+            stored.tweet.text.chars().take(100).collect::<String>(),
+            stored.tweet.url,
         ));
     }
-    lines.push(format!(
-        "\n<a href=\"https://x.com/i/status/{}\">View full conversation</a>",
-        tweet_id
-    ));
-    lines.join("\n")
+
+    let total_pages = ((total as f64) / (per_page as f64)).ceil() as i64;
+    if total_pages > 1 || can_load_older {
+        lines.push(format!("\nPage {page}/{}", total_pages.max(page)));
+    }
+
+    let text = lines.join("\n\n");
+
+    // Build pagination buttons
+    let mut buttons = Vec::new();
+    let user_key = if username.is_empty() { "_all" } else { username };
+
+    if page > 1 {
+        buttons.push(telegram::InlineKeyboardButton {
+            text: "< Prev".to_string(),
+            callback_data: format!("latest:{}:{}", user_key, page - 1),
+        });
+    }
+    if page < total_pages {
+        buttons.push(telegram::InlineKeyboardButton {
+            text: "Next >".to_string(),
+            callback_data: format!("latest:{}:{}", user_key, page + 1),
+        });
+    } else if can_load_older && !username.is_empty() {
+        // On last page with a specific user, offer to load older tweets
+        buttons.push(telegram::InlineKeyboardButton {
+            text: "Load older".to_string(),
+            callback_data: format!("latest_more:{}:{}", user_key, page),
+        });
+    }
+
+    let reply_markup = if buttons.is_empty() {
+        None
+    } else {
+        Some(telegram::InlineKeyboardMarkup {
+            inline_keyboard: vec![buttons],
+        })
+    };
+
+    (text, reply_markup)
 }
 
 fn cmd_help() -> anyhow::Result<String> {
@@ -492,8 +825,7 @@ fn cmd_help() -> anyhow::Result<String> {
          /list - List all sources and status\n\
          /status - Show system status\n\
          /fetch - Trigger an immediate fetch\n\
-         /backfill @username - Backfill all historical tweets\n\
-         /latest [@user] - Show recent tweets (default 5)\n\
+         /latest @username - Browse tweets (auto-sync from X)\n\
          /digest - Show analyzed digest summary\n\
          /spam [list|add|remove] - Manage spam keywords"
             .to_string(),
@@ -670,56 +1002,73 @@ async fn cmd_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<Stri
     Ok(msg)
 }
 
-async fn cmd_backfill(config: &AppConfig, pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+async fn cmd_latest(
+    config: &AppConfig,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: i64,
+    args: &str,
+) {
     let username = args.trim().trim_start_matches('@').to_string();
-    if username.is_empty() {
-        return Ok("Usage: /backfill @username".to_string());
-    }
-    let result = fetch::backfill_user(config, pool, &username, 0, 2).await?;
-    Ok(format!(
-        "Backfill @{} complete:\n\
-         Total: {} tweets\n\
-         New: {}\n\
-         Existing: {}\n\
-         Pages: {}",
-        username, result.total, result.new, result.duplicate, result.pages
-    ))
-}
 
-async fn cmd_latest(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
-    let username = args.trim().trim_start_matches('@').to_string();
-    let filter = if username.is_empty() {
-        storage::TweetFilter {
-            limit: 5,
-            ..Default::default()
+    // When a username is specified, trigger a fresh fetch from X first
+    if !username.is_empty() {
+        if let Err(err) = fetch_latest_for_user(config, pool, &username).await {
+            tracing::warn!(?err, username = %username, "failed to fetch latest for /latest");
         }
-    } else {
-        storage::TweetFilter {
-            username: Some(username.clone()),
-            limit: 5,
-            ..Default::default()
+    }
+
+    let per_page = config.fetch.default_limit.max(1);
+    let filter = storage::TweetFilter {
+        username: if username.is_empty() { None } else { Some(username.clone()) },
+        limit: per_page,
+        ..Default::default()
+    };
+
+    let tweets = match storage::list_tweets(pool, filter.clone()).await {
+        Ok(t) => t,
+        Err(err) => {
+            let _ = send_reply(client, bot_token, &chat_id.to_string(), &format!("Error: {err}")).await;
+            return;
         }
     };
-    let tweets = storage::list_tweets(pool, filter).await?;
+
     if tweets.is_empty() {
-        return Ok(if username.is_empty() {
+        let msg = if username.is_empty() {
             "No tweets found.".to_string()
         } else {
             format!("No tweets found for @{username}.")
-        });
+        };
+        let _ = send_reply(client, bot_token, &chat_id.to_string(), &msg).await;
+        return;
     }
-    let mut lines = vec!["Latest tweets:\n".to_string()];
-    for stored in &tweets {
-        let time = crate::utils::format_utc8(&stored.tweet.created_at);
-        lines.push(format!(
-            "@{} [{}] {}\n{}",
-            stored.tweet.author_username,
-            time,
-            stored.tweet.text.chars().take(100).collect::<String>(),
-            stored.tweet.url,
-        ));
+
+    let total = match storage::count_tweets(pool, &filter).await {
+        Ok(c) => c,
+        Err(_) => tweets.len() as i64,
+    };
+
+    let (text, reply_markup) = format_latest_message(&tweets, &username, 1, total, per_page, !username.is_empty());
+
+    if let Err(err) = send_reply_with_keyboard(client, bot_token, &chat_id.to_string(), &text, reply_markup.as_ref()).await {
+        tracing::error!(?err, "failed to send latest reply");
     }
-    Ok(lines.join("\n\n"))
+}
+
+async fn fetch_latest_for_user(config: &AppConfig, pool: &SqlitePool, username: &str) -> anyhow::Result<()> {
+    let source = Source {
+        source_type: SourceType::Account,
+        value: username.to_string(),
+        label: None,
+        limit: None,
+    };
+    let tweets = fetch::fetch_source(config, pool, &source).await?;
+    for tweet in &tweets {
+        storage::upsert_tweet(pool, tweet).await?;
+    }
+    tracing::info!(username = %username, count = tweets.len(), "fetched latest for /latest");
+    Ok(())
 }
 
 async fn cmd_digest(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<String> {

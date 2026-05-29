@@ -106,21 +106,30 @@ struct LinkPreviewOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct InlineKeyboardButton {
-    text: String,
-    callback_data: String,
+pub struct InlineKeyboardButton {
+    pub text: String,
+    pub callback_data: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct InlineKeyboardMarkup {
-    inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+pub struct InlineKeyboardMarkup {
+    pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
 }
 
-fn comment_button_markup(tweet_id: &str) -> InlineKeyboardMarkup {
+pub fn comment_button_markup(tweet_id: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![InlineKeyboardButton {
             text: "Load comments".to_string(),
             callback_data: format!("comments:{}", tweet_id),
+        }]],
+    }
+}
+
+pub fn comment_button_markup_with_text(text: &str, callback_data: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: text.to_string(),
+            callback_data: callback_data.to_string(),
         }]],
     }
 }
@@ -220,12 +229,8 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
             description: "Trigger immediate fetch".to_string(),
         },
         TelegramBotCommand {
-            command: "backfill".to_string(),
-            description: "Backfill all tweets from a user (e.g. /backfill @openai)".to_string(),
-        },
-        TelegramBotCommand {
             command: "latest".to_string(),
-            description: "Show recent tweets (e.g. /latest @openai)".to_string(),
+            description: "Browse tweets (e.g. /latest @openai)".to_string(),
         },
         TelegramBotCommand {
             command: "digest".to_string(),
@@ -1052,7 +1057,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "add", "remove", "list", "status", "fetch", "backfill", "latest", "digest", "spam"]
+            vec!["help", "add", "remove", "list", "status", "fetch", "latest", "digest", "spam"]
         );
         assert!(commands
             .iter()

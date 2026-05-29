@@ -26,9 +26,9 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 - **Telegram delivery**: push new posts to a chat or channel, with retry and delivery tracking.
 - **Rich media in Telegram**: images, videos, animated GIFs, external link previews, quoted/replied tweet threading, and Twitter Articles.
 - **Display name in Telegram**: shows author's display name alongside @username.
-- **Tweet comments**: on-demand comment fetching with inline "Load comments" button and spam keyword filtering.
+- **Tweet comments**: on-demand comment fetching with inline "Load comments" button, paginated replies as message threads, and spam keyword filtering.
 - **Interactive Telegram bot**: manage sources, spam keywords, and trigger fetches from Telegram.
-- **Historical backfill**: fetch all past tweets from any monitored account via cursor pagination.
+- **Browsable tweet history**: `/latest @user` auto-syncs from X, paginates through cached tweets, and can load older tweets on demand.
 - **Multi-account auth rotation**: rotate imported X auth accounts and skip limited or rejected ones.
 - **Adaptive rate control**: record X rate-limit headers, back off on failures, and recover after success.
 - **Digest generation**: render a Markdown digest from cached and analyzed posts.
@@ -38,7 +38,7 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 
 ### 1. Fetch
 
-The production fetcher, `x_web`, uses browser-compatible X Web API requests with imported `auth_token` and `ct0` cookies. It currently supports account timelines. Use the backfill command to fetch all historical tweets from an account via cursor-based pagination.
+The production fetcher, `x_web`, uses browser-compatible X Web API requests with imported `auth_token` and `ct0` cookies. It currently supports account timelines. Use the CLI `backfill` command to fetch all historical tweets from an account via cursor-based pagination.
 
 The mock fetcher is useful for local setup and tests because it does not call X.
 
@@ -59,7 +59,7 @@ Cached posts can be consumed through:
   - **Quoted/replied tweets** — displayed as a threaded conversation (quoted tweet first, reply linked via Telegram `reply_parameters`).
   - **Twitter Articles** — rendered with title, text, and article link.
   - **Fallback** — if media delivery fails, falls back to text-only to ensure no posts are lost.
-- **Tweet comments**: click "Load comments" on any delivered tweet to fetch and display replies. Comments are filtered through a configurable spam keyword list managed via the bot (`/spam add`, `/spam remove`, `/spam list`). Keywords are stored in the database and take effect immediately without restart.
+- **Tweet comments**: click "Load comments" on any delivered tweet to fetch and display replies as a threaded conversation. Comments show inline media (images, links) and are paginated. Spam keywords are managed via the bot (`/spam add`, `/spam remove`, `/spam list`).
 - Markdown digest output from the CLI.
 
 ## Quick Start
@@ -258,8 +258,7 @@ Supported bot commands:
 | `/list` | List sources |
 | `/status` | Show service status |
 | `/fetch` | Trigger a fetch |
-| `/backfill @openai` | Backfill all historical tweets |
-| `/latest @openai` | Show recent posts |
+| `/latest @openai` | Browse tweets (auto-sync, paginated, load older) |
 | `/digest` | Show digest summary |
 | `/spam` | Show spam keyword usage |
 | `/spam list` | List all spam keywords |

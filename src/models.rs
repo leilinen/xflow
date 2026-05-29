@@ -75,6 +75,10 @@ pub struct TweetComment {
     pub author_name: String,
     pub text: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub media_urls: Vec<String>,
+    #[serde(default)]
+    pub external_links: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
