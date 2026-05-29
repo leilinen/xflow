@@ -140,6 +140,7 @@ Bot 通过长轮询接收和处理命令：
 | `/status` | 查看系统状态 |
 | `/fetch` | 立即触发一次抓取 |
 | `/latest @username` | 浏览推文（自动同步、翻页、加载更早） |
+| `/latest @username 7d` | 浏览最近 7 天推文 |
 | `/digest` | 查看分析摘要 |
 | `/spam` | 显示垃圾关键词用法 |
 | `/spam list` | 列出所有过滤关键词 |

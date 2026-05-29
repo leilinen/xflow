@@ -259,6 +259,7 @@ Supported bot commands:
 | `/status` | Show service status |
 | `/fetch` | Trigger a fetch |
 | `/latest @openai` | Browse tweets (auto-sync, paginated, load older) |
+| `/latest @openai 7d` | Browse tweets from last 7 days |
 | `/digest` | Show digest summary |
 | `/spam` | Show spam keyword usage |
 | `/spam list` | List all spam keywords |
@@ -279,6 +280,7 @@ xflow fetch
 xflow serve
 xflow worker
 xflow backfill --username openai --max-pages 10 --page-delay 2
+xflow backfill --username openai --since 7d
 xflow digest --output digest.md
 
 xflow auth import /path/to/token.json
