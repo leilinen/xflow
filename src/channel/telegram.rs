@@ -230,7 +230,7 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
         },
         TelegramBotCommand {
             command: "latest".to_string(),
-            description: "Browse tweets (e.g. /latest @openai)".to_string(),
+            description: "Browse tweets (e.g. /latest @openai 7d)".to_string(),
         },
         TelegramBotCommand {
             command: "digest".to_string(),

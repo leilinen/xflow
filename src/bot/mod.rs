@@ -825,7 +825,7 @@ fn cmd_help() -> anyhow::Result<String> {
          /list - List all sources and status\n\
          /status - Show system status\n\
          /fetch - Trigger an immediate fetch\n\
-         /latest @username - Browse tweets (auto-sync from X)\n\
+         /latest @username [7d] - Browse tweets (auto-sync, optional time range)\n\
          /digest - Show analyzed digest summary\n\
          /spam [list|add|remove] - Manage spam keywords"
             .to_string(),
@@ -1010,12 +1010,43 @@ async fn cmd_latest(
     chat_id: i64,
     args: &str,
 ) {
-    let username = args.trim().trim_start_matches('@').to_string();
+    // Parse args: "@username [time_range]" e.g. "@openai 7d" or "openai 30d"
+    let parts: Vec<&str> = args.trim().split_whitespace().collect();
+    let username = parts.first()
+        .map(|s| s.trim_start_matches('@').to_string())
+        .unwrap_or_default();
+    let time_range = parts.get(1).map(|s| s.to_string());
 
-    // When a username is specified, trigger a fresh fetch from X first
+    // Parse time range if provided
+    let since = match &time_range {
+        Some(tr) => match parse_bot_duration(tr) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                let _ = send_reply(client, bot_token, &chat_id.to_string(),
+                    "Invalid time range. Use e.g. `/latest @openai 7d` or `/latest @openai 12h`").await;
+                return;
+            }
+        },
+        None => None,
+    };
+
+    // When a username is specified with a time range, trigger backfill
     if !username.is_empty() {
-        if let Err(err) = fetch_latest_for_user(config, pool, &username).await {
-            tracing::warn!(?err, username = %username, "failed to fetch latest for /latest");
+        if let Some(since_dur) = &since {
+            // Time range specified: backfill with since
+            let _ = send_reply(client, bot_token, &chat_id.to_string(),
+                &format!("Fetching tweets for @{username} from last {}...", time_range.as_deref().unwrap_or("?"))).await;
+            if let Err(err) = fetch::backfill_user(config, pool, &username, 0, 2, Some(*since_dur)).await {
+                tracing::warn!(?err, username = %username, "backfill failed for /latest");
+                let _ = send_reply(client, bot_token, &chat_id.to_string(),
+                    &format!("Failed to fetch: {err}")).await;
+                return;
+            }
+        } else {
+            // No time range: just fetch latest batch
+            if let Err(err) = fetch_latest_for_user(config, pool, &username).await {
+                tracing::warn!(?err, username = %username, "failed to fetch latest for /latest");
+            }
         }
     }
 
@@ -1053,6 +1084,32 @@ async fn cmd_latest(
 
     if let Err(err) = send_reply_with_keyboard(client, bot_token, &chat_id.to_string(), &text, reply_markup.as_ref()).await {
         tracing::error!(?err, "failed to send latest reply");
+    }
+}
+
+/// Parse a human duration string like "7d", "30d", "12h" into a chrono Duration.
+fn parse_bot_duration(input: &str) -> anyhow::Result<chrono::Duration> {
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("empty");
+    }
+    let (num_str, unit) = if input.ends_with('d') {
+        (&input[..input.len() - 1], 'd')
+    } else if input.ends_with('h') {
+        (&input[..input.len() - 1], 'h')
+    } else {
+        anyhow::bail!("must end with 'd' or 'h'");
+    };
+    let value: i64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number"))?;
+    if value <= 0 {
+        anyhow::bail!("must be positive");
+    }
+    match unit {
+        'd' => Ok(chrono::Duration::days(value)),
+        'h' => Ok(chrono::Duration::hours(value)),
+        _ => unreachable!(),
     }
 }
 
