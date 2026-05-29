@@ -29,6 +29,7 @@ pub async fn backfill_user(
     username: &str,
     max_pages: usize,
     page_delay: u64,
+    since: Option<chrono::Duration>,
 ) -> anyhow::Result<BackfillResult> {
     let fetcher = XWebFetcher::new(config, pool).await?;
     let username = username.trim_start_matches('@');
@@ -39,8 +40,9 @@ pub async fn backfill_user(
         label: None,
         limit: None,
     };
+    let cutoff = since.map(|d| Utc::now() - d);
     let (tweets, pages) = fetcher
-        .fetch_user_tweets_paginated(&source, &user, max_pages, page_delay)
+        .fetch_user_tweets_paginated(&source, &user, max_pages, page_delay, cutoff)
         .await?;
     let total = tweets.len();
     let mut new = 0;
@@ -320,6 +322,7 @@ impl XWebFetcher {
         user: &XUser,
         max_pages: usize,
         page_delay: u64,
+        cutoff: Option<DateTime<Utc>>,
     ) -> anyhow::Result<(Vec<Tweet>, usize)> {
         let mut all_seen = HashSet::new();
         let mut all_tweets = Vec::new();
@@ -371,6 +374,19 @@ impl XWebFetcher {
             if page_new == 0 {
                 tracing::info!("backfill: page returned 0 new tweets, stopping");
                 break;
+            }
+            // Stop if all new tweets on this page are older than the cutoff
+            if let Some(cutoff) = cutoff {
+                let all_old = all_tweets.iter().rev().take(page_new).all(|t| t.created_at < cutoff);
+                if all_old {
+                    tracing::info!(
+                        ?cutoff,
+                        "backfill: all new tweets are older than cutoff, stopping"
+                    );
+                    // Remove the tweets that are older than cutoff
+                    all_tweets.retain(|t| t.created_at >= cutoff);
+                    break;
+                }
             }
             cursor = extract_cursor(&value, "Bottom");
             if cursor.is_none() {

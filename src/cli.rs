@@ -63,6 +63,9 @@ struct BackfillArgs {
     max_pages: usize,
     #[arg(long, default_value_t = 2)]
     page_delay: u64,
+    /// Stop when tweets are older than this (e.g. "7d", "30d", "12h")
+    #[arg(long)]
+    since: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,8 +159,12 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Command::Backfill(args) => {
             let (config, pool) = configured_pool(&args.config).await?;
+            let since = match &args.since {
+                Some(s) => Some(parse_duration(s)?),
+                None => None,
+            };
             let result =
-                crate::fetch::backfill_user(&config, &pool, &args.username, args.max_pages, args.page_delay)
+                crate::fetch::backfill_user(&config, &pool, &args.username, args.max_pages, args.page_delay, since)
                     .await?;
             println!(
                 "Backfill @{} complete: {} total, {} new, {} existing, {} pages.",
@@ -259,6 +266,29 @@ async fn configured_pool(
     let pool = db::connect(&config.storage.database).await?;
     db::init_db(&pool).await?;
     Ok((config, pool))
+}
+
+/// Parse a human duration string like "7d", "30d", "12h" into hours.
+fn parse_duration(input: &str) -> anyhow::Result<chrono::Duration> {
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("duration cannot be empty");
+    }
+    let (num_str, unit) = if input.ends_with('d') {
+        (&input[..input.len() - 1], 'd')
+    } else if input.ends_with('h') {
+        (&input[..input.len() - 1], 'h')
+    } else {
+        anyhow::bail!("duration must end with 'd' (days) or 'h' (hours), e.g. \"7d\" or \"12h\"");
+    };
+    let value: i64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number in duration: {num_str}"))?;
+    match unit {
+        'd' => Ok(chrono::Duration::days(value)),
+        'h' => Ok(chrono::Duration::hours(value)),
+        _ => unreachable!(),
+    }
 }
 
 async fn auth_command(command: AuthCommand) -> anyhow::Result<()> {

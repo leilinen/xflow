@@ -601,7 +601,7 @@ async fn handle_latest_more_callback(
 
     // Trigger backfill (fetch a few pages of older tweets)
     let backfill_pages = 3;
-    match fetch::backfill_user(config, pool, username, backfill_pages, 2).await {
+    match fetch::backfill_user(config, pool, username, backfill_pages, 2, None).await {
         Ok(result) => {
             tracing::info!(
                 username = %username,
