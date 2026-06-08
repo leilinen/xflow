@@ -56,7 +56,7 @@ pub async fn send_undelivered(
         for tweet in tweets {
             match channel.send_tweet(&tweet).await {
                 Ok(receipt) => {
-                    storage::save_delivery(
+                    if let Err(err) = storage::save_delivery(
                         pool,
                         &tweet.tweet.tweet_id,
                         &channel_id,
@@ -64,11 +64,27 @@ pub async fn send_undelivered(
                         &delivery_payload(&receipt.payload),
                         true,
                     )
-                    .await?;
-                    result.sent += 1;
+                    .await
+                    {
+                        tracing::error!(
+                            tweet_id = %tweet.tweet.tweet_id,
+                            channel = %channel_id,
+                            ?err,
+                            "failed to save delivery record"
+                        );
+                        result.skipped += 1;
+                    } else {
+                        result.sent += 1;
+                    }
                 }
                 Err(err) => {
-                    storage::save_delivery(
+                    tracing::warn!(
+                        tweet_id = %tweet.tweet.tweet_id,
+                        channel = %channel_id,
+                        ?err,
+                        "tweet delivery failed"
+                    );
+                    if let Err(err2) = storage::save_delivery(
                         pool,
                         &tweet.tweet.tweet_id,
                         &channel_id,
@@ -76,8 +92,18 @@ pub async fn send_undelivered(
                         &serde_json::json!({"error": err.to_string()}),
                         false,
                     )
-                    .await?;
-                    result.failed += 1;
+                    .await
+                    {
+                        tracing::error!(
+                            tweet_id = %tweet.tweet.tweet_id,
+                            channel = %channel_id,
+                            ?err2,
+                            "failed to save error delivery record"
+                        );
+                        result.skipped += 1;
+                    } else {
+                        result.failed += 1;
+                    }
                 }
             }
         }

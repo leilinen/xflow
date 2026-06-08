@@ -289,6 +289,7 @@ const QUOTED_TWEET_MAX_CHARS: usize = 200;
 enum TelegramSendError {
     Transient(anyhow::Error),
     Permanent(anyhow::Error),
+    ParseError { description: String },
 }
 
 // --- Message formatting ---
@@ -779,6 +780,10 @@ impl TelegramChannel {
                     last_err = Some(err);
                 }
                 Err(TelegramSendError::Permanent(err)) => return Err(err),
+                Err(TelegramSendError::ParseError { description }) => {
+                    tracing::warn!(method, %description, "Telegram parse error, retrying as plain text");
+                    return self.send_plain_text_fallback(method, payload).await;
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
@@ -828,12 +833,88 @@ impl TelegramChannel {
                 payload: serde_json::to_value(body).unwrap_or_default(),
             })
         } else {
-            Err(TelegramSendError::Permanent(anyhow::anyhow!(
-                "{}",
-                serde_json::json!({"method": method, "response": body})
-            )))
+            let description = body.description.clone().unwrap_or_default();
+            let is_parse_error = description.contains("can't parse entities")
+                || description.contains("unsupported parse_mode")
+                || description.contains("can't parse inline");
+            if is_parse_error {
+                Err(TelegramSendError::ParseError { description })
+            } else {
+                Err(TelegramSendError::Permanent(anyhow::anyhow!(
+                    "{}",
+                    serde_json::json!({"method": method, "response": body})
+                )))
+            }
         }
     }
+
+    /// Retry a failed API call by stripping HTML and removing parse_mode.
+    async fn send_plain_text_fallback<T: Serialize + Clone>(
+        &self,
+        method: &str,
+        original_payload: &T,
+    ) -> anyhow::Result<ChannelSendReceipt> {
+        let mut json = serde_json::to_value(original_payload)
+            .map_err(|e| anyhow::anyhow!("payload serialization failed: {e}"))?;
+
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("parse_mode");
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                obj.insert("text".to_string(), serde_json::Value::String(strip_html(text)));
+            }
+            if let Some(caption) = obj.get("caption").and_then(|v| v.as_str()) {
+                obj.insert("caption".to_string(), serde_json::Value::String(strip_html(caption)));
+            }
+            if let Some(media) = obj.get_mut("media").and_then(|v| v.as_array_mut()) {
+                for item in media.iter_mut() {
+                    if let Some(item_obj) = item.as_object_mut() {
+                        item_obj.remove("parse_mode");
+                        if let Some(c) = item_obj.get("caption").and_then(|v| v.as_str()) {
+                            item_obj.insert("caption".to_string(), serde_json::Value::String(strip_html(c)));
+                        }
+                    }
+                }
+            }
+        }
+
+        match self.try_api_call(method, &json).await {
+            Ok(receipt) => Ok(receipt),
+            Err(TelegramSendError::ParseError { description }) => {
+                Err(anyhow::anyhow!(
+                    "Telegram parse error persisted after plain text fallback: {description}"
+                ))
+            }
+            Err(TelegramSendError::Permanent(e)) | Err(TelegramSendError::Transient(e)) => Err(e),
+        }
+    }
+}
+
+/// Strip HTML tags and decode entities for plain text fallback.
+
+/// Strip HTML tags and decode entities for plain text fallback.
+fn strip_html(html: &str) -> String {
+    let decoded = html
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let mut result = String::with_capacity(decoded.len());
+    let mut in_tag = false;
+    for ch in decoded.chars() {
+        if ch == '<' {
+            in_tag = true;
+            continue;
+        }
+        if ch == '>' && in_tag {
+            in_tag = false;
+            continue;
+        }
+        if !in_tag {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
@@ -1204,5 +1285,23 @@ mod tests {
             payload: serde_json::json!({"ok": true}),
         };
         assert_eq!(extract_message_id(&receipt), None);
+    }
+
+    #[test]
+    fn strip_html_removes_tags_and_decodes_entities() {
+        let input = "<b>OpenAI</b> (@openai) &amp; <i>AI agent</i> <a href=\"https://example.com\">link</a>";
+        let plain = strip_html(input);
+        assert!(!plain.contains('<'));
+        assert!(!plain.contains('>'));
+        assert!(plain.contains("OpenAI"));
+        assert!(plain.contains("&"));
+        assert!(plain.contains("AI agent"));
+        assert!(plain.contains("link"));
+    }
+
+    #[test]
+    fn strip_html_preserves_plain_text() {
+        let input = "Hello world, no HTML here!";
+        assert_eq!(strip_html(input), input);
     }
 }
