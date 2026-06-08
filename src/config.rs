@@ -1,7 +1,6 @@
 use crate::models::{Source, SourceType};
-use crate::utils::{resolve_relative, DEFAULT_DB_PATH};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -20,13 +19,18 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    pub database: PathBuf,
+    #[serde(default = "default_database_url")]
+    pub database_url: String,
+}
+
+fn default_database_url() -> String {
+    "postgres://localhost/xflow".to_string()
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            database: PathBuf::from(DEFAULT_DB_PATH),
+            database_url: default_database_url(),
         }
     }
 }
@@ -240,12 +244,11 @@ pub fn write_default_config(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn load_config(path: &Path) -> anyhow::Result<AppConfig> {
-    let mut config = if path.exists() {
+    let config = if path.exists() {
         serde_yaml::from_str::<AppConfig>(&std::fs::read_to_string(path)?)?
     } else {
         AppConfig::default()
     };
-    config.storage.database = resolve_relative(path, &config.storage.database);
     Ok(config)
 }
 

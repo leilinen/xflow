@@ -2,10 +2,10 @@
 
 [English README](README.md)
 
-xFlow 是一个自托管的 Rust 服务，用于抓取 X/Twitter 内容，缓存到 SQLite，并通过 RSS/JSON 和 Telegram 输出。支持多账号轮换、自适应频率控制、规则分析和 Telegram 机器人交互。
+xFlow 是一个自托管的 Rust 服务，用于抓取 X/Twitter 内容，缓存到 PostgreSQL，并通过 RSS/JSON 和 Telegram 输出。支持多账号轮换、自适应频率控制、规则分析和 Telegram 机器人交互。
 
 ```text
-X 数据源 -> Fetcher（多账号轮换、自适应退避） -> SQLite 缓存/去重 -> Agent -> RSS/JSON/Telegram Bot
+X 数据源 -> Fetcher（多账号轮换、自适应退避） -> PostgreSQL 缓存/去重 -> Agent -> RSS/JSON/Telegram Bot
 ```
 
 ## 功能特性
@@ -18,7 +18,7 @@ X 数据源 -> Fetcher（多账号轮换、自适应退避） -> SQLite 缓存/�
 - **推文评论** — 点击 "Load comments" 按钮按需获取推文评论，评论以回复线程形式展示，支持翻页、富媒体（图片、链接）内嵌显示和垃圾关键词过滤
 - **推文浏览** — `/latest @user` 自动从 X 同步最新推文，分页浏览缓存，翻到底可加载更早推文
 - **RSS/JSON Feed** — HTTP 服务器输出 feed，方便集成
-- **SQLite 存储** — 单文件数据库，无外部依赖
+- **PostgreSQL 存储** — 通过 `database_url` 配置连接，数据安全可靠
 - **Docker Compose** — 一键部署
 
 ## 快速开始
@@ -60,7 +60,7 @@ server:
   host: 127.0.0.1
   port: 8000
 storage:
-  database: data/xflow.db
+  database_url: postgres://localhost/xflow
 fetch:
   interval_seconds: 900
   default_limit: 5
@@ -210,9 +210,24 @@ xflow telegram commands clear              # 清除命令
 
 - 不要提交 `auth_token`、`ct0`、`.env`、`*.token.json` 文件
 - 导入后立即删除 token 文件
-- 保持 SQLite 私有：`chmod 600 data/xflow.db`
+- 保持数据库连接凭据安全
 - CLI 和日志中 token 均脱敏显示
 - Agent/分析代码不会接收原始 token
+
+## 从 SQLite 迁移到 PostgreSQL
+
+如果你之前使用的是 SQLite，可以使用独立的迁移工具将数据迁移到 PostgreSQL：
+
+```bash
+cd tools/migrate_sqlite_to_pg
+cargo run --release -- \
+  --from /path/to/data/xflow.db \
+  --to postgres://user:password@localhost/xflow
+```
+
+迁移工具会按顺序读取 SQLite 中的所有表数据并写入 PostgreSQL。冲突行会被跳过（`ON CONFLICT DO NOTHING`），因此迁移是幂等的，可以安全地重复运行。
+
+迁移顺序遵循外键依赖：`auth_accounts` → `auth_rate_limits` → `sources` → `tweets` → `tweet_analysis` → `fetch_state` → `deliveries` → `spam_keywords`。
 
 ## 生产部署
 
@@ -221,10 +236,9 @@ xflow telegram commands clear              # 清除命令
 ```bash
 cargo build --release
 sudo cp target/release/xflow /usr/local/bin/
-sudo mkdir -p /opt/xflow/data
 cd /opt/xflow
 xflow init
-# 编辑 config.yaml，创建 .env 填入 Telegram token
+# 编辑 config.yaml，设置 database_url 和 Telegram token
 xflow telegram commands set
 ```
 
@@ -302,13 +316,7 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-数据持久化在宿主机 `./data/` 目录，`docker compose down` 不会删除数据。
-
-### 备份
-
-```bash
-sqlite3 /opt/xflow/data/xflow.db ".backup /opt/xflow/data/xflow.db.bak"
-```
+数据持久化依赖外部 PostgreSQL 服务，请在 `config.docker.yaml` 中配置 `database_url`。
 
 ## License
 

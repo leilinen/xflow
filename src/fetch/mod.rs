@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use reqwest::{header, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::collections::HashSet;
 
 const X_WEB_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -25,7 +25,7 @@ pub struct BackfillResult {
 
 pub async fn backfill_user(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     username: &str,
     max_pages: usize,
     page_delay: u64,
@@ -61,7 +61,7 @@ pub async fn backfill_user(
 
 pub async fn fetch_source(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     source: &Source,
 ) -> anyhow::Result<Vec<Tweet>> {
     match config.fetch.fetcher.as_str() {
@@ -78,7 +78,7 @@ pub async fn fetch_source(
     }
 }
 
-pub async fn validate_account(config: &AppConfig, pool: &SqlitePool, username: &str) -> bool {
+pub async fn validate_account(config: &AppConfig, pool: &PgPool, username: &str) -> bool {
     match XWebFetcher::new(config, pool).await {
         Ok(fetcher) => fetcher.lookup_user(username).await.is_ok(),
         Err(_) => false,
@@ -87,7 +87,7 @@ pub async fn validate_account(config: &AppConfig, pool: &SqlitePool, username: &
 
 pub async fn fetch_tweet_comments(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     tweet_id: &str,
     max_comments: usize,
 ) -> anyhow::Result<Vec<TweetComment>> {
@@ -195,7 +195,7 @@ struct XWebFetcher {
     config: AppConfig,
     auth: AuthAccountSecret,
     client: reqwest::Client,
-    pool: SqlitePool,
+    pool: PgPool,
     bearer_token: String,
     user_by_screen_name_query_id: String,
     user_tweets_query_id: String,
@@ -217,7 +217,7 @@ fn random_user_agent() -> &'static str {
 }
 
 impl XWebFetcher {
-    async fn new(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<Self> {
+    async fn new(config: &AppConfig, pool: &PgPool) -> anyhow::Result<Self> {
         let auth = storage::next_auth_account_secret(pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("x_web fetcher requires an imported auth account"))?;

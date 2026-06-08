@@ -4,12 +4,12 @@
 
 [中文文档](README.zh-CN.md) · [Quick Start](#quick-start) · [Configuration](#configuration) · [API](#rss--json-api)
 
-xFlow turns selected X/Twitter accounts into a private, queryable feed pipeline. It fetches posts with locally stored browser auth, deduplicates them in SQLite, optionally scores and summarizes them with rule-based analysis, then exposes the result through RSS, JSON, Markdown digests, and Telegram.
+xFlow turns selected X/Twitter accounts into a private, queryable feed pipeline. It fetches posts with locally stored browser auth, deduplicates them in PostgreSQL, optionally scores and summarizes them with rule-based analysis, then exposes the result through RSS, JSON, Markdown digests, and Telegram.
 
 ```text
 X accounts
    -> x_web fetcher with auth rotation and backoff
-   -> SQLite cache, dedupe, fetch state, delivery state
+   -> PostgreSQL cache, dedupe, fetch state, delivery state
    -> RSS / JSON / Markdown digest / Telegram
 ```
 
@@ -21,7 +21,7 @@ It is not a hosted SaaS, a scraping farm, or a public API proxy. It is a small R
 
 ## Highlights
 
-- **Private by default**: tokens and cached tweets stay in local SQLite.
+- **Private by default**: tokens and cached tweets stay in your PostgreSQL database.
 - **RSS and JSON output**: use any feed reader or custom integration.
 - **Telegram delivery**: push new posts to a chat or channel, with retry and delivery tracking.
 - **Rich media in Telegram**: images, videos, animated GIFs, external link previews, quoted/replied tweet threading, and Twitter Articles.
@@ -44,7 +44,7 @@ The mock fetcher is useful for local setup and tests because it does not call X.
 
 ### 2. Store
 
-xFlow uses one SQLite database for tweets, auth accounts, source definitions, rate-limit state, fetch status, and Telegram delivery state. There is no external database service to run.
+xFlow uses PostgreSQL for tweets, auth accounts, source definitions, rate-limit state, fetch status, and Telegram delivery state. Configure the connection via `database_url` in `config.yaml`.
 
 ### 3. Publish
 
@@ -150,7 +150,7 @@ CLI output masks token values. Do not paste real tokens into issues, logs, promp
 
 ## Configuration
 
-`xflow init` creates `config.yaml` and `data/xflow.db`.
+`xflow init` creates `config.yaml` and initializes the PostgreSQL schema.
 
 Minimal production-style configuration:
 
@@ -160,7 +160,7 @@ server:
   port: 8000
 
 storage:
-  database: data/xflow.db
+  database_url: postgres://localhost/xflow
 
 fetch:
   interval_seconds: 900
@@ -204,7 +204,7 @@ Notes:
 - `fetcher: mock` generates local sample data and does not require X auth.
 - `fetcher: x_web` currently fetches account sources only.
 - `telegram.enabled: true` requires `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in the environment.
-- Database paths are resolved relative to the config file.
+- `database_url` is a standard PostgreSQL connection string, e.g. `postgres://user:password@host:5432/dbname`.
 
 ## RSS & JSON API
 
@@ -310,7 +310,7 @@ Docker Compose runs two processes:
 - `api`: `xflow serve --config config.docker.yaml`
 - `worker`: `xflow worker --config config.docker.yaml`
 
-Data is persisted in `./data` on the host.
+Requires an external PostgreSQL service. Update `database_url` in `config.docker.yaml` to point to your PostgreSQL instance.
 
 ### systemd
 
@@ -319,7 +319,6 @@ Build and install the binary:
 ```bash
 cargo build --release
 sudo cp target/release/xflow /usr/local/bin/
-sudo mkdir -p /opt/xflow/data
 ```
 
 Create `/opt/xflow/config.yaml`, `/opt/xflow/.env`, and run:
@@ -334,11 +333,26 @@ Run `xflow serve` and `xflow worker` as separate systemd units so API availabili
 
 ## Security
 
-- Never commit `data/`, `*.db`, `.env`, `xflow-token.json`, `*.token.json`, browser profiles, or copied cookies.
+- Never commit `.env`, `xflow-token.json`, `*.token.json`, browser profiles, or copied cookies.
 - Delete token JSON files after import.
-- Keep the database private: `chmod 600 data/xflow.db`.
+- Keep the database credentials private.
 - Treat `auth_token` and `ct0` as active login state.
 - Avoid sending raw token values to LLMs, agent code, issue trackers, or logs.
+
+## Migrating from SQLite
+
+If you previously ran xflow with SQLite, use the standalone migration tool to move your data to PostgreSQL:
+
+```bash
+cd tools/migrate_sqlite_to_pg
+cargo run --release -- \
+  --from /path/to/data/xflow.db \
+  --to postgres://user:password@localhost/xflow
+```
+
+The tool reads all tables from the SQLite database and inserts them into PostgreSQL. Conflicting rows are skipped (`ON CONFLICT DO NOTHING`), so the migration is idempotent and safe to re-run.
+
+Migration order respects foreign key dependencies: `auth_accounts` → `auth_rate_limits` → `sources` → `tweets` → `tweet_analysis` → `fetch_state` → `deliveries` → `spam_keywords`.
 
 ## Development
 
@@ -356,7 +370,7 @@ cargo run -- fetch
 cargo run -- serve
 ```
 
-Runtime files created by `xflow init`, including `config.yaml` and `data/xflow.db`, should stay out of version control.
+Runtime files created by `xflow init`, including `config.yaml`, should stay out of version control.
 
 ## License
 

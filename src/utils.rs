@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_PATH: &str = "config.yaml";
 pub const DEFAULT_DATA_DIR: &str = "data";
-pub const DEFAULT_DB_PATH: &str = "data/xflow.db";
 
 pub fn mask_token(token: &str) -> String {
     if token.len() <= 8 {

@@ -11,7 +11,7 @@ use crate::worker::pipeline::FetchSourceError;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
 #[derive(Debug, Clone)]
 pub struct TelegramCredentials {
@@ -850,7 +850,7 @@ fn extract_message_id(receipt: &ChannelSendReceipt) -> Option<i64> {
 }
 
 pub async fn send_undelivered(
-    pool: &SqlitePool,
+    pool: &PgPool,
     config: &TelegramConfig,
     comments: &CommentsConfig,
     limit: i64,

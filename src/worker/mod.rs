@@ -7,7 +7,7 @@ use crate::channel::telegram;
 use crate::channel::telegram::TelegramResult;
 use self::pipeline::FetchResult;
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::time::Duration;
 
 const TOKEN_FRESHNESS_DAYS: i64 = 7;
@@ -18,7 +18,7 @@ pub struct WorkerOnceResult {
     pub telegram: TelegramResult,
 }
 
-pub async fn run_once(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<WorkerOnceResult> {
+pub async fn run_once(config: &AppConfig, pool: &PgPool) -> anyhow::Result<WorkerOnceResult> {
     let fetch = pipeline::run_fetch(config, pool).await?;
     if fetch.failed > 0 {
         tracing::warn!(?fetch.errors, "fetch completed with source failures");
@@ -56,7 +56,7 @@ pub fn adjust_interval(
     }
 }
 
-pub async fn run_forever(config: AppConfig, pool: SqlitePool) -> anyhow::Result<()> {
+pub async fn run_forever(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
     if config.telegram.enabled {
         let bot_config = config.clone();
         let bot_pool = pool.clone();
@@ -127,7 +127,7 @@ pub async fn run_forever(config: AppConfig, pool: SqlitePool) -> anyhow::Result<
     }
 }
 
-async fn warn_stale_tokens(pool: &SqlitePool) {
+async fn warn_stale_tokens(pool: &PgPool) {
     if let Ok(stale) = storage::check_token_freshness(pool, TOKEN_FRESHNESS_DAYS).await {
         for (label, updated_at) in &stale {
             tracing::warn!(

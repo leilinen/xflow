@@ -6,7 +6,7 @@ use crate::worker::pipeline;
 use crate::storage;
 use crate::channel::telegram;
 use serde::Deserialize;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
 #[derive(Debug, Deserialize)]
 struct TelegramUpdate {
@@ -82,7 +82,7 @@ fn is_group_chat(chat: &TelegramChat) -> bool {
     chat.chat_type == "group" || chat.chat_type == "supergroup"
 }
 
-pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<()> {
+pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
     let bot_token = telegram::load_bot_token(&config.telegram)?;
     let allowed_chat_id = std::env::var(&config.telegram.chat_id_env).ok();
     let bot_username = get_bot_username(&bot_token).await;
@@ -269,7 +269,7 @@ async fn poll_updates(
 
 async fn handle_command(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
     chat_id: i64,
@@ -465,7 +465,7 @@ async fn send_reply_get_id(
 
 async fn handle_callback_query(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
     callback: TelegramCallbackQuery,
@@ -616,7 +616,7 @@ async fn send_reply_with_keyboard(
 
 async fn handle_latest_callback(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
     msg: &TelegramCallbackMessage,
@@ -659,7 +659,7 @@ async fn handle_latest_callback(
 
 async fn handle_latest_more_callback(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
     msg: &TelegramCallbackMessage,
@@ -779,7 +779,7 @@ async fn send_reply_to_message(
 
 async fn handle_comments_callback(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
     msg: &TelegramCallbackMessage,
@@ -992,7 +992,7 @@ fn cmd_help() -> anyhow::Result<String> {
     )
 }
 
-async fn cmd_add(config: &AppConfig, pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+async fn cmd_add(config: &AppConfig, pool: &PgPool, args: &str) -> anyhow::Result<String> {
     let username = args.trim().trim_start_matches('@').to_string();
     if username.is_empty() {
         return Ok("Usage: /add @username".to_string());
@@ -1010,7 +1010,7 @@ async fn cmd_add(config: &AppConfig, pool: &SqlitePool, args: &str) -> anyhow::R
     Ok(format!("Added source: @{username}"))
 }
 
-async fn cmd_remove(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+async fn cmd_remove(pool: &PgPool, args: &str) -> anyhow::Result<String> {
     let username = args.trim().trim_start_matches('@').to_string();
     if username.is_empty() {
         return Ok("Usage: /remove @username".to_string());
@@ -1023,7 +1023,7 @@ async fn cmd_remove(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
     }
 }
 
-async fn cmd_list(pool: &SqlitePool) -> anyhow::Result<String> {
+async fn cmd_list(pool: &PgPool) -> anyhow::Result<String> {
     let sources = storage::list_sources(pool, false).await?;
     if sources.is_empty() {
         return Ok("No sources configured.".to_string());
@@ -1071,7 +1071,7 @@ async fn cmd_list(pool: &SqlitePool) -> anyhow::Result<String> {
     Ok(lines.join("\n"))
 }
 
-async fn cmd_status(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<String> {
+async fn cmd_status(pool: &PgPool, config: &AppConfig) -> anyhow::Result<String> {
     let total_tweets: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM tweets")
             .fetch_one(pool)
@@ -1129,7 +1129,7 @@ async fn cmd_status(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<Str
     Ok(status)
 }
 
-async fn cmd_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<String> {
+async fn cmd_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<String> {
     tracing::info!("cmd_fetch: starting run_fetch");
     let fetch = pipeline::run_fetch(config, pool).await?;
     tracing::info!(fetched = fetch.fetched, sources = fetch.sources, "cmd_fetch: run_fetch done");
@@ -1168,7 +1168,7 @@ async fn cmd_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<Stri
 
 async fn cmd_latest(
     config: &AppConfig,
-    pool: &SqlitePool,
+    pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
     chat_id: i64,
@@ -1277,7 +1277,7 @@ fn parse_bot_duration(input: &str) -> anyhow::Result<chrono::Duration> {
     }
 }
 
-async fn fetch_latest_for_user(config: &AppConfig, pool: &SqlitePool, username: &str) -> anyhow::Result<()> {
+async fn fetch_latest_for_user(config: &AppConfig, pool: &PgPool, username: &str) -> anyhow::Result<()> {
     let source = Source {
         source_type: SourceType::Account,
         value: username.to_string(),
@@ -1292,7 +1292,7 @@ async fn fetch_latest_for_user(config: &AppConfig, pool: &SqlitePool, username: 
     Ok(())
 }
 
-async fn cmd_digest(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<String> {
+async fn cmd_digest(pool: &PgPool, config: &AppConfig) -> anyhow::Result<String> {
     if !config.agent.enabled {
         return Ok("Digest requires agent analysis to be enabled.".to_string());
     }
@@ -1323,7 +1323,7 @@ async fn cmd_digest(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<Str
     Ok(lines.join("\n"))
 }
 
-async fn cmd_spam(pool: &SqlitePool, args: &str) -> anyhow::Result<String> {
+async fn cmd_spam(pool: &PgPool, args: &str) -> anyhow::Result<String> {
     let (subcmd, keyword) = parse_command(args);
     match subcmd.as_str() {
         "list" => {

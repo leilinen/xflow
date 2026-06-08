@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::storage::{self, AuthAccount, TokenImport};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::path::Path;
 
 pub struct LiveCheckResult {
@@ -8,7 +8,7 @@ pub struct LiveCheckResult {
     pub error: Option<String>,
 }
 
-pub async fn import_token_json(pool: &SqlitePool, path: &Path) -> anyhow::Result<TokenImport> {
+pub async fn import_token_json(pool: &PgPool, path: &Path) -> anyhow::Result<TokenImport> {
     let token: TokenImport = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     validate_token(&token)?;
     storage::import_auth_account(pool, &token).await?;
@@ -16,7 +16,7 @@ pub async fn import_token_json(pool: &SqlitePool, path: &Path) -> anyhow::Result
 }
 
 pub async fn import_token_values(
-    pool: &SqlitePool,
+    pool: &PgPool,
     label: String,
     auth_token: String,
     ct0: String,
@@ -46,14 +46,14 @@ pub fn validate_token(token: &TokenImport) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn check_account(pool: &SqlitePool, label: &str) -> anyhow::Result<AuthAccount> {
+pub async fn check_account(pool: &PgPool, label: &str) -> anyhow::Result<AuthAccount> {
     storage::get_auth_account(pool, label)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no auth account found for {label}"))
 }
 
 pub async fn check_account_live(
-    pool: &SqlitePool,
+    pool: &PgPool,
     config: &AppConfig,
 ) -> anyhow::Result<LiveCheckResult> {
     let secret = storage::first_auth_account_secret(pool).await?;

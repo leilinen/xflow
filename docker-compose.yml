@@ -8,8 +8,8 @@ services:
       - RUST_LOG=xflow=info
     ports:
       - "8000:8000"
-    volumes:
-      - ./data:/app/data
+    networks:
+      - default
 
   worker:
     build: .
@@ -18,5 +18,5 @@ services:
       - .env
     environment:
       - RUST_LOG=xflow=info
-    volumes:
-      - ./data:/app/data
+    networks:
+      - default

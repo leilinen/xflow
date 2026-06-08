@@ -9,7 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -29,10 +29,10 @@ fn default_limit() -> i64 {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub pool: SqlitePool,
+    pub pool: PgPool,
 }
 
-pub fn router(config: AppConfig, pool: SqlitePool) -> Router {
+pub fn router(config: AppConfig, pool: PgPool) -> Router {
     let state = AppState {
         config: Arc::new(config),
         pool,
@@ -49,7 +49,7 @@ pub fn router(config: AppConfig, pool: SqlitePool) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(config: AppConfig, pool: SqlitePool) -> anyhow::Result<()> {
+pub async fn serve(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving xFlow on http://{addr}");

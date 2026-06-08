@@ -6,9 +6,10 @@ use crate::worker::pipeline;
 use crate::server;
 use crate::storage;
 use crate::channel::telegram;
-use crate::utils::{mask_token, DEFAULT_CONFIG_PATH, DEFAULT_DATA_DIR};
+use crate::utils::{mask_token, DEFAULT_CONFIG_PATH};
 use crate::worker;
 use clap::{Args, Parser, Subcommand};
+use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -240,30 +241,18 @@ async fn init(args: ConfigOpt) -> anyhow::Result<()> {
     } else {
         println!("Kept existing {}", args.config.display());
     }
-    std::fs::create_dir_all(DEFAULT_DATA_DIR)?;
     let config = load_config(&args.config)?;
-    let pool = db::connect(&config.storage.database).await?;
+    let pool = db::connect(&config.storage.database_url).await?;
     db::init_db(&pool).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &config.storage.database,
-            std::fs::Permissions::from_mode(0o600),
-        )?;
-    }
-    println!(
-        "Initialized database at {}",
-        config.storage.database.display()
-    );
+    println!("Initialized database at {}", config.storage.database_url);
     Ok(())
 }
 
 async fn configured_pool(
     config_path: &Path,
-) -> anyhow::Result<(crate::config::AppConfig, sqlx::SqlitePool)> {
+) -> anyhow::Result<(crate::config::AppConfig, PgPool)> {
     let config = load_config(config_path)?;
-    let pool = db::connect(&config.storage.database).await?;
+    let pool = db::connect(&config.storage.database_url).await?;
     db::init_db(&pool).await?;
     Ok((config, pool))
 }

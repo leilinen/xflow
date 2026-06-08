@@ -5,7 +5,8 @@ use crate::utils::{mask_token, to_json_value};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{Row, SqlitePool};
+use sqlx::postgres::PgRow;
+use sqlx::{Row, PgPool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthAccount {
@@ -66,12 +67,12 @@ pub struct TweetFilter {
     pub offset: i64,
 }
 
-pub async fn upsert_source(pool: &SqlitePool, source: &Source) -> anyhow::Result<()> {
+pub async fn upsert_source(pool: &PgPool, source: &Source) -> anyhow::Result<()> {
     upsert_source_enabled(pool, source, true).await
 }
 
 pub async fn upsert_source_enabled(
-    pool: &SqlitePool,
+    pool: &PgPool,
     source: &Source,
     enabled: bool,
 ) -> anyhow::Result<()> {
@@ -80,7 +81,7 @@ pub async fn upsert_source_enabled(
     sqlx::query(
         r#"
         INSERT INTO sources (source_type, value, label, fetch_limit, enabled, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT(source_type, value) DO UPDATE SET
             label=excluded.label,
             fetch_limit=excluded.fetch_limit,
@@ -101,15 +102,15 @@ pub async fn upsert_source_enabled(
 }
 
 pub async fn disable_source(
-    pool: &SqlitePool,
+    pool: &PgPool,
     source_type: SourceType,
     value: &str,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
         r#"
         UPDATE sources
-        SET enabled = 0, updated_at = ?
-        WHERE source_type = ? AND value = ?
+        SET enabled = 0, updated_at = $1
+        WHERE source_type = $2 AND value = $3
         "#,
     )
     .bind(Utc::now().to_rfc3339())
@@ -121,12 +122,12 @@ pub async fn disable_source(
 }
 
 pub async fn delete_source(
-    pool: &SqlitePool,
+    pool: &PgPool,
     source_type: SourceType,
     value: &str,
 ) -> anyhow::Result<bool> {
     let result = sqlx::query(
-        "DELETE FROM sources WHERE source_type = ? AND value = ?",
+        "DELETE FROM sources WHERE source_type = $1 AND value = $2",
     )
     .bind(source_type.as_str())
     .bind(value.trim_start_matches('@'))
@@ -135,7 +136,7 @@ pub async fn delete_source(
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn list_sources(pool: &SqlitePool, enabled_only: bool) -> anyhow::Result<Vec<Source>> {
+pub async fn list_sources(pool: &PgPool, enabled_only: bool) -> anyhow::Result<Vec<Source>> {
     let sql = if enabled_only {
         "SELECT source_type, value, label, fetch_limit FROM sources WHERE enabled = 1 ORDER BY source_type, value"
     } else {
@@ -154,21 +155,21 @@ pub async fn list_sources(pool: &SqlitePool, enabled_only: bool) -> anyhow::Resu
         .collect()
 }
 
-pub async fn ensure_config_sources(pool: &SqlitePool, sources: &[Source]) -> anyhow::Result<()> {
+pub async fn ensure_config_sources(pool: &PgPool, sources: &[Source]) -> anyhow::Result<()> {
     for source in sources {
         upsert_source(pool, source).await?;
     }
     Ok(())
 }
 
-pub async fn upsert_tweet(pool: &SqlitePool, tweet: &Tweet) -> anyhow::Result<bool> {
+pub async fn upsert_tweet(pool: &PgPool, tweet: &Tweet) -> anyhow::Result<bool> {
     let result = sqlx::query(
         r#"
         INSERT INTO tweets (
             tweet_id, source_type, source_value, author_username, author_name,
             text, url, created_at, fetched_at, raw_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT(tweet_id) DO UPDATE SET
             fetched_at=excluded.fetched_at,
             raw_json=excluded.raw_json
@@ -190,7 +191,7 @@ pub async fn upsert_tweet(pool: &SqlitePool, tweet: &Tweet) -> anyhow::Result<bo
 }
 
 pub async fn save_fetch_state(
-    pool: &SqlitePool,
+    pool: &PgPool,
     source: &Source,
     status: &str,
     message: Option<&str>,
@@ -198,7 +199,7 @@ pub async fn save_fetch_state(
     sqlx::query(
         r#"
         INSERT INTO fetch_state (source_type, source_value, last_fetch_at, last_status, message)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT(source_type, source_value) DO UPDATE SET
             last_fetch_at=excluded.last_fetch_at,
             last_status=excluded.last_status,
@@ -215,14 +216,14 @@ pub async fn save_fetch_state(
     Ok(())
 }
 
-pub async fn save_analysis(pool: &SqlitePool, analysis: &TweetAnalysis) -> anyhow::Result<()> {
+pub async fn save_analysis(pool: &PgPool, analysis: &TweetAnalysis) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO tweet_analysis (
             tweet_id, relevance, importance_score, category, tags_json,
             chinese_summary, reason, should_push, analyzed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT(tweet_id) DO UPDATE SET
             relevance=excluded.relevance,
             importance_score=excluded.importance_score,
@@ -249,18 +250,19 @@ pub async fn save_analysis(pool: &SqlitePool, analysis: &TweetAnalysis) -> anyho
 }
 
 pub async fn count_tweets(
-    pool: &SqlitePool,
+    pool: &PgPool,
     filter: &TweetFilter,
 ) -> anyhow::Result<i64> {
     let mut sql = String::from("SELECT COUNT(*) FROM tweets t");
-    let mut where_parts = Vec::new();
+    let mut where_parts: Vec<String> = Vec::new();
     if filter.username.is_some() {
-        where_parts.push("LOWER(t.author_username) = LOWER(?)");
+        where_parts.push("LOWER(t.author_username) = LOWER($1)".to_string());
     }
     if filter.important_only {
-        where_parts.push(
-            "EXISTS (SELECT 1 FROM tweet_analysis a WHERE a.tweet_id = t.tweet_id AND a.should_push = 1)",
-        );
+        let idx = if filter.username.is_some() { 2 } else { 1 };
+        where_parts.push(format!(
+            "EXISTS (SELECT 1 FROM tweet_analysis a WHERE a.tweet_id = t.tweet_id AND a.should_push = ${idx})"
+        ));
     }
     if !where_parts.is_empty() {
         sql.push_str(" WHERE ");
@@ -275,7 +277,7 @@ pub async fn count_tweets(
 }
 
 pub async fn list_tweets(
-    pool: &SqlitePool,
+    pool: &PgPool,
     filter: TweetFilter,
 ) -> anyhow::Result<Vec<StoredTweet>> {
     let mut sql = String::from(
@@ -286,18 +288,23 @@ pub async fn list_tweets(
         LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
         "#,
     );
-    let mut where_parts = Vec::new();
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut param_idx = 1u32;
     if filter.username.is_some() {
-        where_parts.push("LOWER(t.author_username) = LOWER(?)");
+        where_parts.push(format!("LOWER(t.author_username) = LOWER(${param_idx})"));
+        param_idx += 1;
     }
     if filter.important_only {
-        where_parts.push("COALESCE(a.should_push, 0) = 1");
+        where_parts.push("COALESCE(a.should_push, 0) = 1".to_string());
     }
     if !where_parts.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_parts.join(" AND "));
     }
-    sql.push_str(" ORDER BY t.created_at DESC LIMIT ? OFFSET ?");
+    let limit_idx = param_idx;
+    param_idx += 1;
+    let offset_idx = param_idx;
+    sql.push_str(&format!(" ORDER BY t.created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}"));
     let mut query = sqlx::query(&sql);
     if let Some(username) = filter.username {
         query = query.bind(username.trim_start_matches('@').to_string());
@@ -309,7 +316,7 @@ pub async fn list_tweets(
 }
 
 pub async fn list_analyzed_for_digest(
-    pool: &SqlitePool,
+    pool: &PgPool,
     threshold: f64,
     limit: i64,
 ) -> anyhow::Result<Vec<StoredTweet>> {
@@ -319,9 +326,9 @@ pub async fn list_analyzed_for_digest(
                a.chinese_summary, a.reason, a.should_push, a.analyzed_at
         FROM tweets t
         JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
-        WHERE a.importance_score >= ?
+        WHERE a.importance_score >= $1
         ORDER BY a.category ASC, a.importance_score DESC, t.created_at DESC
-        LIMIT ?
+        LIMIT $2
         "#,
     )
     .bind(threshold)
@@ -332,7 +339,7 @@ pub async fn list_analyzed_for_digest(
 }
 
 pub async fn list_undelivered_tweets(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channel: &str,
     important_only: bool,
     limit: i64,
@@ -350,11 +357,11 @@ pub async fn list_undelivered_tweets(
         LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
         LEFT JOIN deliveries d
             ON d.tweet_id = t.tweet_id
-            AND d.channel = ?
+            AND d.channel = $1
             AND d.status = 'delivered'
         WHERE d.id IS NULL {important_clause}
         ORDER BY t.created_at ASC
-        LIMIT ?
+        LIMIT $2
         "#
     );
     let rows = sqlx::query(&sql)
@@ -366,7 +373,7 @@ pub async fn list_undelivered_tweets(
 }
 
 pub async fn save_delivery(
-    pool: &SqlitePool,
+    pool: &PgPool,
     tweet_id: &str,
     channel: &str,
     status: &str,
@@ -378,7 +385,7 @@ pub async fn save_delivery(
     sqlx::query(
         r#"
         INSERT INTO deliveries (tweet_id, channel, status, payload_json, created_at, delivered_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT(tweet_id, channel) DO UPDATE SET
             status=excluded.status,
             payload_json=excluded.payload_json,
@@ -397,12 +404,12 @@ pub async fn save_delivery(
     Ok(())
 }
 
-pub async fn import_auth_account(pool: &SqlitePool, token: &TokenImport) -> anyhow::Result<()> {
+pub async fn import_auth_account(pool: &PgPool, token: &TokenImport) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         INSERT INTO auth_accounts (label, domain, auth_token, ct0, status, exported_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'unknown', ?, ?, ?)
+        VALUES ($1, $2, $3, $4, 'unknown', $5, $6, $7)
         ON CONFLICT(label) DO UPDATE SET
             domain=excluded.domain,
             auth_token=excluded.auth_token,
@@ -425,7 +432,7 @@ pub async fn import_auth_account(pool: &SqlitePool, token: &TokenImport) -> anyh
     Ok(())
 }
 
-pub async fn list_auth_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<AuthAccount>> {
+pub async fn list_auth_accounts(pool: &PgPool) -> anyhow::Result<Vec<AuthAccount>> {
     let rows = sqlx::query(
         "SELECT label, domain, auth_token, ct0, status, exported_at, updated_at FROM auth_accounts ORDER BY label",
     )
@@ -446,11 +453,11 @@ pub async fn list_auth_accounts(pool: &SqlitePool) -> anyhow::Result<Vec<AuthAcc
 }
 
 pub async fn get_auth_account(
-    pool: &SqlitePool,
+    pool: &PgPool,
     label: &str,
 ) -> anyhow::Result<Option<AuthAccount>> {
     let row = sqlx::query(
-        "SELECT label, domain, auth_token, ct0, status, exported_at, updated_at FROM auth_accounts WHERE label = ?",
+        "SELECT label, domain, auth_token, ct0, status, exported_at, updated_at FROM auth_accounts WHERE label = $1",
     )
     .bind(label)
     .fetch_optional(pool)
@@ -467,14 +474,14 @@ pub async fn get_auth_account(
 }
 
 pub async fn first_auth_account_secret(
-    pool: &SqlitePool,
+    pool: &PgPool,
 ) -> anyhow::Result<Option<AuthAccountSecret>> {
     let row = sqlx::query(
         r#"
         SELECT label, auth_token, ct0
         FROM auth_accounts
         WHERE status NOT IN ('rejected', 'deleted')
-          AND (limited_until IS NULL OR limited_until <= ?)
+          AND (limited_until IS NULL OR limited_until <= $1)
         ORDER BY label
         LIMIT 1
         "#,
@@ -491,14 +498,14 @@ pub async fn first_auth_account_secret(
 
 /// Select the least-recently-used auth account for round-robin rotation.
 pub async fn next_auth_account_secret(
-    pool: &SqlitePool,
+    pool: &PgPool,
 ) -> anyhow::Result<Option<AuthAccountSecret>> {
     let row = sqlx::query(
         r#"
         SELECT label, auth_token, ct0
         FROM auth_accounts
         WHERE status NOT IN ('rejected', 'deleted')
-          AND (limited_until IS NULL OR limited_until <= ?)
+          AND (limited_until IS NULL OR limited_until <= $1)
         ORDER BY CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END, last_used_at ASC, label ASC
         LIMIT 1
         "#,
@@ -513,15 +520,15 @@ pub async fn next_auth_account_secret(
     }))
 }
 
-pub async fn mark_auth_used(pool: &SqlitePool, label: &str) -> anyhow::Result<()> {
+pub async fn mark_auth_used(pool: &PgPool, label: &str) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE auth_accounts
         SET status = 'active',
-            last_used_at = ?,
+            last_used_at = $1,
             consecutive_failures = 0,
-            updated_at = ?
-        WHERE label = ?
+            updated_at = $2
+        WHERE label = $3
         "#,
     )
     .bind(Utc::now().to_rfc3339())
@@ -533,17 +540,17 @@ pub async fn mark_auth_used(pool: &SqlitePool, label: &str) -> anyhow::Result<()
 }
 
 pub async fn mark_auth_rejected(
-    pool: &SqlitePool,
+    pool: &PgPool,
     label: &str,
     status: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE auth_accounts
-        SET status = ?,
+        SET status = $1,
             consecutive_failures = consecutive_failures + 1,
-            updated_at = ?
-        WHERE label = ?
+            updated_at = $2
+        WHERE label = $3
         "#,
     )
     .bind(status)
@@ -555,7 +562,7 @@ pub async fn mark_auth_rejected(
 }
 
 pub async fn mark_auth_limited(
-    pool: &SqlitePool,
+    pool: &PgPool,
     label: &str,
     limited_until: &str,
 ) -> anyhow::Result<()> {
@@ -563,9 +570,9 @@ pub async fn mark_auth_limited(
         r#"
         UPDATE auth_accounts
         SET status = 'limited',
-            limited_until = ?,
-            updated_at = ?
-        WHERE label = ?
+            limited_until = $1,
+            updated_at = $2
+        WHERE label = $3
         "#,
     )
     .bind(limited_until)
@@ -577,13 +584,13 @@ pub async fn mark_auth_limited(
 }
 
 pub async fn save_auth_rate_limit(
-    pool: &SqlitePool,
+    pool: &PgPool,
     update: &AuthRateLimitUpdate,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO auth_rate_limits (auth_label, endpoint, remaining, reset_at, limit_value, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT(auth_label, endpoint) DO UPDATE SET
             remaining=excluded.remaining,
             reset_at=excluded.reset_at,
@@ -603,7 +610,7 @@ pub async fn save_auth_rate_limit(
 }
 
 pub async fn get_auth_rate_limit(
-    pool: &SqlitePool,
+    pool: &PgPool,
     auth_label: &str,
     endpoint: &str,
 ) -> anyhow::Result<Option<AuthRateLimit>> {
@@ -611,7 +618,7 @@ pub async fn get_auth_rate_limit(
         r#"
         SELECT auth_label, endpoint, remaining, reset_at, limit_value, updated_at
         FROM auth_rate_limits
-        WHERE auth_label = ? AND endpoint = ?
+        WHERE auth_label = $1 AND endpoint = $2
         "#,
     )
     .bind(auth_label)
@@ -628,22 +635,22 @@ pub async fn get_auth_rate_limit(
     }))
 }
 
-pub async fn delete_auth_account(pool: &SqlitePool, label: &str) -> anyhow::Result<bool> {
-    let result = sqlx::query("DELETE FROM auth_accounts WHERE label = ?")
+pub async fn delete_auth_account(pool: &PgPool, label: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query("DELETE FROM auth_accounts WHERE label = $1")
         .bind(label)
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_tweet(pool: &SqlitePool, tweet_id: &str) -> anyhow::Result<Option<StoredTweet>> {
+pub async fn get_tweet(pool: &PgPool, tweet_id: &str) -> anyhow::Result<Option<StoredTweet>> {
     let row = sqlx::query(
         r#"
         SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
                a.chinese_summary, a.reason, a.should_push, a.analyzed_at
         FROM tweets t
         LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
-        WHERE t.tweet_id = ?
+        WHERE t.tweet_id = $1
         LIMIT 1
         "#,
     )
@@ -653,7 +660,7 @@ pub async fn get_tweet(pool: &SqlitePool, tweet_id: &str) -> anyhow::Result<Opti
     row.map(row_to_tweet).transpose()
 }
 
-fn row_to_tweet(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<StoredTweet> {
+fn row_to_tweet(row: PgRow) -> anyhow::Result<StoredTweet> {
     let source_type = SourceType::try_from(row.get::<String, _>("source_type").as_str())?;
     let raw = serde_json::from_str(row.get::<String, _>("raw_json").as_str())
         .unwrap_or(Value::Object(Default::default()));
@@ -695,7 +702,7 @@ fn row_to_tweet(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<StoredTweet> {
 }
 
 pub async fn check_token_freshness(
-    pool: &SqlitePool,
+    pool: &PgPool,
     threshold_days: i64,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let cutoff = Utc::now() - chrono::Duration::days(threshold_days);
@@ -704,7 +711,7 @@ pub async fn check_token_freshness(
         SELECT label, updated_at
         FROM auth_accounts
         WHERE status NOT IN ('rejected', 'deleted')
-          AND updated_at < ?
+          AND updated_at < $1
         "#,
     )
     .bind(cutoff.to_rfc3339())
@@ -727,7 +734,7 @@ pub fn delivery_payload<T: Serialize>(value: &T) -> Value {
 
 // --- Spam keywords ---
 
-pub async fn list_spam_keywords(pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
+pub async fn list_spam_keywords(pool: &PgPool) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query("SELECT keyword FROM spam_keywords ORDER BY keyword")
         .fetch_all(pool)
         .await?;
@@ -737,14 +744,14 @@ pub async fn list_spam_keywords(pool: &SqlitePool) -> anyhow::Result<Vec<String>
         .collect())
 }
 
-pub async fn add_spam_keyword(pool: &SqlitePool, keyword: &str) -> anyhow::Result<bool> {
+pub async fn add_spam_keyword(pool: &PgPool, keyword: &str) -> anyhow::Result<bool> {
     let now = Utc::now().to_rfc3339();
     let keyword = keyword.trim().to_lowercase();
     if keyword.is_empty() {
         return Ok(false);
     }
     let result = sqlx::query(
-        "INSERT INTO spam_keywords (keyword, created_at, updated_at) VALUES (?, ?, ?)
+        "INSERT INTO spam_keywords (keyword, created_at, updated_at) VALUES ($1, $2, $3)
          ON CONFLICT(keyword) DO NOTHING",
     )
     .bind(&keyword)
@@ -755,9 +762,9 @@ pub async fn add_spam_keyword(pool: &SqlitePool, keyword: &str) -> anyhow::Resul
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn remove_spam_keyword(pool: &SqlitePool, keyword: &str) -> anyhow::Result<bool> {
+pub async fn remove_spam_keyword(pool: &PgPool, keyword: &str) -> anyhow::Result<bool> {
     let keyword = keyword.trim().to_lowercase();
-    let result = sqlx::query("DELETE FROM spam_keywords WHERE keyword = ?")
+    let result = sqlx::query("DELETE FROM spam_keywords WHERE keyword = $1")
         .bind(&keyword)
         .execute(pool)
         .await?;

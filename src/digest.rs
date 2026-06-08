@@ -1,7 +1,7 @@
 use crate::storage;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
-pub async fn generate_digest(pool: &SqlitePool, threshold: f64) -> anyhow::Result<String> {
+pub async fn generate_digest(pool: &PgPool, threshold: f64) -> anyhow::Result<String> {
     let tweets = storage::list_analyzed_for_digest(pool, threshold, 100).await?;
     let mut markdown = String::from("# xFlow Digest\n\n");
     let mut current_category = String::new();

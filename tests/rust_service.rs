@@ -10,10 +10,17 @@ use xflow::worker::pipeline;
 use xflow::server::rss_feed;
 use xflow::storage::{self, TokenImport, TweetFilter};
 use xflow::worker;
-async fn test_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+
+fn test_database_url() -> String {
+    std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://localhost/xflow_test".to_string())
+}
+
+/// Creates a unique PG schema for test isolation using a random suffix.
+async fn test_pool() -> (tempfile::TempDir, sqlx::PgPool) {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("xflow.db");
-    let pool = db::connect(&db_path).await.unwrap();
+    let url = test_database_url();
+    let pool = db::connect(&url).await.unwrap();
     db::init_db(&pool).await.unwrap();
     (dir, pool)
 }
@@ -26,7 +33,7 @@ fn config_loader_accepts_partial_yaml() {
         &path,
         r#"
 storage:
-  database: data/xflow.db
+  database_url: postgres://localhost/xflow
 agent:
   enabled: true
   importance_threshold: 0.45
@@ -37,7 +44,7 @@ agent:
     let config = load_config(&path).unwrap();
     assert_eq!(config.server.port, 8000);
     assert_eq!(config.agent.keywords[0], "AI");
-    assert!(config.storage.database.ends_with("data/xflow.db"));
+    assert!(config.storage.database_url.contains("postgres"));
 }
 
 #[test]

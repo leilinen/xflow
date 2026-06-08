@@ -6,7 +6,7 @@ use crate::storage::{self, delivery_payload};
 use self::telegram::TelegramChannel;
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -40,7 +40,7 @@ pub fn configured_channels(config: &AppConfig) -> anyhow::Result<Vec<Box<dyn Del
 }
 
 pub async fn send_undelivered(
-    pool: &SqlitePool,
+    pool: &PgPool,
     channels: &[Box<dyn DeliveryChannel>],
     limit: i64,
 ) -> anyhow::Result<ChannelDeliveryResult> {

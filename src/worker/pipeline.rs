@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::fetch::fetch_source;
 use crate::storage;
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub struct FetchSourceError {
     pub message: String,
 }
 
-pub async fn run_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<FetchResult> {
+pub async fn run_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<FetchResult> {
     let mut fetched = 0;
     let mut analyzed = 0;
     let mut errors = Vec::new();

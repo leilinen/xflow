@@ -1,0 +1,12 @@
+[package]
+name = "migrate-sqlite-to-pg"
+version = "0.1.0"
+edition = "2021"
+description = "Migrate xflow data from SQLite to PostgreSQL"
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive"] }
