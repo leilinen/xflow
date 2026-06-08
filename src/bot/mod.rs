@@ -12,11 +12,13 @@ use sqlx::SqlitePool;
 struct TelegramUpdate {
     update_id: i64,
     message: Option<TelegramMessage>,
+    channel_post: Option<TelegramMessage>,
     callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TelegramMessage {
+    message_id: i64,
     chat: TelegramChat,
     text: Option<String>,
     #[serde(default)]
@@ -96,11 +98,15 @@ pub async fn run_poller(config: AppConfig, pool: SqlitePool) -> anyhow::Result<(
             Ok(updates) => {
                 for update in updates {
                     offset = Some(update.update_id + 1);
-                    if let Some(message) = update.message {
+
+                    // Process channel_post (commands sent in channels)
+                    let message = update.message.or(update.channel_post);
+                    if let Some(message) = message {
                         let is_group = is_group_chat(&message.chat);
+                        let is_channel = message.chat.chat_type == "channel";
 
                         // In private chat: check authorization
-                        if !is_group {
+                        if !is_group && !is_channel {
                             if let Some(ref allowed) = allowed_chat_id {
                                 if message.chat.id.to_string() != *allowed {
                                     tracing::warn!(
@@ -184,7 +190,8 @@ async fn get_bot_username(bot_token: &str) -> Option<String> {
 
 /// In a group, the bot should only respond when:
 /// 1. The message is a reply to one of the bot's messages, OR
-/// 2. The message starts with @bot_username mention before the command
+/// 2. The message starts with @bot_username mention before the command, OR
+/// 3. The message contains a bot_command entity (e.g. /help)
 fn is_bot_addressed(
     text: &str,
     entities: &[TelegramEntity],
@@ -194,6 +201,13 @@ fn is_bot_addressed(
     // Check if replying to a message (likely from the bot)
     if reply_to.is_some() {
         return true;
+    }
+
+    // Bot commands (e.g. /help, /latest) are always addressed to the bot
+    for entity in entities {
+        if entity.entity_type == "bot_command" {
+            return true;
+        }
     }
 
     // Check if the text contains a mention entity pointing to the bot
@@ -230,7 +244,7 @@ async fn poll_updates(
     let payload = GetUpdatesPayload {
         offset,
         timeout: 30,
-        allowed_updates: vec!["message".to_string(), "callback_query".to_string()],
+        allowed_updates: vec!["message".to_string(), "channel_post".to_string(), "callback_query".to_string()],
     };
 
     let response = client
@@ -273,14 +287,52 @@ async fn handle_command(
         "/remove" => cmd_remove(pool, &args).await,
         "/list" => cmd_list(pool).await,
         "/status" => cmd_status(pool, config).await,
-        "/fetch" => cmd_fetch(config, pool).await,
+        "/fetch" => {
+            // Send immediate acknowledgment
+            if let Err(err) = send_reply(client, bot_token, &chat_id_str, "Fetching...").await {
+                tracing::error!(?err, "failed to send fetch ack");
+            }
+            // Spawn in background with 120s timeout
+            let config = config.clone();
+            let pool = pool.clone();
+            let chat_id_str = chat_id_str.clone();
+            let client = client.clone();
+            let bot_token = bot_token.to_string();
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    cmd_fetch(&config, &pool),
+                ).await;
+                let reply = match result {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(err)) => {
+                        tracing::error!(?err, "fetch command error");
+                        format!("Error: {err}")
+                    }
+                    Err(_) => {
+                        tracing::error!("fetch command timed out after 120s");
+                        "Fetch timed out after 120 seconds.".to_string()
+                    }
+                };
+                if let Err(err) = send_reply(&client, &bot_token, &chat_id_str, &reply).await {
+                    tracing::error!(?err, "failed to send fetch reply");
+                }
+            });
+            return;
+        }
         "/latest" => {
-            cmd_latest(config, pool, client, bot_token, chat_id, &args).await;
+            let config = config.clone();
+            let pool = pool.clone();
+            let client = client.clone();
+            let bot_token = bot_token.to_string();
+            tokio::spawn(async move {
+                cmd_latest(&config, &pool, &client, &bot_token, chat_id, &args).await;
+            });
             return;
         }
         "/digest" => cmd_digest(pool, config).await,
         "/spam" => cmd_spam(pool, &args).await,
-        _ => return,
+        _ => cmd_help(),
     };
 
     let reply = match response {
@@ -298,8 +350,11 @@ async fn handle_command(
         reply
     };
 
+    tracing::info!(command = %command, chat_id = %chat_id_str, reply_len = reply.len(), "sending reply");
     if let Err(err) = send_reply(client, bot_token, &chat_id_str, &reply).await {
-        tracing::error!(?err, "failed to send bot reply");
+        tracing::error!(?err, chat_id = %chat_id_str, "failed to send bot reply");
+    } else {
+        tracing::info!(command = %command, chat_id = %chat_id_str, "reply sent ok");
     }
 }
 
@@ -324,6 +379,13 @@ async fn send_reply(
         text: String,
     }
 
+    #[derive(Debug, serde::Deserialize)]
+    struct TelegramResponse {
+        ok: bool,
+        #[serde(default)]
+        description: Option<String>,
+    }
+
     let response = client
         .post(telegram::telegram_api_url(bot_token, "sendMessage"))
         .json(&SendMessagePayload {
@@ -334,30 +396,39 @@ async fn send_reply(
         .await?;
 
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("sendMessage failed: {status} {body}");
+    let body: TelegramResponse = response.json().await.unwrap_or(TelegramResponse {
+        ok: false,
+        description: Some(format!("invalid response with status {status}")),
+    });
+    if !body.ok {
+        anyhow::bail!("sendMessage failed: {} - {}", status, body.description.unwrap_or_default());
     }
     Ok(())
 }
 
-async fn send_reply_to_message(
+async fn send_reply_get_id(
     client: &reqwest::Client,
     bot_token: &str,
     chat_id: &str,
-    reply_to_message_id: i64,
     text: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     #[derive(Debug, serde::Serialize)]
-    struct ReplyParams {
-        message_id: i64,
-    }
-    #[derive(Debug, serde::Serialize)]
-    struct SendMessageWithReply {
+    struct SendMessagePayload {
         chat_id: String,
         text: String,
         parse_mode: String,
-        reply_parameters: ReplyParams,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct MessageResult {
+        message_id: i64,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct TelegramResponse {
+        ok: bool,
+        #[serde(default)]
+        description: Option<String>,
+        result: Option<MessageResult>,
     }
 
     let text = if text.len() > 4096 {
@@ -368,23 +439,26 @@ async fn send_reply_to_message(
 
     let response = client
         .post(telegram::telegram_api_url(bot_token, "sendMessage"))
-        .json(&SendMessageWithReply {
+        .json(&SendMessagePayload {
             chat_id: chat_id.to_string(),
             text,
             parse_mode: "HTML".to_string(),
-            reply_parameters: ReplyParams {
-                message_id: reply_to_message_id,
-            },
         })
         .send()
         .await?;
 
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("sendMessage failed: {status} {body}");
+    let body: TelegramResponse = response.json().await.unwrap_or(TelegramResponse {
+        ok: false,
+        description: Some(format!("invalid response with status {status}")),
+        result: None,
+    });
+    if !body.ok {
+        anyhow::bail!("sendMessage failed: {} - {}", status, body.description.unwrap_or_default());
     }
-    Ok(())
+    body.result
+        .map(|r| r.message_id)
+        .ok_or_else(|| anyhow::anyhow!("sendMessage returned no result"))
 }
 
 // --- Callback query handling ---
@@ -429,7 +503,6 @@ async fn handle_callback_query(
 
         handle_latest_more_callback(config, pool, client, bot_token, msg, &username, current_page).await;
     } else if let Some(rest) = data.strip_prefix("comments:") {
-        // Parse tweet_id:page
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         let tweet_id = parts[0];
         let page: usize = if parts.len() > 1 {
@@ -658,6 +731,52 @@ async fn handle_latest_more_callback(
     }
 }
 
+async fn send_reply_to_message(
+    client: &reqwest::Client,
+    bot_token: &str,
+    chat_id: &str,
+    reply_to_message_id: i64,
+    text: &str,
+) -> anyhow::Result<()> {
+    #[derive(Debug, serde::Serialize)]
+    struct ReplyParams {
+        message_id: i64,
+    }
+    #[derive(Debug, serde::Serialize)]
+    struct SendMessageWithReply {
+        chat_id: String,
+        text: String,
+        parse_mode: String,
+        reply_parameters: ReplyParams,
+    }
+
+    let text = if text.len() > 4096 {
+        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
+    } else {
+        text.to_string()
+    };
+
+    let response = client
+        .post(telegram::telegram_api_url(bot_token, "sendMessage"))
+        .json(&SendMessageWithReply {
+            chat_id: chat_id.to_string(),
+            text,
+            parse_mode: "HTML".to_string(),
+            reply_parameters: ReplyParams {
+                message_id: reply_to_message_id,
+            },
+        })
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("sendMessage failed: {status} {body}");
+    }
+    Ok(())
+}
+
 async fn handle_comments_callback(
     config: &AppConfig,
     pool: &SqlitePool,
@@ -672,7 +791,27 @@ async fn handle_comments_callback(
         return;
     }
 
-    tracing::info!(tweet_id = %tweet_id, page, "fetching comments on demand");
+    let is_channel = msg.chat.chat_type == "channel";
+    let discussion_group_id = std::env::var(&config.telegram.discussion_group_id_env).ok();
+    let is_discussion_group = discussion_group_id
+        .as_ref()
+        .map(|gid| msg.chat.id.to_string() == *gid)
+        .unwrap_or(false);
+
+    // Route: channel -> send to group with context header; group pagination -> continue in group; else inline
+    let (send_chat_id, use_context_header) = if is_channel {
+        if let Some(ref group_id) = discussion_group_id {
+            (group_id.clone(), true)
+        } else {
+            (msg.chat.id.to_string(), false)
+        }
+    } else if is_discussion_group {
+        (msg.chat.id.to_string(), false)
+    } else {
+        (msg.chat.id.to_string(), false)
+    };
+
+    tracing::info!(tweet_id = %tweet_id, page, is_channel, is_discussion_group, send_chat_id = %send_chat_id, "fetching comments on demand");
 
     match fetch::fetch_tweet_comments(
         config,
@@ -684,10 +823,7 @@ async fn handle_comments_callback(
     {
         Ok(comments) => {
             if comments.is_empty() {
-                let _ = send_reply_to_message(
-                    client, bot_token, &msg.chat.id.to_string(), msg.message_id,
-                    "No comments found (all may have been filtered as spam).",
-                ).await;
+                let _ = send_reply(client, bot_token, &send_chat_id, "No comments found.").await;
                 return;
             }
 
@@ -701,21 +837,45 @@ async fn handle_comments_callback(
             let page_comments = &comments[start..end];
             let has_more = end < total;
 
-            // Send each comment as a reply to the tweet message
+            // For channel posts: send context header to group, thread comments under it
+            let reply_to_id = if use_context_header {
+                let header = match storage::get_tweet(pool, tweet_id).await {
+                    Ok(Some(stored)) => format!(
+                        "<b>Comments</b> for <b>{}</b> (@{})\n{}",
+                        telegram::html_escape(&stored.tweet.author_name),
+                        telegram::html_escape(&stored.tweet.author_username),
+                        stored.tweet.url,
+                    ),
+                    _ => format!("Comments for tweet https://x.com/i/status/{tweet_id}"),
+                };
+                match send_reply_get_id(client, bot_token, &send_chat_id, &header).await {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to send comment header to group");
+                        None
+                    }
+                }
+            } else {
+                Some(msg.message_id)
+            };
+
             for comment in page_comments {
                 let text = format_single_comment(comment);
-                let _ = send_reply_to_message(
-                    client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text,
-                ).await;
+                if let Some(id) = reply_to_id {
+                    let _ = send_reply_to_message(
+                        client, bot_token, &send_chat_id, id, &text,
+                    ).await;
+                } else {
+                    let _ = send_reply(client, bot_token, &send_chat_id, &text).await;
+                }
             }
 
-            // If there are more comments, send a "Next page" button
             if has_more {
                 let callback_data = format!("comments:{tweet_id}:{}", page + 1);
                 let _ = send_reply_with_keyboard(
                     client,
                     bot_token,
-                    &msg.chat.id.to_string(),
+                    &send_chat_id,
                     &format!("Page {}/{} — Load more:", page, total.div_ceil(per_page)),
                     Some(&telegram::comment_button_markup_with_text("Next page >", &callback_data)),
                 ).await;
@@ -723,8 +883,8 @@ async fn handle_comments_callback(
         }
         Err(err) => {
             tracing::error!(?err, tweet_id = %tweet_id, "failed to fetch comments");
-            let _ = send_reply_to_message(
-                client, bot_token, &msg.chat.id.to_string(), msg.message_id,
+            let _ = send_reply(
+                client, bot_token, &send_chat_id,
                 &format!("Failed to fetch comments: {err}"),
             ).await;
         }
@@ -970,9 +1130,13 @@ async fn cmd_status(pool: &SqlitePool, config: &AppConfig) -> anyhow::Result<Str
 }
 
 async fn cmd_fetch(config: &AppConfig, pool: &SqlitePool) -> anyhow::Result<String> {
+    tracing::info!("cmd_fetch: starting run_fetch");
     let fetch = pipeline::run_fetch(config, pool).await?;
+    tracing::info!(fetched = fetch.fetched, sources = fetch.sources, "cmd_fetch: run_fetch done");
     let channels = channel::configured_channels(config)?;
+    tracing::info!("cmd_fetch: starting send_undelivered");
     let delivery = channel::send_undelivered(pool, &channels, 100).await?;
+    tracing::info!(sent = delivery.sent, failed = delivery.failed, "cmd_fetch: send_undelivered done");
 
     let mut msg = format!(
         "Fetch complete:\n\

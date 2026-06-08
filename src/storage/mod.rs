@@ -636,6 +636,23 @@ pub async fn delete_auth_account(pool: &SqlitePool, label: &str) -> anyhow::Resu
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn get_tweet(pool: &SqlitePool, tweet_id: &str) -> anyhow::Result<Option<StoredTweet>> {
+    let row = sqlx::query(
+        r#"
+        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
+               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
+        FROM tweets t
+        LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
+        WHERE t.tweet_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(tweet_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(row_to_tweet).transpose()
+}
+
 fn row_to_tweet(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<StoredTweet> {
     let source_type = SourceType::try_from(row.get::<String, _>("source_type").as_str())?;
     let raw = serde_json::from_str(row.get::<String, _>("raw_json").as_str())

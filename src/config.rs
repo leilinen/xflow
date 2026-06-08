@@ -113,6 +113,8 @@ pub struct TelegramConfig {
     pub enabled: bool,
     pub bot_token_env: String,
     pub chat_id_env: String,
+    #[serde(default)]
+    pub discussion_group_id_env: String,
     pub send_all: bool,
     pub parse_mode: String,
     pub disable_web_page_preview: bool,
@@ -146,7 +148,7 @@ fn default_comment_max() -> usize {
 }
 
 fn default_tweet_detail_query_id() -> String {
-    "bP4FsJMv-HMjGB2nZOjgOQ".to_string()
+    "zXaXQgfyR4GxE21uwYQSyA".to_string()
 }
 
 impl Default for TelegramConfig {
@@ -155,6 +157,7 @@ impl Default for TelegramConfig {
             enabled: false,
             bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
             chat_id_env: "TELEGRAM_CHAT_ID".to_string(),
+            discussion_group_id_env: "TELEGRAM_DISCUSSION_GROUP_ID".to_string(),
             send_all: true,
             parse_mode: "HTML".to_string(),
             disable_web_page_preview: false,
