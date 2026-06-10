@@ -24,7 +24,7 @@ pub async fn run_once(config: &AppConfig, pool: &PgPool) -> anyhow::Result<Worke
         tracing::warn!(?fetch.errors, "fetch completed with source failures");
     }
     let channels = channel::configured_channels(config)?;
-    let telegram = channel::send_undelivered(pool, &channels, 100).await?;
+    let telegram = channel::send_undelivered(pool, &channels, 100, config.fetch.max_delivery_retries).await?;
     Ok(WorkerOnceResult { fetch, telegram })
 }
 

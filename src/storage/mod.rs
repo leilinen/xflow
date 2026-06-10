@@ -343,6 +343,7 @@ pub async fn list_undelivered_tweets(
     channel: &str,
     important_only: bool,
     limit: i64,
+    max_retries: i64,
 ) -> anyhow::Result<Vec<StoredTweet>> {
     let important_clause = if important_only {
         "AND COALESCE(a.should_push, 0) = 1"
@@ -358,7 +359,9 @@ pub async fn list_undelivered_tweets(
         LEFT JOIN deliveries d
             ON d.tweet_id = t.tweet_id
             AND d.channel = $1
-            AND d.status = 'delivered'
+            AND (d.status = 'delivered'
+                 OR d.status = 'dead'
+                 OR d.retry_count >= $3)
         WHERE d.id IS NULL {important_clause}
         ORDER BY t.created_at ASC
         LIMIT $2
@@ -367,6 +370,7 @@ pub async fn list_undelivered_tweets(
     let rows = sqlx::query(&sql)
         .bind(channel)
         .bind(limit)
+        .bind(max_retries)
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(row_to_tweet).collect()
@@ -382,12 +386,14 @@ pub async fn save_delivery(
 ) -> anyhow::Result<()> {
     let now = Utc::now().to_rfc3339();
     let delivered_at = if delivered { Some(now.clone()) } else { None };
+    let final_status = if status == "dead" { "dead" } else { status };
     sqlx::query(
         r#"
-        INSERT INTO deliveries (tweet_id, channel, status, payload_json, created_at, delivered_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO deliveries (tweet_id, channel, status, retry_count, payload_json, created_at, delivered_at)
+        VALUES ($1, $2, $3, 0, $4, $5, $6)
         ON CONFLICT(tweet_id, channel) DO UPDATE SET
             status=excluded.status,
+            retry_count = deliveries.retry_count + 1,
             payload_json=excluded.payload_json,
             created_at=excluded.created_at,
             delivered_at=excluded.delivered_at
@@ -395,7 +401,7 @@ pub async fn save_delivery(
     )
     .bind(tweet_id)
     .bind(channel)
-    .bind(status)
+    .bind(final_status)
     .bind(payload.to_string())
     .bind(now)
     .bind(delivered_at)

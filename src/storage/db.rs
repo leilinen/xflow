@@ -113,6 +113,7 @@ pub async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
     migrate_sources(pool).await?;
     migrate_auth_accounts(pool).await?;
     migrate_deliveries(pool).await?;
+    migrate_deliveries_retry_count(pool).await?;
     tracing::debug!("database schema initialized");
     Ok(())
 }
@@ -223,5 +224,16 @@ async fn migrate_deliveries(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query("ALTER TABLE deliveries_new RENAME TO deliveries")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn migrate_deliveries_retry_count(pool: &PgPool) -> anyhow::Result<()> {
+    let columns = table_columns(pool, "deliveries").await?;
+    if !columns.iter().any(|c| c == "retry_count") {
+        tracing::info!("migrating deliveries: adding retry_count column");
+        sqlx::query("ALTER TABLE deliveries ADD COLUMN retry_count BIGINT NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }

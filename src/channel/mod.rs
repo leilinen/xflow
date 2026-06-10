@@ -22,8 +22,14 @@ pub struct ChannelSendReceipt {
     pub payload: Value,
 }
 
+#[derive(Debug)]
+pub enum DeliveryError {
+    Transient(anyhow::Error),
+    Permanent(anyhow::Error),
+}
+
 pub type ChannelSendFuture<'a> =
-    Pin<Box<dyn Future<Output = anyhow::Result<ChannelSendReceipt>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<ChannelSendReceipt, DeliveryError>> + Send + 'a>>;
 
 pub trait DeliveryChannel: Send + Sync {
     fn id(&self) -> String;
@@ -43,6 +49,7 @@ pub async fn send_undelivered(
     pool: &PgPool,
     channels: &[Box<dyn DeliveryChannel>],
     limit: i64,
+    max_retries: i64,
 ) -> anyhow::Result<ChannelDeliveryResult> {
     let mut result = ChannelDeliveryResult {
         sent: 0,
@@ -52,7 +59,7 @@ pub async fn send_undelivered(
     for channel in channels {
         let channel_id = channel.id();
         let tweets =
-            storage::list_undelivered_tweets(pool, &channel_id, !channel.send_all(), limit).await?;
+            storage::list_undelivered_tweets(pool, &channel_id, !channel.send_all(), limit, max_retries).await?;
         for tweet in tweets {
             match channel.send_tweet(&tweet).await {
                 Ok(receipt) => {
@@ -77,12 +84,40 @@ pub async fn send_undelivered(
                         result.sent += 1;
                     }
                 }
-                Err(err) => {
+                Err(DeliveryError::Permanent(err)) => {
                     tracing::warn!(
                         tweet_id = %tweet.tweet.tweet_id,
                         channel = %channel_id,
                         ?err,
-                        "tweet delivery failed"
+                        "permanent delivery failure, marking as dead"
+                    );
+                    if let Err(err2) = storage::save_delivery(
+                        pool,
+                        &tweet.tweet.tweet_id,
+                        &channel_id,
+                        "dead",
+                        &serde_json::json!({"error": err.to_string()}),
+                        false,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            tweet_id = %tweet.tweet.tweet_id,
+                            channel = %channel_id,
+                            ?err2,
+                            "failed to save dead delivery record"
+                        );
+                        result.skipped += 1;
+                    } else {
+                        result.failed += 1;
+                    }
+                }
+                Err(DeliveryError::Transient(err)) => {
+                    tracing::warn!(
+                        tweet_id = %tweet.tweet.tweet_id,
+                        channel = %channel_id,
+                        ?err,
+                        "transient delivery failure"
                     );
                     if let Err(err2) = storage::save_delivery(
                         pool,

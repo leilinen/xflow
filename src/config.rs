@@ -46,6 +46,10 @@ pub struct FetchConfig {
     pub source_delay_min_seconds: u64,
     #[serde(default)]
     pub source_delay_max_seconds: u64,
+    #[serde(default = "default_command_timeout_seconds")]
+    pub command_timeout_seconds: u64,
+    #[serde(default = "default_max_delivery_retries")]
+    pub max_delivery_retries: i64,
 }
 
 impl Default for FetchConfig {
@@ -57,6 +61,8 @@ impl Default for FetchConfig {
             rate_limit_safety_margin: 10,
             source_delay_min_seconds: 0,
             source_delay_max_seconds: 0,
+            command_timeout_seconds: 300,
+            max_delivery_retries: 3,
         }
     }
 }
@@ -215,6 +221,14 @@ impl Default for AppConfig {
             comments: CommentsConfig::default(),
         }
     }
+}
+
+fn default_command_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_max_delivery_retries() -> i64 {
+    3
 }
 
 fn default_rate_limit_safety_margin() -> i64 {

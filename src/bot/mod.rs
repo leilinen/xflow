@@ -298,9 +298,10 @@ async fn handle_command(
             let chat_id_str = chat_id_str.clone();
             let client = client.clone();
             let bot_token = bot_token.to_string();
+            let timeout_secs = config.fetch.command_timeout_seconds;
             tokio::spawn(async move {
                 let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
+                    std::time::Duration::from_secs(timeout_secs),
                     cmd_fetch(&config, &pool),
                 ).await;
                 let reply = match result {
@@ -310,8 +311,8 @@ async fn handle_command(
                         format!("Error: {err}")
                     }
                     Err(_) => {
-                        tracing::error!("fetch command timed out after 120s");
-                        "Fetch timed out after 120 seconds.".to_string()
+                        tracing::error!("fetch command timed out after {timeout_secs}s");
+                        format!("Fetch timed out after {timeout_secs} seconds.")
                     }
                 };
                 if let Err(err) = send_reply(&client, &bot_token, &chat_id_str, &reply).await {
@@ -1135,7 +1136,7 @@ async fn cmd_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<String> 
     tracing::info!(fetched = fetch.fetched, sources = fetch.sources, "cmd_fetch: run_fetch done");
     let channels = channel::configured_channels(config)?;
     tracing::info!("cmd_fetch: starting send_undelivered");
-    let delivery = channel::send_undelivered(pool, &channels, 100).await?;
+    let delivery = channel::send_undelivered(pool, &channels, 100, config.fetch.max_delivery_retries).await?;
     tracing::info!(sent = delivery.sent, failed = delivery.failed, "cmd_fetch: send_undelivered done");
 
     let mut msg = format!(

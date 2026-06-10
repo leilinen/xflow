@@ -505,7 +505,7 @@ impl TelegramChannel {
         &self,
         _tweet: &StoredTweet,
         reply_ctx: Option<&ReplyContext>,
-    ) -> anyhow::Result<Option<i64>> {
+    ) -> Result<Option<i64>, super::DeliveryError> {
         let Some(ctx) = reply_ctx else {
             return Ok(None);
         };
@@ -536,7 +536,7 @@ impl TelegramChannel {
         media: &[TweetMedium],
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let result = match self.try_send_media(tweet, media, reply_to_msg_id, reply_markup.clone()).await {
             Ok(r) => r,
             Err(err) => {
@@ -564,7 +564,7 @@ impl TelegramChannel {
         media: &[TweetMedium],
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let caption = format_tweet_caption(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
 
@@ -697,7 +697,7 @@ impl TelegramChannel {
         article: &ArticleContent,
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let text = format_article_message(tweet, article);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, false, reply_markup).await
@@ -710,7 +710,7 @@ impl TelegramChannel {
         _links: &[ExternalLink],
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let text = format_tweet_message(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, false, reply_markup)
@@ -723,7 +723,7 @@ impl TelegramChannel {
         tweet: &StoredTweet,
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let text = format_tweet_message(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, self.disable_web_page_preview, reply_markup)
@@ -737,7 +737,7 @@ impl TelegramChannel {
         reply_parameters: Option<ReplyParameters>,
         disable_preview: bool,
         reply_markup: Option<InlineKeyboardMarkup>,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let payload = SendMessagePayload {
             chat_id: self.credentials.chat_id.clone(),
             text: text.to_string(),
@@ -767,7 +767,7 @@ impl TelegramChannel {
         &self,
         method: &str,
         payload: &T,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
@@ -779,14 +779,18 @@ impl TelegramChannel {
                     tracing::warn!(attempt, method, "Telegram transient error, will retry: {err}");
                     last_err = Some(err);
                 }
-                Err(TelegramSendError::Permanent(err)) => return Err(err),
+                Err(TelegramSendError::Permanent(err)) => {
+                    return Err(super::DeliveryError::Permanent(err));
+                }
                 Err(TelegramSendError::ParseError { description }) => {
                     tracing::warn!(method, %description, "Telegram parse error, retrying as plain text");
                     return self.send_plain_text_fallback(method, payload).await;
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
+        Err(super::DeliveryError::Transient(
+            last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded"))
+        ))
     }
 
     /// Single API call attempt.
@@ -853,9 +857,9 @@ impl TelegramChannel {
         &self,
         method: &str,
         original_payload: &T,
-    ) -> anyhow::Result<ChannelSendReceipt> {
+    ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let mut json = serde_json::to_value(original_payload)
-            .map_err(|e| anyhow::anyhow!("payload serialization failed: {e}"))?;
+            .map_err(|e| super::DeliveryError::Permanent(anyhow::anyhow!("payload serialization failed: {e}")))?;
 
         if let Some(obj) = json.as_object_mut() {
             obj.remove("parse_mode");
@@ -880,11 +884,12 @@ impl TelegramChannel {
         match self.try_api_call(method, &json).await {
             Ok(receipt) => Ok(receipt),
             Err(TelegramSendError::ParseError { description }) => {
-                Err(anyhow::anyhow!(
+                Err(super::DeliveryError::Permanent(anyhow::anyhow!(
                     "Telegram parse error persisted after plain text fallback: {description}"
-                ))
+                )))
             }
-            Err(TelegramSendError::Permanent(e)) | Err(TelegramSendError::Transient(e)) => Err(e),
+            Err(TelegramSendError::Permanent(e)) => Err(super::DeliveryError::Permanent(e)),
+            Err(TelegramSendError::Transient(e)) => Err(super::DeliveryError::Transient(e)),
         }
     }
 }
@@ -935,6 +940,7 @@ pub async fn send_undelivered(
     config: &TelegramConfig,
     comments: &CommentsConfig,
     limit: i64,
+    max_retries: i64,
 ) -> anyhow::Result<TelegramResult> {
     if !config.enabled {
         return Ok(TelegramResult {
@@ -947,6 +953,7 @@ pub async fn send_undelivered(
         pool,
         &[Box::new(TelegramChannel::from_config(config, comments)?)],
         limit,
+        max_retries,
     )
     .await
 }

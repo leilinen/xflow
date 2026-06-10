@@ -588,10 +588,10 @@ async fn channel_delivery_records_prevent_duplicate_sends() {
     .unwrap();
 
     let channels: Vec<Box<dyn DeliveryChannel>> = vec![Box::new(MockChannel)];
-    let first = channel::send_undelivered(&pool, &channels, 10)
+    let first = channel::send_undelivered(&pool, &channels, 10, 3)
         .await
         .unwrap();
-    let second = channel::send_undelivered(&pool, &channels, 10)
+    let second = channel::send_undelivered(&pool, &channels, 10, 3)
         .await
         .unwrap();
 
