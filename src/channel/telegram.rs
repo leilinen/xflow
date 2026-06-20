@@ -1,12 +1,14 @@
 use super::{
     ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel,
 };
-use crate::config::{CommentsConfig, TelegramConfig};
+use crate::config::{CommentsConfig, TelegramConfig, TranslationConfig};
 use crate::fetch::media::{
     extract_article, extract_external_links, extract_media, extract_reply_context,
     ArticleContent, ExternalLink, QuotedTweet, ReplyContext, TweetMedium,
 };
+use crate::lang;
 use crate::models::StoredTweet;
+use crate::translate::TranslationClient;
 use crate::worker::pipeline::FetchSourceError;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -162,17 +164,30 @@ pub struct TelegramChannel {
     parse_mode: String,
     disable_web_page_preview: bool,
     comments_enabled: bool,
+    translation_client: Option<TranslationClient>,
     client: Client,
 }
 
 impl TelegramChannel {
-    pub fn from_config(config: &TelegramConfig, comments: &CommentsConfig) -> anyhow::Result<Self> {
+    pub fn from_config(config: &TelegramConfig, comments: &CommentsConfig, translation: &TranslationConfig) -> anyhow::Result<Self> {
+        let translation_client = if translation.enabled {
+            match TranslationClient::from_config(translation) {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::warn!("translation client init failed: {err}, proceeding without translation");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             credentials: load_credentials(config)?,
             send_all: config.send_all,
             parse_mode: config.parse_mode.clone(),
             disable_web_page_preview: config.disable_web_page_preview,
             comments_enabled: comments.enabled,
+            translation_client,
             client: Client::new(),
         })
     }
@@ -294,7 +309,7 @@ enum TelegramSendError {
 
 // --- Message formatting ---
 
-pub fn format_tweet_message(stored: &StoredTweet) -> String {
+pub fn format_tweet_message(stored: &StoredTweet, translation: Option<&str>) -> String {
     let mut parts = vec![
         format!(
             "<b>{}</b> (@{}) · {} UTC+8",
@@ -304,10 +319,13 @@ pub fn format_tweet_message(stored: &StoredTweet) -> String {
         ),
         html_escape(&stored.tweet.text),
     ];
-    if let Some(analysis) = &stored.analysis {
-        if analysis.chinese_summary != stored.tweet.text {
-            parts.push(format!("<i>{}</i>", html_escape(&analysis.chinese_summary)));
+    if let Some(t) = translation {
+        if !t.is_empty() {
+            parts.push("----------".to_string());
+            parts.push(format!("<i>{}</i>", html_escape(t)));
         }
+    }
+    if let Some(analysis) = &stored.analysis {
         if !analysis.tags.is_empty() {
             parts.push(format!("Tags: {}", html_escape(&analysis.tags.join(", "))));
         }
@@ -474,6 +492,23 @@ impl DeliveryChannel for TelegramChannel {
 
     fn send_tweet<'a>(&'a self, tweet: &'a StoredTweet) -> ChannelSendFuture<'a> {
         Box::pin(async move {
+            // Real-time translation for non-Chinese tweets
+            let translation = if let Some(client) = &self.translation_client {
+                if !lang::is_primarily_chinese(&tweet.tweet.text) {
+                    match client.translate(&tweet.tweet.text).await {
+                        Ok(t) => Some(t),
+                        Err(err) => {
+                            tracing::warn!(tweet_id = %tweet.tweet.tweet_id, "translation failed: {err}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let media = extract_media(&tweet.tweet.raw);
             let links = extract_external_links(&tweet.tweet.raw);
             let reply_ctx = extract_reply_context(&tweet.tweet.raw);
@@ -485,13 +520,13 @@ impl DeliveryChannel for TelegramChannel {
 
             // Step 2: Route by content type
             if !media.is_empty() {
-                self.send_media_tweet(tweet, &media, reply_to_msg_id, reply_markup).await
+                self.send_media_tweet(tweet, &media, reply_to_msg_id, reply_markup, translation.as_deref()).await
             } else if article.is_some() {
                 self.send_article_tweet(tweet, article.as_ref().unwrap(), reply_to_msg_id, reply_markup).await
             } else if !links.is_empty() {
-                self.send_link_tweet(tweet, &links, reply_to_msg_id, reply_markup).await
+                self.send_link_tweet(tweet, &links, reply_to_msg_id, reply_markup, translation.as_deref()).await
             } else {
-                self.send_text_tweet(tweet, reply_to_msg_id, reply_markup).await
+                self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation.as_deref()).await
             }
         })
     }
@@ -536,17 +571,18 @@ impl TelegramChannel {
         media: &[TweetMedium],
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
+        translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let result = match self.try_send_media(tweet, media, reply_to_msg_id, reply_markup.clone()).await {
+        let result = match self.try_send_media(tweet, media, reply_to_msg_id, reply_markup.clone(), translation).await {
             Ok(r) => r,
             Err(err) => {
                 tracing::warn!(?err, "media send failed, falling back to text-only");
-                return self.send_text_tweet(tweet, reply_to_msg_id, reply_markup).await;
+                return self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation).await;
             }
         };
 
         // If caption was truncated, send full text as a follow-up reply
-        let full_msg = format_tweet_message(tweet);
+        let full_msg = format_tweet_message(tweet, translation);
         let caption = format_tweet_caption(tweet);
         if caption.len() < full_msg.len() {
             let reply_params = extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
@@ -564,6 +600,7 @@ impl TelegramChannel {
         media: &[TweetMedium],
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
+        translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let caption = format_tweet_caption(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
@@ -687,7 +724,7 @@ impl TelegramChannel {
         }
 
         // Fallback to text
-        self.send_text_tweet(tweet, reply_to_msg_id, reply_markup).await
+        self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation).await
     }
 
     /// Send an article tweet.
@@ -710,8 +747,9 @@ impl TelegramChannel {
         _links: &[ExternalLink],
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
+        translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let text = format_tweet_message(tweet);
+        let text = format_tweet_message(tweet, translation);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, false, reply_markup)
             .await
@@ -723,8 +761,9 @@ impl TelegramChannel {
         tweet: &StoredTweet,
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
+        translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let text = format_tweet_message(tweet);
+        let text = format_tweet_message(tweet, translation);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, self.disable_web_page_preview, reply_markup)
             .await
@@ -939,6 +978,7 @@ pub async fn send_undelivered(
     pool: &PgPool,
     config: &TelegramConfig,
     comments: &CommentsConfig,
+    translation: &TranslationConfig,
     limit: i64,
     max_retries: i64,
 ) -> anyhow::Result<TelegramResult> {
@@ -951,7 +991,7 @@ pub async fn send_undelivered(
     }
     super::send_undelivered(
         pool,
-        &[Box::new(TelegramChannel::from_config(config, comments)?)],
+        &[Box::new(TelegramChannel::from_config(config, comments, translation)?)],
         limit,
         max_retries,
     )
@@ -1133,7 +1173,7 @@ mod tests {
             },
             analysis: None,
         };
-        let message = format_tweet_message(&stored);
+        let message = format_tweet_message(&stored, None);
         assert!(message.contains("AI &lt;agent&gt; &amp; update"));
         assert!(message.contains("x=1&amp;y=2"));
     }
@@ -1181,7 +1221,7 @@ mod tests {
                 analyzed_at: Utc::now(),
             }),
         };
-        let message = format_tweet_message(&stored);
+        let message = format_tweet_message(&stored, None);
         assert!(message.len() <= TELEGRAM_MESSAGE_LIMIT);
         assert!(message.contains("<b>OpenAI</b> (@openai)"));
         assert!(message.contains("Open tweet"));
@@ -1207,9 +1247,28 @@ mod tests {
             },
             analysis: None,
         };
-        let message = format_tweet_message(&stored);
+        let message = format_tweet_message(&stored, None);
         assert!(!message.contains(TRUNCATION_MARKER.trim()));
         assert!(message.contains("Short tweet"));
+    }
+
+    #[test]
+    fn format_tweet_message_with_translation() {
+        let stored = make_stored("Hello world from OpenAI!", json!({}));
+        let message = format_tweet_message(&stored, Some("来自OpenAI的你好世界！"));
+        assert!(message.contains("Hello world from OpenAI!"));
+        assert!(message.contains("----------"));
+        assert!(message.contains("<i>来自OpenAI的你好世界！</i>"));
+        assert!(message.contains("Open tweet"));
+    }
+
+    #[test]
+    fn format_tweet_message_without_translation() {
+        let stored = make_stored("Hello world from OpenAI!", json!({}));
+        let message = format_tweet_message(&stored, None);
+        assert!(message.contains("Hello world from OpenAI!"));
+        assert!(!message.contains("----------"));
+        assert!(message.contains("Open tweet"));
     }
 
     #[test]

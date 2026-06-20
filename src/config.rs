@@ -131,6 +131,62 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_translation_prompt")]
+    pub system_prompt: String,
+}
+
+impl Default for TranslationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: default_api_key_env(),
+            base_url: default_base_url(),
+            model: default_model(),
+            max_tokens: default_max_tokens(),
+            temperature: default_temperature(),
+            system_prompt: default_translation_prompt(),
+        }
+    }
+}
+
+fn default_api_key_env() -> String {
+    "OPENAI_API_KEY".to_string()
+}
+
+fn default_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_max_tokens() -> u32 {
+    1024
+}
+
+fn default_temperature() -> f32 {
+    0.3
+}
+
+fn default_translation_prompt() -> String {
+    "You are a professional translator. Translate the following tweet to Chinese (Simplified). Output only the translation, nothing else.".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -190,6 +246,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
+    pub translation: TranslationConfig,
+    #[serde(default)]
     pub comments: CommentsConfig,
 }
 
@@ -218,6 +276,7 @@ impl Default for AppConfig {
             },
             agent: AgentConfig::default(),
             telegram: TelegramConfig::default(),
+            translation: TranslationConfig::default(),
             comments: CommentsConfig::default(),
         }
     }

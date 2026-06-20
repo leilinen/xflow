@@ -40,7 +40,7 @@ pub trait DeliveryChannel: Send + Sync {
 pub fn configured_channels(config: &AppConfig) -> anyhow::Result<Vec<Box<dyn DeliveryChannel>>> {
     let mut channels: Vec<Box<dyn DeliveryChannel>> = Vec::new();
     if config.telegram.enabled {
-        channels.push(Box::new(TelegramChannel::from_config(&config.telegram, &config.comments)?));
+        channels.push(Box::new(TelegramChannel::from_config(&config.telegram, &config.comments, &config.translation)?));
     }
     Ok(channels)
 }
