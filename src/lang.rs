@@ -56,7 +56,9 @@ mod tests {
     #[test]
     fn mostly_english_with_chinese_phrase() {
         // Only 2 CJK chars out of many — not primarily Chinese
-        assert!(!is_primarily_chinese("Just shipped the 你好 feature to production"));
+        assert!(!is_primarily_chinese(
+            "Just shipped the 你好 feature to production"
+        ));
     }
 
     #[test]

@@ -1,11 +1,11 @@
 pub mod pipeline;
 
-use crate::config::AppConfig;
-use crate::storage;
+use self::pipeline::FetchResult;
 use crate::channel;
 use crate::channel::telegram;
 use crate::channel::telegram::TelegramResult;
-use self::pipeline::FetchResult;
+use crate::config::AppConfig;
+use crate::storage;
 use serde::Serialize;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -24,7 +24,8 @@ pub async fn run_once(config: &AppConfig, pool: &PgPool) -> anyhow::Result<Worke
         tracing::warn!(?fetch.errors, "fetch completed with source failures");
     }
     let channels = channel::configured_channels(config)?;
-    let telegram = channel::send_undelivered(pool, &channels, 100, config.fetch.max_delivery_retries).await?;
+    let telegram =
+        channel::send_undelivered(pool, &channels, 100, config.fetch.max_delivery_retries).await?;
     Ok(WorkerOnceResult { fetch, telegram })
 }
 
@@ -86,11 +87,8 @@ pub async fn run_forever(config: AppConfig, pool: PgPool) -> anyhow::Result<()> 
                 current_interval = next;
                 consecutive_successes = successes;
                 if result.fetch.failed > 0 {
-                    if let Err(err) = telegram::send_fetch_alert(
-                        &config.telegram,
-                        &result.fetch.errors,
-                    )
-                    .await
+                    if let Err(err) =
+                        telegram::send_fetch_alert(&config.telegram, &result.fetch.errors).await
                     {
                         tracing::warn!(?err, "failed to send fetch alert");
                     }
@@ -105,11 +103,8 @@ pub async fn run_forever(config: AppConfig, pool: PgPool) -> anyhow::Result<()> 
                     source_value: "cycle".to_string(),
                     message: err.to_string(),
                 };
-                if let Err(alert_err) = telegram::send_fetch_alert(
-                    &config.telegram,
-                    &[generic_error],
-                )
-                .await
+                if let Err(alert_err) =
+                    telegram::send_fetch_alert(&config.telegram, &[generic_error]).await
                 {
                     tracing::warn!(?alert_err, "failed to send cycle failure alert");
                 }

@@ -1,13 +1,13 @@
-use crate::fetch::auth;
+use crate::channel::telegram;
 use crate::config::{load_config, write_default_config};
-use crate::storage::db;
 use crate::digest;
-use crate::worker::pipeline;
+use crate::fetch::auth;
 use crate::server;
 use crate::storage;
-use crate::channel::telegram;
+use crate::storage::db;
 use crate::utils::{mask_token, DEFAULT_CONFIG_PATH};
 use crate::worker;
+use crate::worker::pipeline;
 use clap::{Args, Parser, Subcommand};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
@@ -164,9 +164,15 @@ pub async fn run() -> anyhow::Result<()> {
                 Some(s) => Some(parse_duration(s)?),
                 None => None,
             };
-            let result =
-                crate::fetch::backfill_user(&config, &pool, &args.username, args.max_pages, args.page_delay, since)
-                    .await?;
+            let result = crate::fetch::backfill_user(
+                &config,
+                &pool,
+                &args.username,
+                args.max_pages,
+                args.page_delay,
+                since,
+            )
+            .await?;
             println!(
                 "Backfill @{} complete: {} total, {} new, {} existing, {} pages.",
                 args.username, result.total, result.new, result.duplicate, result.pages
@@ -188,8 +194,15 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Telegram { command } => match command {
             TelegramCommand::Send(args) => {
                 let (config, pool) = configured_pool(&args.config).await?;
-                let result =
-                    telegram::send_undelivered(&pool, &config.telegram, &config.comments, &config.translation, args.limit, config.fetch.max_delivery_retries).await?;
+                let result = telegram::send_undelivered(
+                    &pool,
+                    &config.telegram,
+                    &config.comments,
+                    &config.translation,
+                    args.limit,
+                    config.fetch.max_delivery_retries,
+                )
+                .await?;
                 println!(
                     "Telegram delivery: sent {}, failed {}, skipped {}.",
                     result.sent, result.failed, result.skipped
@@ -248,9 +261,7 @@ async fn init(args: ConfigOpt) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn configured_pool(
-    config_path: &Path,
-) -> anyhow::Result<(crate::config::AppConfig, PgPool)> {
+async fn configured_pool(config_path: &Path) -> anyhow::Result<(crate::config::AppConfig, PgPool)> {
     let config = load_config(config_path)?;
     let pool = db::connect(&config.storage.database_url).await?;
     db::init_db(&pool).await?;

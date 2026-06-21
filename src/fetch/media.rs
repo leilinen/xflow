@@ -65,9 +65,7 @@ pub fn extract_external_links(raw: &Value) -> Vec<ExternalLink> {
         Some(l) => l,
         None => return Vec::new(),
     };
-    let urls = legacy
-        .pointer("/entities/urls")
-        .and_then(Value::as_array);
+    let urls = legacy.pointer("/entities/urls").and_then(Value::as_array);
     let Some(urls) = urls else {
         return Vec::new();
     };
@@ -152,9 +150,7 @@ fn extract_quoted_tweet(raw: &Value) -> Option<QuotedTweet> {
     let legacy = raw.get("legacy")?;
 
     // Check for quoted_status_id_str as indicator
-    let _quoted_id = legacy
-        .get("quoted_status_id_str")
-        .and_then(Value::as_str)?;
+    let _quoted_id = legacy.get("quoted_status_id_str").and_then(Value::as_str)?;
 
     // Try to get the full quoted tweet data
     // Path 1: legacy.quoted_status (older API shape)
@@ -230,10 +226,7 @@ fn best_mp4_variant(media_item: &Value) -> Option<String> {
         if ct != "video/mp4" {
             continue;
         }
-        let bitrate = v
-            .get("bitrate")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let bitrate = v.get("bitrate").and_then(Value::as_i64).unwrap_or(0);
         if best.map_or(true, |(_, b)| bitrate > b) {
             best = Some((v, bitrate));
         }

@@ -1,10 +1,8 @@
-use super::{
-    ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel,
-};
+use super::{ChannelDeliveryResult, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use crate::config::{CommentsConfig, TelegramConfig, TranslationConfig};
 use crate::fetch::media::{
-    extract_article, extract_external_links, extract_media, extract_reply_context,
-    ArticleContent, ExternalLink, QuotedTweet, ReplyContext, TweetMedium,
+    extract_article, extract_external_links, extract_media, extract_reply_context, ArticleContent,
+    ExternalLink, QuotedTweet, ReplyContext, TweetMedium,
 };
 use crate::lang;
 use crate::models::StoredTweet;
@@ -136,7 +134,6 @@ pub fn comment_button_markup_with_text(text: &str, callback_data: &str) -> Inlin
     }
 }
 
-
 // --- Response types ---
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -169,12 +166,18 @@ pub struct TelegramChannel {
 }
 
 impl TelegramChannel {
-    pub fn from_config(config: &TelegramConfig, comments: &CommentsConfig, translation: &TranslationConfig) -> anyhow::Result<Self> {
+    pub fn from_config(
+        config: &TelegramConfig,
+        comments: &CommentsConfig,
+        translation: &TranslationConfig,
+    ) -> anyhow::Result<Self> {
         let translation_client = if translation.enabled {
             match TranslationClient::from_config(translation) {
                 Ok(client) => Some(client),
                 Err(err) => {
-                    tracing::warn!("translation client init failed: {err}, proceeding without translation");
+                    tracing::warn!(
+                        "translation client init failed: {err}, proceeding without translation"
+                    );
                     None
                 }
             }
@@ -373,10 +376,7 @@ pub fn format_tweet_caption(stored: &StoredTweet) -> String {
 /// Format a quoted/replied-to tweet as a block message.
 pub fn format_quoted_tweet_block(quoted: &QuotedTweet) -> String {
     let text = truncate_str(&quoted.text, QUOTED_TWEET_MAX_CHARS);
-    let lines: Vec<String> = text
-        .lines()
-        .map(|l| format!("▎ {l}"))
-        .collect();
+    let lines: Vec<String> = text.lines().map(|l| format!("▎ {l}")).collect();
     let block = lines.join("\n");
     format!(
         "▎ <b>@{}</b>:\n{}\n▎ 🔗 {}",
@@ -396,9 +396,7 @@ fn format_reply_context_message(reply_ctx: &ReplyContext) -> Option<String> {
     if let Some(username) = &reply_ctx.reply_to_username {
         let mut msg = format!("Replying to <b>@{}</b>", html_escape(username));
         if let Some(id) = &reply_ctx.reply_to_tweet_id {
-            msg.push_str(&format!(
-                "\n▎ 🔗 https://x.com/{username}/status/{id}"
-            ));
+            msg.push_str(&format!("\n▎ 🔗 https://x.com/{username}/status/{id}"));
         }
         return Some(msg);
     }
@@ -429,7 +427,10 @@ fn format_article_message(stored: &StoredTweet, article: &ArticleContent) -> Str
 
     // Footer with both article link and tweet link
     let mut footer = String::new();
-    footer.push_str(&format!("<a href=\"{}\">Open article</a>", html_escape(&article.url)));
+    footer.push_str(&format!(
+        "<a href=\"{}\">Open article</a>",
+        html_escape(&article.url)
+    ));
     footer.push_str(&format!(
         " · <a href=\"{}\">Open tweet</a>",
         html_escape(&stored.tweet.url)
@@ -520,13 +521,34 @@ impl DeliveryChannel for TelegramChannel {
 
             // Step 2: Route by content type
             if !media.is_empty() {
-                self.send_media_tweet(tweet, &media, reply_to_msg_id, reply_markup, translation.as_deref()).await
+                self.send_media_tweet(
+                    tweet,
+                    &media,
+                    reply_to_msg_id,
+                    reply_markup,
+                    translation.as_deref(),
+                )
+                .await
             } else if article.is_some() {
-                self.send_article_tweet(tweet, article.as_ref().unwrap(), reply_to_msg_id, reply_markup).await
+                self.send_article_tweet(
+                    tweet,
+                    article.as_ref().unwrap(),
+                    reply_to_msg_id,
+                    reply_markup,
+                )
+                .await
             } else if !links.is_empty() {
-                self.send_link_tweet(tweet, &links, reply_to_msg_id, reply_markup, translation.as_deref()).await
+                self.send_link_tweet(
+                    tweet,
+                    &links,
+                    reply_to_msg_id,
+                    reply_markup,
+                    translation.as_deref(),
+                )
+                .await
             } else {
-                self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation.as_deref()).await
+                self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation.as_deref())
+                    .await
             }
         })
     }
@@ -573,11 +595,22 @@ impl TelegramChannel {
         reply_markup: Option<InlineKeyboardMarkup>,
         translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let result = match self.try_send_media(tweet, media, reply_to_msg_id, reply_markup.clone(), translation).await {
+        let result = match self
+            .try_send_media(
+                tweet,
+                media,
+                reply_to_msg_id,
+                reply_markup.clone(),
+                translation,
+            )
+            .await
+        {
             Ok(r) => r,
             Err(err) => {
                 tracing::warn!(?err, "media send failed, falling back to text-only");
-                return self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation).await;
+                return self
+                    .send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation)
+                    .await;
             }
         };
 
@@ -585,7 +618,8 @@ impl TelegramChannel {
         let full_msg = format_tweet_message(tweet, translation);
         let caption = format_tweet_caption(tweet);
         if caption.len() < full_msg.len() {
-            let reply_params = extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
+            let reply_params =
+                extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
             let _ = self
                 .send_text_message(&full_msg, reply_params, true, None)
                 .await;
@@ -612,7 +646,12 @@ impl TelegramChannel {
             .collect();
         let videos: Vec<&TweetMedium> = media
             .iter()
-            .filter(|m| matches!(m, TweetMedium::Video { .. } | TweetMedium::AnimatedGif { .. }))
+            .filter(|m| {
+                matches!(
+                    m,
+                    TweetMedium::Video { .. } | TweetMedium::AnimatedGif { .. }
+                )
+            })
             .collect();
 
         // Single photo
@@ -647,7 +686,11 @@ impl TelegramChannel {
                         type_: "photo".to_string(),
                         media: url,
                         caption: if i == 0 { Some(caption.clone()) } else { None },
-                        parse_mode: if i == 0 { self.effective_parse_mode() } else { None },
+                        parse_mode: if i == 0 {
+                            self.effective_parse_mode()
+                        } else {
+                            None
+                        },
                     }
                 })
                 .collect();
@@ -724,7 +767,8 @@ impl TelegramChannel {
         }
 
         // Fallback to text
-        self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation).await
+        self.send_text_tweet(tweet, reply_to_msg_id, reply_markup, translation)
+            .await
     }
 
     /// Send an article tweet.
@@ -737,7 +781,8 @@ impl TelegramChannel {
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let text = format_article_message(tweet, article);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
-        self.send_text_message(&text, reply_params, false, reply_markup).await
+        self.send_text_message(&text, reply_params, false, reply_markup)
+            .await
     }
 
     /// Send a tweet with external links (enable link preview).
@@ -765,8 +810,13 @@ impl TelegramChannel {
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
         let text = format_tweet_message(tweet, translation);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
-        self.send_text_message(&text, reply_params, self.disable_web_page_preview, reply_markup)
-            .await
+        self.send_text_message(
+            &text,
+            reply_params,
+            self.disable_web_page_preview,
+            reply_markup,
+        )
+        .await
     }
 
     /// Low-level: send a text message via sendMessage.
@@ -815,7 +865,11 @@ impl TelegramChannel {
             match self.try_api_call(method, payload).await {
                 Ok(receipt) => return Ok(receipt),
                 Err(TelegramSendError::Transient(err)) => {
-                    tracing::warn!(attempt, method, "Telegram transient error, will retry: {err}");
+                    tracing::warn!(
+                        attempt,
+                        method,
+                        "Telegram transient error, will retry: {err}"
+                    );
                     last_err = Some(err);
                 }
                 Err(TelegramSendError::Permanent(err)) => {
@@ -828,7 +882,7 @@ impl TelegramChannel {
             }
         }
         Err(super::DeliveryError::Transient(
-            last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded"))
+            last_err.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")),
         ))
     }
 
@@ -897,23 +951,33 @@ impl TelegramChannel {
         method: &str,
         original_payload: &T,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let mut json = serde_json::to_value(original_payload)
-            .map_err(|e| super::DeliveryError::Permanent(anyhow::anyhow!("payload serialization failed: {e}")))?;
+        let mut json = serde_json::to_value(original_payload).map_err(|e| {
+            super::DeliveryError::Permanent(anyhow::anyhow!("payload serialization failed: {e}"))
+        })?;
 
         if let Some(obj) = json.as_object_mut() {
             obj.remove("parse_mode");
             if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                obj.insert("text".to_string(), serde_json::Value::String(strip_html(text)));
+                obj.insert(
+                    "text".to_string(),
+                    serde_json::Value::String(strip_html(text)),
+                );
             }
             if let Some(caption) = obj.get("caption").and_then(|v| v.as_str()) {
-                obj.insert("caption".to_string(), serde_json::Value::String(strip_html(caption)));
+                obj.insert(
+                    "caption".to_string(),
+                    serde_json::Value::String(strip_html(caption)),
+                );
             }
             if let Some(media) = obj.get_mut("media").and_then(|v| v.as_array_mut()) {
                 for item in media.iter_mut() {
                     if let Some(item_obj) = item.as_object_mut() {
                         item_obj.remove("parse_mode");
                         if let Some(c) = item_obj.get("caption").and_then(|v| v.as_str()) {
-                            item_obj.insert("caption".to_string(), serde_json::Value::String(strip_html(c)));
+                            item_obj.insert(
+                                "caption".to_string(),
+                                serde_json::Value::String(strip_html(c)),
+                            );
                         }
                     }
                 }
@@ -991,7 +1055,11 @@ pub async fn send_undelivered(
     }
     super::send_undelivered(
         pool,
-        &[Box::new(TelegramChannel::from_config(config, comments, translation)?)],
+        &[Box::new(TelegramChannel::from_config(
+            config,
+            comments,
+            translation,
+        )?)],
         limit,
         max_retries,
     )
@@ -1133,8 +1201,8 @@ pub async fn send_fetch_alert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{SourceType, Tweet, TweetAnalysis};
     use crate::fetch::media::{ArticleContent, QuotedTweet};
+    use crate::models::{SourceType, Tweet, TweetAnalysis};
     use chrono::Utc;
     use serde_json::json;
 

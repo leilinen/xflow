@@ -100,7 +100,9 @@ pub async fn fetch_tweet_comments(
             spam_keywords.push(lower);
         }
     }
-    fetcher.fetch_comments(tweet_id, max_comments, &spam_keywords).await
+    fetcher
+        .fetch_comments(tweet_id, max_comments, &spam_keywords)
+        .await
 }
 
 pub async fn verify_auth(
@@ -377,7 +379,11 @@ impl XWebFetcher {
             }
             // Stop if all new tweets on this page are older than the cutoff
             if let Some(cutoff) = cutoff {
-                let all_old = all_tweets.iter().rev().take(page_new).all(|t| t.created_at < cutoff);
+                let all_old = all_tweets
+                    .iter()
+                    .rev()
+                    .take(page_new)
+                    .all(|t| t.created_at < cutoff);
                 if all_old {
                     tracing::info!(
                         ?cutoff,
@@ -801,7 +807,10 @@ fn extract_cursor(value: &Value, cursor_type: &str) -> Option<String> {
             if let Some(content) = map.get("content") {
                 if let Some(ct) = content.get("cursorType").and_then(Value::as_str) {
                     if ct == cursor_type {
-                        return content.get("value").and_then(Value::as_str).map(String::from);
+                        return content
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .map(String::from);
                     }
                 }
             }
@@ -917,7 +926,11 @@ fn parse_comment_result(result: &Value, focal_tweet_id: &str) -> Option<TweetCom
         .map(|media| {
             media
                 .iter()
-                .filter_map(|m| m.get("media_url_https").and_then(Value::as_str).map(String::from))
+                .filter_map(|m| {
+                    m.get("media_url_https")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -928,7 +941,11 @@ fn parse_comment_result(result: &Value, focal_tweet_id: &str) -> Option<TweetCom
         .and_then(Value::as_array)
         .map(|urls| {
             urls.iter()
-                .filter_map(|u| u.get("expanded_url").and_then(Value::as_str).map(String::from))
+                .filter_map(|u| {
+                    u.get("expanded_url")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
                 .filter(|url| {
                     !url.starts_with("https://x.com/")
                         && !url.starts_with("https://twitter.com/")

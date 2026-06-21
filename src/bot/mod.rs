@@ -1,10 +1,10 @@
 use crate::channel;
+use crate::channel::telegram;
 use crate::config::AppConfig;
 use crate::fetch;
 use crate::models::{Source, SourceType};
-use crate::worker::pipeline;
 use crate::storage;
-use crate::channel::telegram;
+use crate::worker::pipeline;
 use serde::Deserialize;
 use sqlx::PgPool;
 
@@ -124,7 +124,12 @@ pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
 
                         // In groups: only respond to replies to bot or @mentions
                         if is_group
-                            && !is_bot_addressed(&text, &message.entities, &message.reply_to_message, bot_username.as_deref())
+                            && !is_bot_addressed(
+                                &text,
+                                &message.entities,
+                                &message.reply_to_message,
+                                bot_username.as_deref(),
+                            )
                         {
                             continue;
                         }
@@ -143,14 +148,7 @@ pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
                     }
 
                     if let Some(callback) = update.callback_query {
-                        handle_callback_query(
-                            &config,
-                            &pool,
-                            &client,
-                            &bot_token,
-                            callback,
-                        )
-                        .await;
+                        handle_callback_query(&config, &pool, &client, &bot_token, callback).await;
                     }
                 }
             }
@@ -244,7 +242,11 @@ async fn poll_updates(
     let payload = GetUpdatesPayload {
         offset,
         timeout: 30,
-        allowed_updates: vec!["message".to_string(), "channel_post".to_string(), "callback_query".to_string()],
+        allowed_updates: vec![
+            "message".to_string(),
+            "channel_post".to_string(),
+            "callback_query".to_string(),
+        ],
     };
 
     let response = client
@@ -303,7 +305,8 @@ async fn handle_command(
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
                     cmd_fetch(&config, &pool),
-                ).await;
+                )
+                .await;
                 let reply = match result {
                     Ok(Ok(msg)) => msg,
                     Ok(Err(err)) => {
@@ -346,7 +349,10 @@ async fn handle_command(
 
     // Truncate to Telegram limit
     let reply = if reply.len() > 4096 {
-        format!("{}\n\n... (truncated)", &reply[..reply.floor_char_boundary(3900)])
+        format!(
+            "{}\n\n... (truncated)",
+            &reply[..reply.floor_char_boundary(3900)]
+        )
     } else {
         reply
     };
@@ -402,7 +408,11 @@ async fn send_reply(
         description: Some(format!("invalid response with status {status}")),
     });
     if !body.ok {
-        anyhow::bail!("sendMessage failed: {} - {}", status, body.description.unwrap_or_default());
+        anyhow::bail!(
+            "sendMessage failed: {} - {}",
+            status,
+            body.description.unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -455,7 +465,11 @@ async fn send_reply_get_id(
         result: None,
     });
     if !body.ok {
-        anyhow::bail!("sendMessage failed: {} - {}", status, body.description.unwrap_or_default());
+        anyhow::bail!(
+            "sendMessage failed: {} - {}",
+            status,
+            body.description.unwrap_or_default()
+        );
     }
     body.result
         .map(|r| r.message_id)
@@ -502,7 +516,16 @@ async fn handle_callback_query(
             Err(_) => return,
         };
 
-        handle_latest_more_callback(config, pool, client, bot_token, msg, &username, current_page).await;
+        handle_latest_more_callback(
+            config,
+            pool,
+            client,
+            bot_token,
+            msg,
+            &username,
+            current_page,
+        )
+        .await;
     } else if let Some(rest) = data.strip_prefix("comments:") {
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         let tweet_id = parts[0];
@@ -626,7 +649,11 @@ async fn handle_latest_callback(
 ) {
     let per_page = config.fetch.default_limit.max(1);
     let filter = storage::TweetFilter {
-        username: if username.is_empty() { None } else { Some(username.to_string()) },
+        username: if username.is_empty() {
+            None
+        } else {
+            Some(username.to_string())
+        },
         limit: per_page,
         offset: (page - 1) * per_page,
         ..Default::default()
@@ -641,7 +668,15 @@ async fn handle_latest_callback(
     };
 
     if tweets.is_empty() {
-        let _ = edit_message_text(client, bot_token, &msg.chat.id.to_string(), msg.message_id, "No more tweets.", None).await;
+        let _ = edit_message_text(
+            client,
+            bot_token,
+            &msg.chat.id.to_string(),
+            msg.message_id,
+            "No more tweets.",
+            None,
+        )
+        .await;
         return;
     }
 
@@ -651,9 +686,19 @@ async fn handle_latest_callback(
     };
 
     let can_load_older = !username.is_empty();
-    let (text, reply_markup) = format_latest_message(&tweets, username, page, total, per_page, can_load_older);
+    let (text, reply_markup) =
+        format_latest_message(&tweets, username, page, total, per_page, can_load_older);
 
-    if let Err(err) = edit_message_text(client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text, reply_markup.as_ref()).await {
+    if let Err(err) = edit_message_text(
+        client,
+        bot_token,
+        &msg.chat.id.to_string(),
+        msg.message_id,
+        &text,
+        reply_markup.as_ref(),
+    )
+    .await
+    {
         tracing::error!(?err, "failed to edit latest message");
     }
 }
@@ -669,9 +714,14 @@ async fn handle_latest_more_callback(
 ) {
     // Show loading state
     let _ = edit_message_text(
-        client, bot_token, &msg.chat.id.to_string(), msg.message_id,
-        &format!("Loading older tweets for @{username}..."), None,
-    ).await;
+        client,
+        bot_token,
+        &msg.chat.id.to_string(),
+        msg.message_id,
+        &format!("Loading older tweets for @{username}..."),
+        None,
+    )
+    .await;
 
     // Trigger backfill (fetch a few pages of older tweets)
     let backfill_pages = 3;
@@ -687,9 +737,14 @@ async fn handle_latest_more_callback(
         Err(err) => {
             tracing::error!(?err, username = %username, "backfill failed for /latest load older");
             let _ = edit_message_text(
-                client, bot_token, &msg.chat.id.to_string(), msg.message_id,
-                &format!("Failed to load older tweets: {err}"), None,
-            ).await;
+                client,
+                bot_token,
+                &msg.chat.id.to_string(),
+                msg.message_id,
+                &format!("Failed to load older tweets: {err}"),
+                None,
+            )
+            .await;
             return;
         }
     }
@@ -714,9 +769,14 @@ async fn handle_latest_more_callback(
 
     if tweets.is_empty() {
         let _ = edit_message_text(
-            client, bot_token, &msg.chat.id.to_string(), msg.message_id,
-            "No older tweets found.", None,
-        ).await;
+            client,
+            bot_token,
+            &msg.chat.id.to_string(),
+            msg.message_id,
+            "No older tweets found.",
+            None,
+        )
+        .await;
         return;
     }
 
@@ -725,9 +785,19 @@ async fn handle_latest_more_callback(
         Err(_) => (next_page - 1) * per_page + tweets.len() as i64,
     };
 
-    let (text, reply_markup) = format_latest_message(&tweets, username, next_page, total, per_page, true);
+    let (text, reply_markup) =
+        format_latest_message(&tweets, username, next_page, total, per_page, true);
 
-    if let Err(err) = edit_message_text(client, bot_token, &msg.chat.id.to_string(), msg.message_id, &text, reply_markup.as_ref()).await {
+    if let Err(err) = edit_message_text(
+        client,
+        bot_token,
+        &msg.chat.id.to_string(),
+        msg.message_id,
+        &text,
+        reply_markup.as_ref(),
+    )
+    .await
+    {
         tracing::error!(?err, "failed to edit latest message after backfill");
     }
 }
@@ -788,7 +858,13 @@ async fn handle_comments_callback(
     page: usize,
 ) {
     if !config.comments.enabled {
-        let _ = send_reply(client, bot_token, &msg.chat.id.to_string(), "Comment fetching is disabled.").await;
+        let _ = send_reply(
+            client,
+            bot_token,
+            &msg.chat.id.to_string(),
+            "Comment fetching is disabled.",
+        )
+        .await;
         return;
     }
 
@@ -814,14 +890,7 @@ async fn handle_comments_callback(
 
     tracing::info!(tweet_id = %tweet_id, page, is_channel, is_discussion_group, send_chat_id = %send_chat_id, "fetching comments on demand");
 
-    match fetch::fetch_tweet_comments(
-        config,
-        pool,
-        tweet_id,
-        config.comments.max_comments,
-    )
-    .await
-    {
+    match fetch::fetch_tweet_comments(config, pool, tweet_id, config.comments.max_comments).await {
         Ok(comments) => {
             if comments.is_empty() {
                 let _ = send_reply(client, bot_token, &send_chat_id, "No comments found.").await;
@@ -863,9 +932,8 @@ async fn handle_comments_callback(
             for comment in page_comments {
                 let text = format_single_comment(comment);
                 if let Some(id) = reply_to_id {
-                    let _ = send_reply_to_message(
-                        client, bot_token, &send_chat_id, id, &text,
-                    ).await;
+                    let _ =
+                        send_reply_to_message(client, bot_token, &send_chat_id, id, &text).await;
                 } else {
                     let _ = send_reply(client, bot_token, &send_chat_id, &text).await;
                 }
@@ -878,16 +946,23 @@ async fn handle_comments_callback(
                     bot_token,
                     &send_chat_id,
                     &format!("Page {}/{} — Load more:", page, total.div_ceil(per_page)),
-                    Some(&telegram::comment_button_markup_with_text("Next page >", &callback_data)),
-                ).await;
+                    Some(&telegram::comment_button_markup_with_text(
+                        "Next page >",
+                        &callback_data,
+                    )),
+                )
+                .await;
             }
         }
         Err(err) => {
             tracing::error!(?err, tweet_id = %tweet_id, "failed to fetch comments");
             let _ = send_reply(
-                client, bot_token, &send_chat_id,
+                client,
+                bot_token,
+                &send_chat_id,
                 &format!("Failed to fetch comments: {err}"),
-            ).await;
+            )
+            .await;
         }
     }
 }
@@ -945,7 +1020,11 @@ fn format_latest_message(
 
     // Build pagination buttons
     let mut buttons = Vec::new();
-    let user_key = if username.is_empty() { "_all" } else { username };
+    let user_key = if username.is_empty() {
+        "_all"
+    } else {
+        username
+    };
 
     if page > 1 {
         buttons.push(telegram::InlineKeyboardButton {
@@ -978,8 +1057,7 @@ fn format_latest_message(
 }
 
 fn cmd_help() -> anyhow::Result<String> {
-    Ok(
-        "xFlow Bot Commands:\n\n\
+    Ok("xFlow Bot Commands:\n\n\
          /help - Show this help\n\
          /add @username - Add a source to monitor\n\
          /remove @username - Remove a source\n\
@@ -989,8 +1067,7 @@ fn cmd_help() -> anyhow::Result<String> {
          /latest @username [7d] - Browse tweets (auto-sync, optional time range)\n\
          /digest - Show analyzed digest summary\n\
          /spam [list|add|remove] - Manage spam keywords"
-            .to_string(),
-    )
+        .to_string())
 }
 
 async fn cmd_add(config: &AppConfig, pool: &PgPool, args: &str) -> anyhow::Result<String> {
@@ -999,7 +1076,9 @@ async fn cmd_add(config: &AppConfig, pool: &PgPool, args: &str) -> anyhow::Resul
         return Ok("Usage: /add @username".to_string());
     }
     if !fetch::validate_account(config, pool, &username).await {
-        return Ok(format!("@{username} not found on X, please check the username"));
+        return Ok(format!(
+            "@{username} not found on X, please check the username"
+        ));
     }
     let source = Source {
         source_type: SourceType::Account,
@@ -1065,7 +1144,10 @@ async fn cmd_list(pool: &PgPool) -> anyhow::Result<String> {
         lines.push(format!(
             "  {icon}{} (limit: {}){}",
             source.value,
-            source.limit.map(|l| l.to_string()).unwrap_or_else(|| "5".to_string()),
+            source
+                .limit
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| "5".to_string()),
             fetch_info.unwrap_or_default(),
         ));
     }
@@ -1073,20 +1155,18 @@ async fn cmd_list(pool: &PgPool) -> anyhow::Result<String> {
 }
 
 async fn cmd_status(pool: &PgPool, config: &AppConfig) -> anyhow::Result<String> {
-    let total_tweets: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tweets")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let total_tweets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tweets")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
 
     let sources = storage::list_sources(pool, true).await?;
 
-    let last_fetch: Option<String> = sqlx::query_scalar(
-        "SELECT MAX(last_fetch_at) FROM fetch_state WHERE last_status = 'ok'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    let last_fetch: Option<String> =
+        sqlx::query_scalar("SELECT MAX(last_fetch_at) FROM fetch_state WHERE last_status = 'ok'")
+            .fetch_optional(pool)
+            .await?
+            .flatten();
 
     let last_fetch_display = match &last_fetch {
         Some(s) => crate::utils::format_db_timestamp(Some(s)),
@@ -1133,11 +1213,20 @@ async fn cmd_status(pool: &PgPool, config: &AppConfig) -> anyhow::Result<String>
 async fn cmd_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<String> {
     tracing::info!("cmd_fetch: starting run_fetch");
     let fetch = pipeline::run_fetch(config, pool).await?;
-    tracing::info!(fetched = fetch.fetched, sources = fetch.sources, "cmd_fetch: run_fetch done");
+    tracing::info!(
+        fetched = fetch.fetched,
+        sources = fetch.sources,
+        "cmd_fetch: run_fetch done"
+    );
     let channels = channel::configured_channels(config)?;
     tracing::info!("cmd_fetch: starting send_undelivered");
-    let delivery = channel::send_undelivered(pool, &channels, 100, config.fetch.max_delivery_retries).await?;
-    tracing::info!(sent = delivery.sent, failed = delivery.failed, "cmd_fetch: send_undelivered done");
+    let delivery =
+        channel::send_undelivered(pool, &channels, 100, config.fetch.max_delivery_retries).await?;
+    tracing::info!(
+        sent = delivery.sent,
+        failed = delivery.failed,
+        "cmd_fetch: send_undelivered done"
+    );
 
     let mut msg = format!(
         "Fetch complete:\n\
@@ -1177,21 +1266,24 @@ async fn cmd_latest(
 ) {
     // Parse args: "@username [time_range]" e.g. "@openai 7d" or "openai 30d"
     let parts: Vec<&str> = args.trim().split_whitespace().collect();
-    let username = parts.first()
+    let username = parts
+        .first()
         .map(|s| s.trim_start_matches('@').to_string())
         .unwrap_or_default();
     let time_range = parts.get(1).map(|s| s.to_string());
 
     // Parse time range if provided
     let since = match &time_range {
-        Some(tr) => match parse_bot_duration(tr) {
-            Ok(d) => Some(d),
-            Err(_) => {
-                let _ = send_reply(client, bot_token, &chat_id.to_string(),
+        Some(tr) => {
+            match parse_bot_duration(tr) {
+                Ok(d) => Some(d),
+                Err(_) => {
+                    let _ = send_reply(client, bot_token, &chat_id.to_string(),
                     "Invalid time range. Use e.g. `/latest @openai 7d` or `/latest @openai 12h`").await;
-                return;
+                    return;
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -1199,12 +1291,27 @@ async fn cmd_latest(
     if !username.is_empty() {
         if let Some(since_dur) = &since {
             // Time range specified: backfill with since
-            let _ = send_reply(client, bot_token, &chat_id.to_string(),
-                &format!("Fetching tweets for @{username} from last {}...", time_range.as_deref().unwrap_or("?"))).await;
-            if let Err(err) = fetch::backfill_user(config, pool, &username, 0, 2, Some(*since_dur)).await {
+            let _ = send_reply(
+                client,
+                bot_token,
+                &chat_id.to_string(),
+                &format!(
+                    "Fetching tweets for @{username} from last {}...",
+                    time_range.as_deref().unwrap_or("?")
+                ),
+            )
+            .await;
+            if let Err(err) =
+                fetch::backfill_user(config, pool, &username, 0, 2, Some(*since_dur)).await
+            {
                 tracing::warn!(?err, username = %username, "backfill failed for /latest");
-                let _ = send_reply(client, bot_token, &chat_id.to_string(),
-                    &format!("Failed to fetch: {err}")).await;
+                let _ = send_reply(
+                    client,
+                    bot_token,
+                    &chat_id.to_string(),
+                    &format!("Failed to fetch: {err}"),
+                )
+                .await;
                 return;
             }
         } else {
@@ -1217,7 +1324,11 @@ async fn cmd_latest(
 
     let per_page = config.fetch.default_limit.max(1);
     let filter = storage::TweetFilter {
-        username: if username.is_empty() { None } else { Some(username.clone()) },
+        username: if username.is_empty() {
+            None
+        } else {
+            Some(username.clone())
+        },
         limit: per_page,
         ..Default::default()
     };
@@ -1225,7 +1336,13 @@ async fn cmd_latest(
     let tweets = match storage::list_tweets(pool, filter.clone()).await {
         Ok(t) => t,
         Err(err) => {
-            let _ = send_reply(client, bot_token, &chat_id.to_string(), &format!("Error: {err}")).await;
+            let _ = send_reply(
+                client,
+                bot_token,
+                &chat_id.to_string(),
+                &format!("Error: {err}"),
+            )
+            .await;
             return;
         }
     };
@@ -1245,9 +1362,18 @@ async fn cmd_latest(
         Err(_) => tweets.len() as i64,
     };
 
-    let (text, reply_markup) = format_latest_message(&tweets, &username, 1, total, per_page, !username.is_empty());
+    let (text, reply_markup) =
+        format_latest_message(&tweets, &username, 1, total, per_page, !username.is_empty());
 
-    if let Err(err) = send_reply_with_keyboard(client, bot_token, &chat_id.to_string(), &text, reply_markup.as_ref()).await {
+    if let Err(err) = send_reply_with_keyboard(
+        client,
+        bot_token,
+        &chat_id.to_string(),
+        &text,
+        reply_markup.as_ref(),
+    )
+    .await
+    {
         tracing::error!(?err, "failed to send latest reply");
     }
 }
@@ -1278,7 +1404,11 @@ fn parse_bot_duration(input: &str) -> anyhow::Result<chrono::Duration> {
     }
 }
 
-async fn fetch_latest_for_user(config: &AppConfig, pool: &PgPool, username: &str) -> anyhow::Result<()> {
+async fn fetch_latest_for_user(
+    config: &AppConfig,
+    pool: &PgPool,
+    username: &str,
+) -> anyhow::Result<()> {
     let source = Source {
         source_type: SourceType::Account,
         value: username.to_string(),
@@ -1317,7 +1447,11 @@ async fn cmd_digest(pool: &PgPool, config: &AppConfig) -> anyhow::Result<String>
             "  @{}/{} | {}\n  {}",
             stored.tweet.author_username,
             time,
-            analysis.chinese_summary.chars().take(80).collect::<String>(),
+            analysis
+                .chinese_summary
+                .chars()
+                .take(80)
+                .collect::<String>(),
             stored.tweet.url,
         ));
     }

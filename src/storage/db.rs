@@ -1,5 +1,5 @@
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Row, PgPool};
+use sqlx::{PgPool, Row};
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS auth_accounts (

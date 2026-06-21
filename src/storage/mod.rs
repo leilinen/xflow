@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::postgres::PgRow;
-use sqlx::{Row, PgPool};
+use sqlx::{PgPool, Row};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthAccount {
@@ -126,13 +126,11 @@ pub async fn delete_source(
     source_type: SourceType,
     value: &str,
 ) -> anyhow::Result<bool> {
-    let result = sqlx::query(
-        "DELETE FROM sources WHERE source_type = $1 AND value = $2",
-    )
-    .bind(source_type.as_str())
-    .bind(value.trim_start_matches('@'))
-    .execute(pool)
-    .await?;
+    let result = sqlx::query("DELETE FROM sources WHERE source_type = $1 AND value = $2")
+        .bind(source_type.as_str())
+        .bind(value.trim_start_matches('@'))
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -249,10 +247,7 @@ pub async fn save_analysis(pool: &PgPool, analysis: &TweetAnalysis) -> anyhow::R
     Ok(())
 }
 
-pub async fn count_tweets(
-    pool: &PgPool,
-    filter: &TweetFilter,
-) -> anyhow::Result<i64> {
+pub async fn count_tweets(pool: &PgPool, filter: &TweetFilter) -> anyhow::Result<i64> {
     let mut sql = String::from("SELECT COUNT(*) FROM tweets t");
     let mut where_parts: Vec<String> = Vec::new();
     if filter.username.is_some() {
@@ -276,10 +271,7 @@ pub async fn count_tweets(
     Ok(count)
 }
 
-pub async fn list_tweets(
-    pool: &PgPool,
-    filter: TweetFilter,
-) -> anyhow::Result<Vec<StoredTweet>> {
+pub async fn list_tweets(pool: &PgPool, filter: TweetFilter) -> anyhow::Result<Vec<StoredTweet>> {
     let mut sql = String::from(
         r#"
         SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
@@ -304,7 +296,9 @@ pub async fn list_tweets(
     let limit_idx = param_idx;
     param_idx += 1;
     let offset_idx = param_idx;
-    sql.push_str(&format!(" ORDER BY t.created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}"));
+    sql.push_str(&format!(
+        " ORDER BY t.created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}"
+    ));
     let mut query = sqlx::query(&sql);
     if let Some(username) = filter.username {
         query = query.bind(username.trim_start_matches('@').to_string());
@@ -458,10 +452,7 @@ pub async fn list_auth_accounts(pool: &PgPool) -> anyhow::Result<Vec<AuthAccount
         .collect())
 }
 
-pub async fn get_auth_account(
-    pool: &PgPool,
-    label: &str,
-) -> anyhow::Result<Option<AuthAccount>> {
+pub async fn get_auth_account(pool: &PgPool, label: &str) -> anyhow::Result<Option<AuthAccount>> {
     let row = sqlx::query(
         "SELECT label, domain, auth_token, ct0, status, exported_at, updated_at FROM auth_accounts WHERE label = $1",
     )
@@ -479,9 +470,7 @@ pub async fn get_auth_account(
     }))
 }
 
-pub async fn first_auth_account_secret(
-    pool: &PgPool,
-) -> anyhow::Result<Option<AuthAccountSecret>> {
+pub async fn first_auth_account_secret(pool: &PgPool) -> anyhow::Result<Option<AuthAccountSecret>> {
     let row = sqlx::query(
         r#"
         SELECT label, auth_token, ct0
@@ -503,9 +492,7 @@ pub async fn first_auth_account_secret(
 }
 
 /// Select the least-recently-used auth account for round-robin rotation.
-pub async fn next_auth_account_secret(
-    pool: &PgPool,
-) -> anyhow::Result<Option<AuthAccountSecret>> {
+pub async fn next_auth_account_secret(pool: &PgPool) -> anyhow::Result<Option<AuthAccountSecret>> {
     let row = sqlx::query(
         r#"
         SELECT label, auth_token, ct0
@@ -545,11 +532,7 @@ pub async fn mark_auth_used(pool: &PgPool, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn mark_auth_rejected(
-    pool: &PgPool,
-    label: &str,
-    status: &str,
-) -> anyhow::Result<()> {
+pub async fn mark_auth_rejected(pool: &PgPool, label: &str, status: &str) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE auth_accounts

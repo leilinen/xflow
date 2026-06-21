@@ -1,9 +1,9 @@
 pub mod telegram;
 
+use self::telegram::TelegramChannel;
 use crate::config::AppConfig;
 use crate::models::StoredTweet;
 use crate::storage::{self, delivery_payload};
-use self::telegram::TelegramChannel;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -40,7 +40,11 @@ pub trait DeliveryChannel: Send + Sync {
 pub fn configured_channels(config: &AppConfig) -> anyhow::Result<Vec<Box<dyn DeliveryChannel>>> {
     let mut channels: Vec<Box<dyn DeliveryChannel>> = Vec::new();
     if config.telegram.enabled {
-        channels.push(Box::new(TelegramChannel::from_config(&config.telegram, &config.comments, &config.translation)?));
+        channels.push(Box::new(TelegramChannel::from_config(
+            &config.telegram,
+            &config.comments,
+            &config.translation,
+        )?));
     }
     Ok(channels)
 }
@@ -58,8 +62,14 @@ pub async fn send_undelivered(
     };
     for channel in channels {
         let channel_id = channel.id();
-        let tweets =
-            storage::list_undelivered_tweets(pool, &channel_id, !channel.send_all(), limit, max_retries).await?;
+        let tweets = storage::list_undelivered_tweets(
+            pool,
+            &channel_id,
+            !channel.send_all(),
+            limit,
+            max_retries,
+        )
+        .await?;
         for tweet in tweets {
             match channel.send_tweet(&tweet).await {
                 Ok(receipt) => {

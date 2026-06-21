@@ -42,11 +42,15 @@ fn utc8_offset() -> FixedOffset {
 }
 
 pub fn format_utc8(dt: &DateTime<Utc>) -> String {
-    dt.with_timezone(&utc8_offset()).format("%Y-%m-%d %H:%M").to_string()
+    dt.with_timezone(&utc8_offset())
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 pub fn format_utc8_full(dt: &DateTime<Utc>) -> String {
-    dt.with_timezone(&utc8_offset()).format("%Y-%m-%d %H:%M:%S").to_string()
+    dt.with_timezone(&utc8_offset())
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 pub fn format_db_timestamp(s: Option<&str>) -> String {
