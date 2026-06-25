@@ -67,6 +67,30 @@ pub struct TweetFilter {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyDigestRun {
+    pub digest_date: String,
+    pub channel: String,
+    pub window_start: String,
+    pub window_end: String,
+    pub status: String,
+    pub retry_count: i64,
+    pub payload: Value,
+    pub error: Option<String>,
+    pub delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DailyDigestRunUpdate<'a> {
+    pub digest_date: &'a str,
+    pub channel: &'a str,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub status: &'a str,
+    pub payload: &'a Value,
+    pub error: Option<&'a str>,
+}
+
 pub async fn upsert_source(pool: &PgPool, source: &Source) -> anyhow::Result<()> {
     upsert_source_enabled(pool, source, true).await
 }
@@ -330,6 +354,139 @@ pub async fn list_analyzed_for_digest(
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(row_to_tweet).collect()
+}
+
+pub async fn list_account_tweets_for_window(
+    pool: &PgPool,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    limit: i64,
+) -> anyhow::Result<Vec<StoredTweet>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
+               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
+        FROM tweets t
+        LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
+        WHERE t.source_type = 'account'
+          AND t.created_at >= $1
+          AND t.created_at < $2
+          AND EXISTS (
+              SELECT 1
+              FROM sources s
+              WHERE s.source_type = 'account'
+                AND s.enabled = 1
+                AND LOWER(s.value) = LOWER(t.source_value)
+          )
+        ORDER BY LOWER(t.author_username) ASC, t.created_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(window_start.to_rfc3339())
+    .bind(window_end.to_rfc3339())
+    .bind(if limit > 0 { limit } else { 1000 })
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_tweet).collect()
+}
+
+pub async fn get_daily_digest_run(
+    pool: &PgPool,
+    digest_date: &str,
+    channel: &str,
+) -> anyhow::Result<Option<DailyDigestRun>> {
+    let row = sqlx::query(
+        r#"
+        SELECT digest_date, channel, window_start, window_end, status, retry_count,
+               payload_json, error, delivered_at
+        FROM daily_digest_runs
+        WHERE digest_date = $1 AND channel = $2
+        LIMIT 1
+        "#,
+    )
+    .bind(digest_date)
+    .bind(channel)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        let payload = serde_json::from_str(row.get::<String, _>("payload_json").as_str())
+            .unwrap_or(Value::Object(Default::default()));
+        Ok(DailyDigestRun {
+            digest_date: row.get("digest_date"),
+            channel: row.get("channel"),
+            window_start: row.get("window_start"),
+            window_end: row.get("window_end"),
+            status: row.get("status"),
+            retry_count: row.get("retry_count"),
+            payload,
+            error: row.get("error"),
+            delivered_at: row.get("delivered_at"),
+        })
+    })
+    .transpose()
+}
+
+pub async fn daily_digest_delivered(
+    pool: &PgPool,
+    digest_date: &str,
+    channel: &str,
+) -> anyhow::Result<bool> {
+    let delivered = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT COUNT(*) > 0
+        FROM daily_digest_runs
+        WHERE digest_date = $1 AND channel = $2 AND status = 'delivered'
+        "#,
+    )
+    .bind(digest_date)
+    .bind(channel)
+    .fetch_one(pool)
+    .await?;
+    Ok(delivered)
+}
+
+pub async fn save_daily_digest_run(
+    pool: &PgPool,
+    update: DailyDigestRunUpdate<'_>,
+) -> anyhow::Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let delivered_at = if update.status == "delivered" {
+        Some(now.clone())
+    } else {
+        None
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO daily_digest_runs (
+            digest_date, channel, window_start, window_end, status,
+            retry_count, payload_json, error, created_at, delivered_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9)
+        ON CONFLICT(digest_date, channel) DO UPDATE SET
+            window_start=excluded.window_start,
+            window_end=excluded.window_end,
+            status=excluded.status,
+            retry_count = CASE
+                WHEN excluded.status = 'delivered' THEN daily_digest_runs.retry_count
+                ELSE daily_digest_runs.retry_count + 1
+            END,
+            payload_json=excluded.payload_json,
+            error=excluded.error,
+            delivered_at=excluded.delivered_at
+        "#,
+    )
+    .bind(update.digest_date)
+    .bind(update.channel)
+    .bind(update.window_start.to_rfc3339())
+    .bind(update.window_end.to_rfc3339())
+    .bind(update.status)
+    .bind(update.payload.to_string())
+    .bind(update.error)
+    .bind(now)
+    .bind(delivered_at)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_undelivered_tweets(

@@ -5,6 +5,7 @@ use crate::channel;
 use crate::channel::telegram;
 use crate::channel::telegram::TelegramResult;
 use crate::config::AppConfig;
+use crate::digest;
 use crate::storage;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -64,6 +65,15 @@ pub async fn run_forever(config: AppConfig, pool: PgPool) -> anyhow::Result<()> 
         tokio::spawn(async move {
             if let Err(err) = crate::bot::run_poller(bot_config, bot_pool).await {
                 tracing::error!(?err, "bot poller crashed");
+            }
+        });
+    }
+    if config.telegram.enabled && config.daily_digest.enabled {
+        let digest_config = config.clone();
+        let digest_pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_daily_digest_scheduler(digest_config, digest_pool).await {
+                tracing::error!(?err, "daily digest scheduler crashed");
             }
         });
     }
@@ -130,6 +140,131 @@ async fn warn_stale_tokens(pool: &PgPool) {
                 updated_at,
                 "auth token may be stale (not used/updated in {TOKEN_FRESHNESS_DAYS}+ days), consider refreshing"
             );
+        }
+    }
+}
+
+async fn run_daily_digest_scheduler(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
+    tracing::info!(
+        send_time = %config.daily_digest.send_time,
+        timezone_offset_hours = config.daily_digest.timezone_offset_hours,
+        "daily digest scheduler started"
+    );
+    loop {
+        let now = chrono::Utc::now();
+        let due = digest::daily_digest_due_now(now, &config.daily_digest)?;
+        if due {
+            match send_daily_digest_if_needed(&config, &pool, now).await {
+                Ok(sent) => {
+                    if sent {
+                        tracing::info!("daily digest delivered");
+                    }
+                    let next_due =
+                        digest::next_daily_digest_due_at(chrono::Utc::now(), &config.daily_digest)?;
+                    sleep_until(next_due).await;
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "daily digest attempt failed, will retry");
+                    tokio::time::sleep(Duration::from_secs(900)).await;
+                    continue;
+                }
+            }
+        }
+
+        let next_due = digest::next_daily_digest_due_at(now, &config.daily_digest)?;
+        sleep_until(next_due).await;
+    }
+}
+
+async fn sleep_until(when: chrono::DateTime<chrono::Utc>) {
+    let now = chrono::Utc::now();
+    let duration = when
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    tracing::info!(next_daily_digest_at = %when.to_rfc3339(), "sleeping until daily digest");
+    tokio::time::sleep(duration).await;
+}
+
+async fn send_daily_digest_if_needed(
+    config: &AppConfig,
+    pool: &PgPool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<bool> {
+    let window = digest::daily_digest_window(now, &config.daily_digest)?;
+    let channel = telegram::channel_id(&config.telegram)?;
+    if storage::daily_digest_delivered(pool, &window.digest_date, &channel).await? {
+        tracing::debug!(
+            digest_date = %window.digest_date,
+            channel = %channel,
+            "daily digest already delivered"
+        );
+        return Ok(false);
+    }
+
+    let generated =
+        match digest::generate_daily_account_digest(pool, &config.daily_digest, now).await {
+            Ok(value) => value,
+            Err(err) => {
+                storage::save_daily_digest_run(
+                    pool,
+                    storage::DailyDigestRunUpdate {
+                        digest_date: &window.digest_date,
+                        channel: &channel,
+                        window_start: window.window_start,
+                        window_end: window.window_end,
+                        status: "error",
+                        payload: &serde_json::json!({"stage": "generate"}),
+                        error: Some(&err.to_string()),
+                    },
+                )
+                .await?;
+                return Err(err);
+            }
+        };
+
+    let payload = serde_json::json!({
+        "digest_date": generated.digest_date,
+        "account_count": generated.account_count,
+        "tweet_count": generated.tweet_count,
+        "llm_error": generated.llm_error,
+    });
+
+    match telegram::send_daily_digest(&config.telegram, &generated.text).await {
+        Ok(receipt) => {
+            let mut payload = payload;
+            payload["telegram"] = receipt;
+            storage::save_daily_digest_run(
+                pool,
+                storage::DailyDigestRunUpdate {
+                    digest_date: &generated.digest_date,
+                    channel: &channel,
+                    window_start: generated.window_start,
+                    window_end: generated.window_end,
+                    status: "delivered",
+                    payload: &payload,
+                    error: None,
+                },
+            )
+            .await?;
+            Ok(true)
+        }
+        Err(err) => {
+            storage::save_daily_digest_run(
+                pool,
+                storage::DailyDigestRunUpdate {
+                    digest_date: &generated.digest_date,
+                    channel: &channel,
+                    window_start: generated.window_start,
+                    window_end: generated.window_end,
+                    status: "error",
+                    payload: &payload,
+                    error: Some(&err.to_string()),
+                },
+            )
+            .await?;
+            Err(err)
         }
     }
 }

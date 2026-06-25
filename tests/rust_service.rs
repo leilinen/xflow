@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use tempfile::tempdir;
 use xflow::channel::{self, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use xflow::config::{load_config, AppConfig};
@@ -45,6 +45,8 @@ agent:
     assert_eq!(config.server.port, 8000);
     assert_eq!(config.agent.keywords[0], "AI");
     assert!(config.storage.database_url.contains("postgres"));
+    assert!(!config.daily_digest.enabled);
+    assert_eq!(config.daily_digest.send_time, "18:00");
 }
 
 #[test]
@@ -508,6 +510,112 @@ async fn rss_generation_contains_items() {
     let xml = rss_feed::generate_rss("Test", "http://localhost/rss/all", "desc", &tweets).unwrap();
     assert!(xml.contains("<rss"));
     assert!(xml.contains("AI update"));
+}
+
+#[tokio::test]
+async fn daily_digest_query_uses_account_sources_and_window() {
+    let (_dir, pool) = test_pool().await;
+    let inside = Utc.with_ymd_and_hms(2026, 6, 26, 2, 0, 0).unwrap();
+    let outside = Utc.with_ymd_and_hms(2026, 6, 25, 8, 0, 0).unwrap();
+    let window_start = Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap();
+    let window_end = Utc.with_ymd_and_hms(2026, 6, 26, 10, 0, 0).unwrap();
+    storage::upsert_source(
+        &pool,
+        &Source {
+            source_type: SourceType::Account,
+            value: "openai".to_string(),
+            label: None,
+            limit: Some(10),
+        },
+    )
+    .await
+    .unwrap();
+
+    for (tweet_id, source_type, author, created_at) in [
+        ("account-in", SourceType::Account, "openai", inside),
+        ("search-in", SourceType::Search, "openai", inside),
+        ("account-out", SourceType::Account, "anthropic", outside),
+    ] {
+        storage::upsert_tweet(
+            &pool,
+            &Tweet {
+                tweet_id: tweet_id.to_string(),
+                source_type,
+                source_value: author.to_string(),
+                author_username: author.to_string(),
+                author_name: author.to_string(),
+                text: format!("{tweet_id} update"),
+                url: format!("https://x.com/{author}/status/{tweet_id}"),
+                created_at,
+                fetched_at: created_at,
+                raw: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let tweets = storage::list_account_tweets_for_window(&pool, window_start, window_end, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(tweets.len(), 1);
+    assert_eq!(tweets[0].tweet.tweet_id, "account-in");
+}
+
+#[tokio::test]
+async fn daily_digest_run_records_delivery_and_dedupes() {
+    let (_dir, pool) = test_pool().await;
+    let start = Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 6, 26, 10, 0, 0).unwrap();
+
+    assert!(
+        !storage::daily_digest_delivered(&pool, "2026-06-26", "telegram:1")
+            .await
+            .unwrap()
+    );
+
+    storage::save_daily_digest_run(
+        &pool,
+        storage::DailyDigestRunUpdate {
+            digest_date: "2026-06-26",
+            channel: "telegram:1",
+            window_start: start,
+            window_end: end,
+            status: "error",
+            payload: &serde_json::json!({"stage": "send"}),
+            error: Some("timeout"),
+        },
+    )
+    .await
+    .unwrap();
+    storage::save_daily_digest_run(
+        &pool,
+        storage::DailyDigestRunUpdate {
+            digest_date: "2026-06-26",
+            channel: "telegram:1",
+            window_start: start,
+            window_end: end,
+            status: "delivered",
+            payload: &serde_json::json!({"ok": true}),
+            error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        storage::daily_digest_delivered(&pool, "2026-06-26", "telegram:1")
+            .await
+            .unwrap()
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM daily_digest_runs WHERE digest_date = '2026-06-26'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]

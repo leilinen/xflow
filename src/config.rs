@@ -162,6 +162,47 @@ impl Default for TranslationConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyDigestConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_daily_digest_send_time")]
+    pub send_time: String,
+    #[serde(default = "default_daily_digest_timezone_offset_hours")]
+    pub timezone_offset_hours: i32,
+    #[serde(default = "default_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_daily_digest_model")]
+    pub model: String,
+    #[serde(default = "default_daily_digest_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_daily_digest_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_daily_digest_max_tweets_per_account")]
+    pub max_tweets_per_account: usize,
+}
+
+impl Default for DailyDigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            send_time: default_daily_digest_send_time(),
+            timezone_offset_hours: default_daily_digest_timezone_offset_hours(),
+            api_key_env: default_api_key_env(),
+            base_url: default_base_url(),
+            model: default_daily_digest_model(),
+            max_tokens: default_daily_digest_max_tokens(),
+            temperature: default_temperature(),
+            system_prompt: default_daily_digest_prompt(),
+            max_tweets_per_account: default_daily_digest_max_tweets_per_account(),
+        }
+    }
+}
+
 fn default_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
@@ -184,6 +225,30 @@ fn default_temperature() -> f32 {
 
 fn default_translation_prompt() -> String {
     "You are a professional translator. Translate the following tweet to Chinese (Simplified). Output only the translation, nothing else.".to_string()
+}
+
+fn default_daily_digest_send_time() -> String {
+    "18:00".to_string()
+}
+
+fn default_daily_digest_timezone_offset_hours() -> i32 {
+    8
+}
+
+fn default_daily_digest_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_daily_digest_max_tokens() -> u32 {
+    1200
+}
+
+fn default_daily_digest_prompt() -> String {
+    "你是一个中文信息分析助手。请按账号总结当天推文，提炼事实、产品动态、观点变化和可执行关注点。输出要简洁，避免营销语气，不要编造推文中没有的信息。".to_string()
+}
+
+fn default_daily_digest_max_tweets_per_account() -> usize {
+    20
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +313,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub translation: TranslationConfig,
     #[serde(default)]
+    pub daily_digest: DailyDigestConfig,
+    #[serde(default)]
     pub comments: CommentsConfig,
 }
 
@@ -277,6 +344,7 @@ impl Default for AppConfig {
             agent: AgentConfig::default(),
             telegram: TelegramConfig::default(),
             translation: TranslationConfig::default(),
+            daily_digest: DailyDigestConfig::default(),
             comments: CommentsConfig::default(),
         }
     }

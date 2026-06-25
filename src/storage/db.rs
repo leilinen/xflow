@@ -92,6 +92,21 @@ CREATE TABLE IF NOT EXISTS spam_keywords (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS daily_digest_runs (
+    id BIGSERIAL PRIMARY KEY,
+    digest_date TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    status TEXT NOT NULL,
+    retry_count BIGINT NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    UNIQUE(digest_date, channel)
+);
 "#;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
@@ -114,6 +129,7 @@ pub async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
     migrate_auth_accounts(pool).await?;
     migrate_deliveries(pool).await?;
     migrate_deliveries_retry_count(pool).await?;
+    migrate_daily_digest_runs(pool).await?;
     tracing::debug!("database schema initialized");
     Ok(())
 }
@@ -235,5 +251,29 @@ async fn migrate_deliveries_retry_count(pool: &PgPool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+async fn migrate_daily_digest_runs(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS daily_digest_runs (
+            id BIGSERIAL PRIMARY KEY,
+            digest_date TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            window_start TEXT NOT NULL,
+            window_end TEXT NOT NULL,
+            status TEXT NOT NULL,
+            retry_count BIGINT NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT,
+            UNIQUE(digest_date, channel)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }

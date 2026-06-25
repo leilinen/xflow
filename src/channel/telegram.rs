@@ -11,6 +11,7 @@ use crate::worker::pipeline::FetchSourceError;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::PgPool;
 
 #[derive(Debug, Clone)]
@@ -998,8 +999,6 @@ impl TelegramChannel {
 }
 
 /// Strip HTML tags and decode entities for plain text fallback.
-
-/// Strip HTML tags and decode entities for plain text fallback.
 fn strip_html(html: &str) -> String {
     let decoded = html
         .replace("&amp;", "&")
@@ -1127,6 +1126,104 @@ async fn parse_telegram_response<T: DeserializeOwned>(
 
 pub fn telegram_api_url(bot_token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{bot_token}/{method}")
+}
+
+pub fn channel_id(config: &TelegramConfig) -> anyhow::Result<String> {
+    Ok(load_credentials(config)?.channel())
+}
+
+pub async fn send_daily_digest(config: &TelegramConfig, text: &str) -> anyhow::Result<Value> {
+    if !config.enabled {
+        return Ok(serde_json::json!({"ok": true, "skipped": "telegram disabled"}));
+    }
+    let credentials = load_credentials(config)?;
+    let client = Client::new();
+    let mut receipts = Vec::new();
+
+    for chunk in split_telegram_text(text, TELEGRAM_MESSAGE_LIMIT) {
+        let payload = SendMessagePayload {
+            chat_id: credentials.chat_id.clone(),
+            text: chunk,
+            parse_mode: None,
+            link_preview_options: Some(LinkPreviewOptions {
+                is_disabled: true,
+                url: None,
+                prefer_small_media: None,
+                show_above_text: None,
+            }),
+            reply_parameters: None,
+            reply_markup: None,
+        };
+        let response = client
+            .post(telegram_api_url(&credentials.bot_token, "sendMessage"))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!("daily digest Telegram request failed: {err}"))?;
+        let status = response.status();
+        let body = response
+            .json::<TelegramApiResponse<Value>>()
+            .await
+            .unwrap_or(TelegramApiResponse {
+                ok: false,
+                description: Some(format!("invalid Telegram response with status {status}")),
+                result: None,
+            });
+        if !status.is_success() || !body.ok {
+            anyhow::bail!(
+                "daily digest Telegram sendMessage failed: {}",
+                body.description
+                    .unwrap_or_else(|| format!("HTTP status {status}"))
+            );
+        }
+        receipts.push(serde_json::to_value(body).unwrap_or_default());
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "messages": receipts,
+    }))
+}
+
+fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
+    if text.len() <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let line_len = line.len() + usize::from(!current.is_empty());
+        if !current.is_empty() && current.len() + line_len > limit {
+            chunks.push(current);
+            current = String::new();
+        }
+        if line.len() > limit {
+            if !current.is_empty() {
+                chunks.push(current);
+                current = String::new();
+            }
+            let mut buf = String::new();
+            for ch in line.chars() {
+                if buf.len() + ch.len_utf8() > limit {
+                    chunks.push(buf);
+                    buf = String::new();
+                }
+                buf.push(ch);
+            }
+            if !buf.is_empty() {
+                current = buf;
+            }
+        } else {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Send a fetch failure alert via Telegram. Best-effort: errors are logged but not propagated.
