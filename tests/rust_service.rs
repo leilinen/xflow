@@ -937,7 +937,7 @@ async fn check_token_freshness_detects_stale_tokens() {
     };
     storage::import_auth_account(&pool, &token).await.unwrap();
     let ten_days_ago = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
-    sqlx::query("UPDATE auth_accounts SET updated_at = ? WHERE label = ?")
+    sqlx::query("UPDATE auth_accounts SET updated_at = $1 WHERE label = $2")
         .bind(&ten_days_ago)
         .bind("stale_one")
         .execute(&pool)
