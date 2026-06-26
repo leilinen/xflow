@@ -8,29 +8,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 
-pub async fn generate_digest(pool: &PgPool, threshold: f64) -> anyhow::Result<String> {
-    let tweets = storage::list_analyzed_for_digest(pool, threshold, 100).await?;
-    let mut markdown = String::from("# xFlow Digest\n\n");
-    let mut current_category = String::new();
-    for stored in tweets {
-        let Some(analysis) = stored.analysis else {
-            continue;
-        };
-        if analysis.category != current_category {
-            current_category = analysis.category.clone();
-            markdown.push_str(&format!("## {current_category}\n\n"));
-        }
-        markdown.push_str(&format!(
-            "- [@{}]({}) {:.2}: {}\n",
-            stored.tweet.author_username,
-            stored.tweet.url,
-            analysis.importance_score,
-            analysis.chinese_summary
-        ));
-    }
-    Ok(markdown)
-}
-
 #[derive(Debug, Clone)]
 pub struct DailyDigestWindow {
     pub digest_date: String,
@@ -217,12 +194,7 @@ fn format_local_account_digest(
         ));
         for stored in tweets {
             let time = crate::utils::format_utc8(&stored.tweet.created_at);
-            let summary = stored
-                .analysis
-                .as_ref()
-                .map(|analysis| analysis.chinese_summary.as_str())
-                .filter(|summary| !summary.trim().is_empty())
-                .unwrap_or(&stored.tweet.text);
+            let summary = &stored.tweet.text;
             lines.push(format!(
                 "- {} {} {}",
                 time,
@@ -447,7 +419,6 @@ struct ChatMessageResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DailyDigestConfig;
     use chrono::TimeZone;
 
     #[test]

@@ -335,7 +335,6 @@ async fn handle_command(
             });
             return;
         }
-        "/digest" => cmd_digest(pool, config).await,
         "/spam" => cmd_spam(pool, &args).await,
         _ => cmd_help(),
     };
@@ -657,7 +656,6 @@ async fn handle_latest_callback(
         },
         limit: per_page,
         offset: (page - 1) * per_page,
-        ..Default::default()
     };
 
     let tweets = match storage::list_tweets(pool, filter.clone()).await {
@@ -757,7 +755,6 @@ async fn handle_latest_more_callback(
         username: Some(username.to_string()),
         limit: per_page,
         offset: (next_page - 1) * per_page,
-        ..Default::default()
     };
 
     let tweets = match storage::list_tweets(pool, filter.clone()).await {
@@ -1064,7 +1061,6 @@ fn cmd_help() -> anyhow::Result<String> {
          /status - Show system status\n\
          /fetch - Trigger an immediate fetch\n\
          /latest @username [7d] - Browse tweets (auto-sync, optional time range)\n\
-         /digest - Show analyzed digest summary\n\
          /spam [list|add|remove] - Manage spam keywords"
         .to_string())
 }
@@ -1230,9 +1226,8 @@ async fn cmd_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<String> 
     let mut msg = format!(
         "Fetch complete:\n\
          Fetched: {} tweets from {} sources\n\
-         Analyzed: {}\n\
          Failed: {}\n",
-        fetch.fetched, fetch.sources, fetch.analyzed, fetch.failed,
+        fetch.fetched, fetch.sources, fetch.failed,
     );
 
     if delivery.sent > 0 || delivery.failed > 0 {
@@ -1420,41 +1415,6 @@ async fn fetch_latest_for_user(
     }
     tracing::info!(username = %username, count = tweets.len(), "fetched latest for /latest");
     Ok(())
-}
-
-async fn cmd_digest(pool: &PgPool, config: &AppConfig) -> anyhow::Result<String> {
-    if !config.agent.enabled {
-        return Ok("Digest requires agent analysis to be enabled.".to_string());
-    }
-    let tweets =
-        storage::list_analyzed_for_digest(pool, config.agent.importance_threshold, 20).await?;
-    if tweets.is_empty() {
-        return Ok("No analyzed tweets found for digest.".to_string());
-    }
-    let mut lines = vec!["xFlow Digest:\n".to_string()];
-    let mut current_category = String::new();
-    for stored in &tweets {
-        let Some(ref analysis) = stored.analysis else {
-            continue;
-        };
-        if analysis.category != current_category {
-            current_category = analysis.category.clone();
-            lines.push(format!("\n[{}]", current_category));
-        }
-        let time = crate::utils::format_utc8(&stored.tweet.created_at);
-        lines.push(format!(
-            "  @{}/{} | {}\n  {}",
-            stored.tweet.author_username,
-            time,
-            analysis
-                .chinese_summary
-                .chars()
-                .take(80)
-                .collect::<String>(),
-            stored.tweet.url,
-        ));
-    }
-    Ok(lines.join("\n"))
 }
 
 async fn cmd_spam(pool: &PgPool, args: &str) -> anyhow::Result<String> {

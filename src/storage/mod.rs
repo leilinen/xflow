@@ -1,6 +1,6 @@
 pub mod db;
 
-use crate::models::{Source, SourceType, StoredTweet, Tweet, TweetAnalysis};
+use crate::models::{Source, SourceType, StoredTweet, Tweet};
 use crate::utils::{mask_token, to_json_value};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,6 @@ fn default_domain() -> String {
 #[derive(Debug, Clone, Default)]
 pub struct TweetFilter {
     pub username: Option<String>,
-    pub important_only: bool,
     pub limit: i64,
     pub offset: i64,
 }
@@ -231,50 +230,11 @@ pub async fn save_fetch_state(
     Ok(())
 }
 
-pub async fn save_analysis(pool: &PgPool, analysis: &TweetAnalysis) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO tweet_analysis (
-            tweet_id, relevance, importance_score, category, tags_json,
-            chinese_summary, reason, should_push, analyzed_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT(tweet_id) DO UPDATE SET
-            relevance=excluded.relevance,
-            importance_score=excluded.importance_score,
-            category=excluded.category,
-            tags_json=excluded.tags_json,
-            chinese_summary=excluded.chinese_summary,
-            reason=excluded.reason,
-            should_push=excluded.should_push,
-            analyzed_at=excluded.analyzed_at
-        "#,
-    )
-    .bind(&analysis.tweet_id)
-    .bind(analysis.relevance)
-    .bind(analysis.importance_score)
-    .bind(&analysis.category)
-    .bind(serde_json::to_string(&analysis.tags)?)
-    .bind(&analysis.chinese_summary)
-    .bind(&analysis.reason)
-    .bind(i64::from(analysis.should_push))
-    .bind(analysis.analyzed_at.to_rfc3339())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 pub async fn count_tweets(pool: &PgPool, filter: &TweetFilter) -> anyhow::Result<i64> {
     let mut sql = String::from("SELECT COUNT(*) FROM tweets t");
     let mut where_parts: Vec<String> = Vec::new();
     if filter.username.is_some() {
         where_parts.push("LOWER(t.author_username) = LOWER($1)".to_string());
-    }
-    if filter.important_only {
-        let idx = if filter.username.is_some() { 2 } else { 1 };
-        where_parts.push(format!(
-            "EXISTS (SELECT 1 FROM tweet_analysis a WHERE a.tweet_id = t.tweet_id AND a.should_push = ${idx})"
-        ));
     }
     if !where_parts.is_empty() {
         sql.push_str(" WHERE ");
@@ -289,22 +249,12 @@ pub async fn count_tweets(pool: &PgPool, filter: &TweetFilter) -> anyhow::Result
 }
 
 pub async fn list_tweets(pool: &PgPool, filter: TweetFilter) -> anyhow::Result<Vec<StoredTweet>> {
-    let mut sql = String::from(
-        r#"
-        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
-               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
-        FROM tweets t
-        LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
-        "#,
-    );
+    let mut sql = String::from("SELECT t.* FROM tweets t");
     let mut where_parts: Vec<String> = Vec::new();
     let mut param_idx = 1u32;
     if filter.username.is_some() {
         where_parts.push(format!("LOWER(t.author_username) = LOWER(${param_idx})"));
         param_idx += 1;
-    }
-    if filter.important_only {
-        where_parts.push("COALESCE(a.should_push, 0) = 1".to_string());
     }
     if !where_parts.is_empty() {
         sql.push_str(" WHERE ");
@@ -326,29 +276,6 @@ pub async fn list_tweets(pool: &PgPool, filter: TweetFilter) -> anyhow::Result<V
     rows.into_iter().map(row_to_tweet).collect()
 }
 
-pub async fn list_analyzed_for_digest(
-    pool: &PgPool,
-    threshold: f64,
-    limit: i64,
-) -> anyhow::Result<Vec<StoredTweet>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
-               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
-        FROM tweets t
-        JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
-        WHERE a.importance_score >= $1
-        ORDER BY a.category ASC, a.importance_score DESC, t.created_at DESC
-        LIMIT $2
-        "#,
-    )
-    .bind(threshold)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter().map(row_to_tweet).collect()
-}
-
 pub async fn list_account_tweets_for_window(
     pool: &PgPool,
     window_start: DateTime<Utc>,
@@ -357,10 +284,8 @@ pub async fn list_account_tweets_for_window(
 ) -> anyhow::Result<Vec<StoredTweet>> {
     let rows = sqlx::query(
         r#"
-        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
-               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
+        SELECT t.*
         FROM tweets t
-        LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
         WHERE t.source_type = 'account'
           AND t.created_at >= $1
           AND t.created_at < $2
@@ -485,38 +410,29 @@ pub async fn save_daily_digest_run(
 pub async fn list_undelivered_tweets(
     pool: &PgPool,
     channel: &str,
-    important_only: bool,
     limit: i64,
     max_retries: i64,
 ) -> anyhow::Result<Vec<StoredTweet>> {
-    let important_clause = if important_only {
-        "AND COALESCE(a.should_push, 0) = 1"
-    } else {
-        ""
-    };
-    let sql = format!(
+    let rows = sqlx::query(
         r#"
-        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
-               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
+        SELECT t.*
         FROM tweets t
-        LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
         LEFT JOIN deliveries d
             ON d.tweet_id = t.tweet_id
             AND d.channel = $1
             AND (d.status = 'delivered'
                  OR d.status = 'dead'
                  OR d.retry_count >= $3)
-        WHERE d.id IS NULL {important_clause}
+        WHERE d.id IS NULL
         ORDER BY t.created_at ASC
         LIMIT $2
-        "#
-    );
-    let rows = sqlx::query(&sql)
-        .bind(channel)
-        .bind(limit)
-        .bind(max_retries)
-        .fetch_all(pool)
-        .await?;
+        "#,
+    )
+    .bind(channel)
+    .bind(limit)
+    .bind(max_retries)
+    .fetch_all(pool)
+    .await?;
     rows.into_iter().map(row_to_tweet).collect()
 }
 
@@ -783,19 +699,10 @@ pub async fn delete_auth_account(pool: &PgPool, label: &str) -> anyhow::Result<b
 }
 
 pub async fn get_tweet(pool: &PgPool, tweet_id: &str) -> anyhow::Result<Option<StoredTweet>> {
-    let row = sqlx::query(
-        r#"
-        SELECT t.*, a.relevance, a.importance_score, a.category, a.tags_json,
-               a.chinese_summary, a.reason, a.should_push, a.analyzed_at
-        FROM tweets t
-        LEFT JOIN tweet_analysis a ON a.tweet_id = t.tweet_id
-        WHERE t.tweet_id = $1
-        LIMIT 1
-        "#,
-    )
-    .bind(tweet_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT * FROM tweets WHERE tweet_id = $1 LIMIT 1")
+        .bind(tweet_id)
+        .fetch_optional(pool)
+        .await?;
     row.map(row_to_tweet).transpose()
 }
 
@@ -817,27 +724,7 @@ fn row_to_tweet(row: PgRow) -> anyhow::Result<StoredTweet> {
             .with_timezone(&Utc),
         raw,
     };
-    let importance_score: Option<f64> = row.get("importance_score");
-    let analysis = if importance_score.is_some() {
-        Some(TweetAnalysis {
-            tweet_id: tweet.tweet_id.clone(),
-            relevance: row.get("relevance"),
-            importance_score: importance_score.unwrap_or_default(),
-            category: row.get("category"),
-            tags: serde_json::from_str(row.get::<String, _>("tags_json").as_str())
-                .unwrap_or_default(),
-            chinese_summary: row.get("chinese_summary"),
-            reason: row.get("reason"),
-            should_push: row.get::<i64, _>("should_push") == 1,
-            analyzed_at: DateTime::parse_from_rfc3339(
-                row.get::<String, _>("analyzed_at").as_str(),
-            )?
-            .with_timezone(&Utc),
-        })
-    } else {
-        None
-    };
-    Ok(StoredTweet { tweet, analysis })
+    Ok(StoredTweet { tweet })
 }
 
 pub async fn check_token_freshness(

@@ -61,19 +61,6 @@ CREATE TABLE IF NOT EXISTS fetch_state (
     PRIMARY KEY(source_type, source_value)
 );
 
-CREATE TABLE IF NOT EXISTS tweet_analysis (
-    tweet_id TEXT PRIMARY KEY,
-    relevance DOUBLE PRECISION NOT NULL,
-    importance_score DOUBLE PRECISION NOT NULL,
-    category TEXT NOT NULL,
-    tags_json TEXT NOT NULL,
-    chinese_summary TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    should_push BIGINT NOT NULL,
-    analyzed_at TEXT NOT NULL,
-    FOREIGN KEY(tweet_id) REFERENCES tweets(tweet_id) ON DELETE CASCADE
-);
-
 CREATE TABLE IF NOT EXISTS deliveries (
     id BIGSERIAL PRIMARY KEY,
     tweet_id TEXT,

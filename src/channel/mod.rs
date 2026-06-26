@@ -33,7 +33,6 @@ pub type ChannelSendFuture<'a> =
 
 pub trait DeliveryChannel: Send + Sync {
     fn id(&self) -> String;
-    fn send_all(&self) -> bool;
     fn send_tweet<'a>(&'a self, tweet: &'a StoredTweet) -> ChannelSendFuture<'a>;
 }
 
@@ -62,14 +61,8 @@ pub async fn send_undelivered(
     };
     for channel in channels {
         let channel_id = channel.id();
-        let tweets = storage::list_undelivered_tweets(
-            pool,
-            &channel_id,
-            !channel.send_all(),
-            limit,
-            max_retries,
-        )
-        .await?;
+        let tweets =
+            storage::list_undelivered_tweets(pool, &channel_id, limit, max_retries).await?;
         for tweet in tweets {
             match channel.send_tweet(&tweet).await {
                 Ok(receipt) => {

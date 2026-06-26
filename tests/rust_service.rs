@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 use xflow::channel::{self, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use xflow::config::{load_config, AppConfig};
-use xflow::digest;
 use xflow::fetch::auth;
 use xflow::models::{Source, SourceType, StoredTweet, Tweet};
 use xflow::server::rss_feed;
@@ -69,7 +68,6 @@ agent:
     .unwrap();
     let config = load_config(&path).unwrap();
     assert_eq!(config.server.port, 8000);
-    assert_eq!(config.agent.keywords[0], "AI");
     assert!(config.storage.database_url.contains("postgres"));
     assert!(!config.daily_digest.enabled);
     assert_eq!(config.daily_digest.send_time, "18:00");
@@ -292,8 +290,6 @@ async fn fetch_dedupes_and_generates_digest() {
     .await
     .unwrap();
     assert_eq!(tweets.len() as i64, first.fetched);
-    let markdown = digest::generate_digest(&pool, 0.1).await.unwrap();
-    assert!(markdown.starts_with("# xFlow Digest"));
 }
 
 #[tokio::test]

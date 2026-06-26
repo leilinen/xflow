@@ -1,4 +1,3 @@
-use crate::agent;
 use crate::config::AppConfig;
 use crate::fetch::fetch_source;
 use crate::storage;
@@ -9,7 +8,6 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FetchResult {
     pub fetched: i64,
-    pub analyzed: i64,
     pub sources: i64,
     pub failed: i64,
     pub errors: Vec<FetchSourceError>,
@@ -24,7 +22,6 @@ pub struct FetchSourceError {
 
 pub async fn run_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<FetchResult> {
     let mut fetched = 0;
-    let mut analyzed = 0;
     let mut errors = Vec::new();
     let sources = storage::list_sources(pool, true).await?;
     for (index, source) in sources.iter().enumerate() {
@@ -37,11 +34,6 @@ pub async fn run_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<Fetc
                 for tweet in tweets {
                     storage::upsert_tweet(pool, &tweet).await?;
                     fetched += 1;
-                    if config.agent.enabled {
-                        storage::save_analysis(pool, &agent::analyze(&tweet, &config.agent))
-                            .await?;
-                        analyzed += 1;
-                    }
                 }
                 storage::save_fetch_state(
                     pool,
@@ -64,7 +56,6 @@ pub async fn run_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<Fetc
     }
     Ok(FetchResult {
         fetched,
-        analyzed,
         sources: sources.len() as i64,
         failed: errors.len() as i64,
         errors,

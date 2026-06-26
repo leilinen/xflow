@@ -67,33 +67,12 @@ impl Default for FetchConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
-    pub enabled: bool,
-    #[serde(default = "default_keywords")]
-    pub keywords: Vec<String>,
-    pub importance_threshold: f64,
-    pub push_threshold: f64,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            keywords: default_keywords(),
-            importance_threshold: 0.45,
-            push_threshold: 0.7,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
     pub enabled: bool,
     pub bot_token_env: String,
     pub chat_id_env: String,
     #[serde(default)]
     pub discussion_group_id_env: String,
-    pub send_all: bool,
     pub parse_mode: String,
     pub disable_web_page_preview: bool,
 }
@@ -257,7 +236,6 @@ impl Default for TelegramConfig {
             bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
             chat_id_env: "TELEGRAM_CHAT_ID".to_string(),
             discussion_group_id_env: "TELEGRAM_DISCUSSION_GROUP_ID".to_string(),
-            send_all: true,
             parse_mode: "HTML".to_string(),
             disable_web_page_preview: false,
         }
@@ -272,8 +250,6 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub fetch: FetchConfig,
-    #[serde(default)]
-    pub agent: AgentConfig,
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
@@ -294,22 +270,6 @@ fn default_max_delivery_retries() -> i64 {
 
 fn default_rate_limit_safety_margin() -> i64 {
     10
-}
-
-fn default_keywords() -> Vec<String> {
-    vec![
-        "AI".to_string(),
-        "agent".to_string(),
-        "LLM".to_string(),
-        "Claude".to_string(),
-        "OpenAI".to_string(),
-        "Anthropic".to_string(),
-        "Cursor".to_string(),
-        "coding".to_string(),
-        "model".to_string(),
-        "paper".to_string(),
-        "GitHub".to_string(),
-    ]
 }
 
 pub fn write_default_config(path: &Path) -> anyhow::Result<()> {

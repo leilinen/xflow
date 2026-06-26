@@ -67,15 +67,10 @@ fetch:
   fetcher: mock          # 改为 "x_web" 抓取真实数据
   source_delay_min_seconds: 60
   source_delay_max_seconds: 120
-agent:
-  enabled: false         # 规则分析（默认关闭）
-  importance_threshold: 0.45
-  push_threshold: 0.7
 telegram:
   enabled: true
   bot_token_env: TELEGRAM_BOT_TOKEN
   chat_id_env: TELEGRAM_CHAT_ID
-  send_all: true
   parse_mode: HTML
 ```
 
@@ -137,7 +132,6 @@ Bot 通过长轮询接收和处理命令：
 | `/fetch` | 立即触发一次抓取 |
 | `/latest @username` | 浏览推文（自动同步、翻页、加载更早） |
 | `/latest @username 7d` | 浏览最近 7 天推文 |
-| `/digest` | 查看分析摘要 |
 | `/spam` | 显示垃圾关键词用法 |
 | `/spam list` | 列出所有过滤关键词 |
 | `/spam add <关键词>` | 添加过滤关键词 |
@@ -171,7 +165,6 @@ xflow auth delete --label main               # 删除账号
 ```
 http://127.0.0.1:8000/rss/all              # 所有推文
 http://127.0.0.1:8000/rss/account/openai   # 按账号
-http://127.0.0.1:8000/rss/important        # 重要推文
 http://127.0.0.1:8000/json/all             # JSON 格式
 http://127.0.0.1:8000/health               # 健康检查
 ```
@@ -191,7 +184,6 @@ xflow init                                 # 初始化配置和数据库
 xflow fetch                                # 一次性抓取
 xflow serve                                # 启动 HTTP API 服务器
 xflow worker                               # 抓取 + Telegram 循环（含 bot poller）
-xflow digest --output digest.md            # 生成 Markdown 摘要
 xflow auth import /path/to/token.json      # 从 JSON 文件导入
 xflow auth import --label L --auth-token X --ct0 Y  # 直接导入
 xflow auth list                            # 列出账号

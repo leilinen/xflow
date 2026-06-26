@@ -56,19 +56,6 @@ pub struct Tweet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TweetAnalysis {
-    pub tweet_id: String,
-    pub relevance: f64,
-    pub importance_score: f64,
-    pub category: String,
-    pub tags: Vec<String>,
-    pub chinese_summary: String,
-    pub reason: String,
-    pub should_push: bool,
-    pub analyzed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TweetComment {
     pub tweet_id: String,
     pub author_username: String,
@@ -85,5 +72,4 @@ pub struct TweetComment {
 pub struct StoredTweet {
     #[serde(flatten)]
     pub tweet: Tweet,
-    pub analysis: Option<TweetAnalysis>,
 }

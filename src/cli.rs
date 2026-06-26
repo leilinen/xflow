@@ -1,6 +1,5 @@
 use crate::channel::telegram;
 use crate::config::{load_config, write_default_config};
-use crate::digest;
 use crate::fetch::auth;
 use crate::server;
 use crate::storage;
@@ -29,7 +28,6 @@ enum Command {
     Serve(ConfigOpt),
     Worker(ConfigOpt),
     Backfill(BackfillArgs),
-    Digest(DigestArgs),
     Telegram {
         #[command(subcommand)]
         command: TelegramCommand,
@@ -44,14 +42,6 @@ enum Command {
 struct ConfigOpt {
     #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     config: PathBuf,
-}
-
-#[derive(Debug, Args)]
-struct DigestArgs {
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
-    config: PathBuf,
-    #[arg(short, long)]
-    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -132,8 +122,8 @@ pub async fn run() -> anyhow::Result<()> {
             let (config, pool) = configured_pool(&args.config).await?;
             let result = pipeline::run_fetch(&config, &pool).await?;
             println!(
-                "Fetched {} tweets from {} sources; analyzed {}; failed {}.",
-                result.fetched, result.sources, result.analyzed, result.failed
+                "Fetched {} tweets from {} sources; failed {}.",
+                result.fetched, result.sources, result.failed
             );
             if result.failed > 0 {
                 for error in &result.errors {
@@ -177,18 +167,6 @@ pub async fn run() -> anyhow::Result<()> {
                 "Backfill @{} complete: {} total, {} new, {} existing, {} pages.",
                 args.username, result.total, result.new, result.duplicate, result.pages
             );
-            Ok(())
-        }
-        Command::Digest(args) => {
-            let (config, pool) = configured_pool(&args.config).await?;
-            let markdown =
-                digest::generate_digest(&pool, config.agent.importance_threshold).await?;
-            if let Some(output) = args.output {
-                std::fs::write(&output, markdown)?;
-                println!("Wrote digest to {}", output.display());
-            } else {
-                println!("{markdown}");
-            }
             Ok(())
         }
         Command::Telegram { command } => match command {

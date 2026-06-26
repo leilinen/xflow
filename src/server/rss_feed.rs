@@ -13,17 +13,7 @@ pub fn generate_rss(
         .iter()
         .map(|stored| {
             let tweet = &stored.tweet;
-            let analysis = stored.analysis.as_ref();
-            let mut description = String::new();
-            if let Some(analysis) = analysis {
-                description.push_str(&analysis.chinese_summary);
-                if !analysis.tags.is_empty() {
-                    description.push_str("\nTags: ");
-                    description.push_str(&analysis.tags.join(", "));
-                }
-                description.push_str("\n\n");
-            }
-            description.push_str(&tweet.text);
+            let description = tweet.text.clone();
             ItemBuilder::default()
                 .title(Some(format!(
                     "@{}: {}",

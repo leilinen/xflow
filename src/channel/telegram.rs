@@ -158,7 +158,6 @@ pub struct TelegramBotCommand {
 #[derive(Debug, Clone)]
 pub struct TelegramChannel {
     credentials: TelegramCredentials,
-    send_all: bool,
     parse_mode: String,
     disable_web_page_preview: bool,
     comments_enabled: bool,
@@ -187,7 +186,6 @@ impl TelegramChannel {
         };
         Ok(Self {
             credentials: load_credentials(config)?,
-            send_all: config.send_all,
             parse_mode: config.parse_mode.clone(),
             disable_web_page_preview: config.disable_web_page_preview,
             comments_enabled: comments.enabled,
@@ -251,10 +249,6 @@ pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
         TelegramBotCommand {
             command: "latest".to_string(),
             description: "Browse tweets (e.g. /latest @openai 7d)".to_string(),
-        },
-        TelegramBotCommand {
-            command: "digest".to_string(),
-            description: "Show analyzed digest summary".to_string(),
         },
         TelegramBotCommand {
             command: "spam".to_string(),
@@ -327,11 +321,6 @@ pub fn format_tweet_message(stored: &StoredTweet, translation: Option<&str>) -> 
         if !t.is_empty() {
             parts.push("----------".to_string());
             parts.push(format!("<i>{}</i>", html_escape(t)));
-        }
-    }
-    if let Some(analysis) = &stored.analysis {
-        if !analysis.tags.is_empty() {
-            parts.push(format!("Tags: {}", html_escape(&analysis.tags.join(", "))));
         }
     }
     let footer = format!(
@@ -486,10 +475,6 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 impl DeliveryChannel for TelegramChannel {
     fn id(&self) -> String {
         self.credentials.channel()
-    }
-
-    fn send_all(&self) -> bool {
-        self.send_all
     }
 
     fn send_tweet<'a>(&'a self, tweet: &'a StoredTweet) -> ChannelSendFuture<'a> {
@@ -1299,7 +1284,7 @@ pub async fn send_fetch_alert(
 mod tests {
     use super::*;
     use crate::fetch::media::{ArticleContent, QuotedTweet};
-    use crate::models::{SourceType, Tweet, TweetAnalysis};
+    use crate::models::{SourceType, Tweet};
     use chrono::Utc;
     use serde_json::json;
 
@@ -1317,7 +1302,6 @@ mod tests {
                 fetched_at: Utc::now(),
                 raw,
             },
-            analysis: None,
         }
     }
 
@@ -1336,7 +1320,6 @@ mod tests {
                 fetched_at: Utc::now(),
                 raw: json!({}),
             },
-            analysis: None,
         };
         let message = format_tweet_message(&stored, None);
         assert!(message.contains("AI &lt;agent&gt; &amp; update"));
@@ -1351,7 +1334,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "add", "remove", "list", "status", "fetch", "latest", "digest", "spam"]
+            vec!["help", "add", "remove", "list", "status", "fetch", "latest", "spam"]
         );
         assert!(commands
             .iter()
@@ -1374,25 +1357,12 @@ mod tests {
                 fetched_at: Utc::now(),
                 raw: json!({}),
             },
-            analysis: Some(TweetAnalysis {
-                tweet_id: "2".to_string(),
-                relevance: 0.9,
-                importance_score: 0.8,
-                category: "research".to_string(),
-                tags: vec!["AI".to_string(), "LLM".to_string()],
-                chinese_summary: "这是一段很长的中文摘要".to_string(),
-                reason: "important".to_string(),
-                should_push: true,
-                analyzed_at: Utc::now(),
-            }),
         };
         let message = format_tweet_message(&stored, None);
         assert!(message.len() <= TELEGRAM_MESSAGE_LIMIT);
         assert!(message.contains("<b>OpenAI</b> (@openai)"));
         assert!(message.contains("Open tweet"));
         assert!(message.contains(TRUNCATION_MARKER.trim()));
-        // Summary and tags should be dropped when truncated.
-        assert!(!message.contains("这是一段很长的中文摘要"));
     }
 
     #[test]
@@ -1410,7 +1380,6 @@ mod tests {
                 fetched_at: Utc::now(),
                 raw: json!({}),
             },
-            analysis: None,
         };
         let message = format_tweet_message(&stored, None);
         assert!(!message.contains(TRUNCATION_MARKER.trim()));

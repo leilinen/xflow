@@ -40,10 +40,8 @@ pub fn router(config: AppConfig, pool: PgPool) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/json/all", get(json_all))
-        .route("/json/important", get(json_important))
         .route("/rss/all", get(rss_all))
         .route("/rss/account/:username", get(rss_account))
-        .route("/rss/important", get(rss_important))
         .route("/api/sources", get(api_sources))
         .route("/api/fetch-state", get(api_fetch_state))
         .with_state(state)
@@ -73,23 +71,6 @@ async fn json_all(
     let tweets: Vec<_> = storage::list_tweets(
         &state.pool,
         TweetFilter {
-            limit: params.limit,
-            offset: params.offset,
-            ..Default::default()
-        },
-    )
-    .await?;
-    Ok(Json(json!({"tweets": tweets})))
-}
-
-async fn json_important(
-    State(state): State<AppState>,
-    Query(params): Query<PaginationParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let tweets: Vec<_> = storage::list_tweets(
-        &state.pool,
-        TweetFilter {
-            important_only: true,
             limit: params.limit,
             offset: params.offset,
             ..Default::default()
@@ -131,7 +112,6 @@ async fn rss_account(
             username: Some(username.clone()),
             limit: params.limit,
             offset: params.offset,
-            ..Default::default()
         },
     )
     .await?;
@@ -139,28 +119,6 @@ async fn rss_account(
         &format!("xFlow @{username}"),
         &format!("http://localhost/rss/account/{username}"),
         &format!("Cached tweets from @{username}"),
-        &tweets,
-    )?)
-}
-
-async fn rss_important(
-    State(state): State<AppState>,
-    Query(params): Query<PaginationParams>,
-) -> Result<Response, AppError> {
-    let tweets: Vec<_> = storage::list_tweets(
-        &state.pool,
-        TweetFilter {
-            important_only: true,
-            limit: params.limit,
-            offset: params.offset,
-            ..Default::default()
-        },
-    )
-    .await?;
-    rss_response(rss_feed::generate_rss(
-        "xFlow Important",
-        "http://localhost/rss/important",
-        "Important cached xFlow tweets",
         &tweets,
     )?)
 }
