@@ -179,10 +179,6 @@ telegram:
 comments:
   enabled: true
   max_comments: 20
-  spam_keywords:
-    - "follow me"
-    - "free crypto"
-    - "airdrop"
 ```
 
 Notes:
@@ -334,7 +330,7 @@ cargo run --release -- \
 
 The tool reads all tables from the SQLite database and inserts them into PostgreSQL. Conflicting rows are skipped (`ON CONFLICT DO NOTHING`), so the migration is idempotent and safe to re-run.
 
-Migration order respects foreign key dependencies: `auth_accounts` → `auth_rate_limits` → `sources` → `tweets` → `tweet_analysis` → `fetch_state` → `deliveries` → `spam_keywords`.
+Migration order respects foreign key dependencies: `auth_accounts` → `auth_rate_limits` → `sources` → `tweets` → `fetch_state` → `deliveries` → `spam_keywords` → `daily_digest_runs`.
 
 ## Development
 

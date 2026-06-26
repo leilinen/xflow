@@ -20,13 +20,3 @@ telegram:
 comments:
   enabled: true
   max_comments: 20
-  spam_keywords:
-    - "follow me"
-    - "subscribe"
-    - "check out my"
-    - "free crypto"
-    - "airdrop"
-    - "click here"
-    - "DM me"
-    - "NFT giveaway"
-    - "mint now"

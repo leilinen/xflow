@@ -204,8 +204,6 @@ pub struct CommentsConfig {
     pub enabled: bool,
     #[serde(default = "default_comment_max")]
     pub max_comments: usize,
-    #[serde(default)]
-    pub spam_keywords: Vec<String>,
     #[serde(default = "default_tweet_detail_query_id")]
     pub tweet_detail_query_id: String,
 }
@@ -215,7 +213,6 @@ impl Default for CommentsConfig {
         Self {
             enabled: false,
             max_comments: 20,
-            spam_keywords: Vec::new(),
             tweet_detail_query_id: default_tweet_detail_query_id(),
         }
     }

@@ -107,17 +107,6 @@ xFlow 在推送推文到 Telegram 时自动识别内容类型，使用对应的 
 | `/spam add <关键词>` | 添加过滤关键词 |
 | `/spam remove <关键词>` | 删除过滤关键词 |
 
-也可以在 `config.yaml` 中配置初始关键词（作为 fallback）：
-
-```yaml
-comments:
-  enabled: true
-  max_comments: 20
-  spam_keywords:
-    - "follow me"
-    - "free crypto"
-```
-
 ### 交互式命令
 
 Bot 通过长轮询接收和处理命令：
@@ -215,7 +204,7 @@ cargo run --release -- \
 
 迁移工具会按顺序读取 SQLite 中的所有表数据并写入 PostgreSQL。冲突行会被跳过（`ON CONFLICT DO NOTHING`），因此迁移是幂等的，可以安全地重复运行。
 
-迁移顺序遵循外键依赖：`auth_accounts` → `auth_rate_limits` → `sources` → `tweets` → `tweet_analysis` → `fetch_state` → `deliveries` → `spam_keywords`。
+迁移顺序遵循外键依赖：`auth_accounts` → `auth_rate_limits` → `sources` → `tweets` → `fetch_state` → `deliveries` → `spam_keywords` → `daily_digest_runs`。
 
 ## 生产部署
 

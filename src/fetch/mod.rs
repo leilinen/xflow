@@ -92,14 +92,7 @@ pub async fn fetch_tweet_comments(
     max_comments: usize,
 ) -> anyhow::Result<Vec<TweetComment>> {
     let fetcher = XWebFetcher::new(config, pool).await?;
-    let mut spam_keywords = storage::list_spam_keywords(pool).await?;
-    // Merge config keywords as fallback
-    for kw in &config.comments.spam_keywords {
-        let lower = kw.to_lowercase();
-        if !spam_keywords.iter().any(|k| k.to_lowercase() == lower) {
-            spam_keywords.push(lower);
-        }
-    }
+    let spam_keywords = storage::list_spam_keywords(pool).await?;
     fetcher
         .fetch_comments(tweet_id, max_comments, &spam_keywords)
         .await
