@@ -32,6 +32,7 @@ impl TelegramCredentials {
 struct SendMessagePayload {
     chat_id: String,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     link_preview_options: Option<LinkPreviewOptions>,
@@ -1356,6 +1357,38 @@ mod tests {
         assert!(commands
             .iter()
             .all(|command| !command.description.trim().is_empty()));
+    }
+
+    #[test]
+    fn send_message_payload_omits_empty_parse_mode() {
+        let payload = SendMessagePayload {
+            chat_id: "1".to_string(),
+            text: "daily digest".to_string(),
+            parse_mode: None,
+            link_preview_options: None,
+            reply_parameters: None,
+            reply_markup: None,
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert!(value.get("parse_mode").is_none());
+    }
+
+    #[test]
+    fn send_message_payload_keeps_configured_parse_mode() {
+        let payload = SendMessagePayload {
+            chat_id: "1".to_string(),
+            text: "tweet".to_string(),
+            parse_mode: Some("HTML".to_string()),
+            link_preview_options: None,
+            reply_parameters: None,
+            reply_markup: None,
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value.get("parse_mode"), Some(&json!("HTML")));
     }
 
     #[test]
