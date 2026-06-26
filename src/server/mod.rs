@@ -58,10 +58,7 @@ pub async fn serve(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-        .is_ok();
+    let db_ok = sqlx::query("SELECT 1").execute(&state.pool).await.is_ok();
     if db_ok {
         Json(json!({"status": "ok", "db": "ok"}))
     } else {
