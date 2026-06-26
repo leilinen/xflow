@@ -28,9 +28,12 @@ pub struct DailyAccountDigest {
 
 const DAILY_DIGEST_TWEET_INPUT_CHARS: usize = 240;
 const DAILY_DIGEST_RETRY_TWEET_INPUT_CHARS: usize = 140;
+const DAILY_DIGEST_COMPACT_TWEET_INPUT_CHARS: usize = 90;
 const DAILY_DIGEST_CHUNK_CHAR_BUDGET: usize = 8_000;
 const DAILY_DIGEST_RETRY_CHUNK_CHAR_BUDGET: usize = 4_000;
+const DAILY_DIGEST_COMPACT_CHUNK_CHAR_BUDGET: usize = 2_000;
 const DAILY_DIGEST_FALLBACK_TWEETS_PER_ACCOUNT: usize = 5;
+const DAILY_DIGEST_MIN_OUTPUT_TOKENS: u32 = 2_400;
 
 pub fn daily_digest_window(
     now: DateTime<Utc>,
@@ -145,23 +148,26 @@ pub async fn generate_daily_account_digest(
             continue;
         };
         let username = first.tweet.author_username.clone();
+        let display_name = first.tweet.author_name.clone();
         let section = match &client {
-            Some(client) => match summarize_account(client, &window, &username, tweets).await {
-                Ok(section) => section,
-                Err(err) => {
-                    tracing::warn!(
-                        account = %username,
-                        tweet_count = tweets.len(),
-                        ?err,
-                        "daily digest account summary failed, using account fallback"
-                    );
-                    errors.push(format!("@{username}: {err}"));
-                    format_account_fallback_section(&username, tweets)
+            Some(client) => {
+                match summarize_account(client, &window, &display_name, &username, tweets).await {
+                    Ok(section) => section,
+                    Err(err) => {
+                        tracing::warn!(
+                            account = %username,
+                            tweet_count = tweets.len(),
+                            ?err,
+                            "daily digest account summary failed, using account fallback"
+                        );
+                        errors.push(format!("@{username}: {err}"));
+                        format_account_fallback_section(&display_name, &username, tweets)
+                    }
                 }
-            },
+            }
             None => {
                 errors.push(format!("@{username}: daily digest LLM client unavailable"));
-                format_account_fallback_section(&username, tweets)
+                format_account_fallback_section(&display_name, &username, tweets)
             }
         };
         sections.push(section);
@@ -216,6 +222,7 @@ fn format_local_account_digest(
             continue;
         };
         lines.push(format_account_fallback_section(
+            &first.tweet.author_name,
             &first.tweet.author_username,
             tweets,
         ));
@@ -258,12 +265,14 @@ fn format_digest_title(
 async fn summarize_account(
     client: &DigestChatClient,
     window: &DailyDigestWindow,
+    display_name: &str,
     username: &str,
     tweets: &[StoredTweet],
 ) -> anyhow::Result<String> {
     match summarize_account_with_budget(
         client,
         window,
+        display_name,
         username,
         tweets,
         DAILY_DIGEST_TWEET_INPUT_CHARS,
@@ -278,16 +287,41 @@ async fn summarize_account(
                 ?first_err,
                 "daily digest account summary failed, retrying with smaller chunks"
             );
-            summarize_account_with_budget(
+            match summarize_account_with_budget(
                 client,
                 window,
+                display_name,
                 username,
                 tweets,
                 DAILY_DIGEST_RETRY_TWEET_INPUT_CHARS,
                 DAILY_DIGEST_RETRY_CHUNK_CHAR_BUDGET,
             )
             .await
-            .with_context(|| format!("retry after initial account summary failure: {first_err}"))
+            {
+                Ok(section) => Ok(section),
+                Err(second_err) => {
+                    tracing::warn!(
+                        account = %username,
+                        ?second_err,
+                        "daily digest account summary retry failed, retrying with compact prompt"
+                    );
+                    summarize_account_with_budget(
+                        client,
+                        window,
+                        display_name,
+                        username,
+                        tweets,
+                        DAILY_DIGEST_COMPACT_TWEET_INPUT_CHARS,
+                        DAILY_DIGEST_COMPACT_CHUNK_CHAR_BUDGET,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "compact retry after failures: initial={first_err}; retry={second_err}"
+                        )
+                    })
+                }
+            }
         }
     }
 }
@@ -295,6 +329,7 @@ async fn summarize_account(
 async fn summarize_account_with_budget(
     client: &DigestChatClient,
     window: &DailyDigestWindow,
+    display_name: &str,
     username: &str,
     tweets: &[StoredTweet],
     tweet_char_limit: usize,
@@ -310,8 +345,15 @@ async fn summarize_account_with_budget(
     );
     let mut summaries = Vec::new();
     for (index, chunk) in chunks.iter().enumerate() {
-        let prompt =
-            build_account_chunk_prompt(window, username, tweets.len(), index, chunks.len(), chunk);
+        let prompt = build_account_chunk_prompt(
+            window,
+            display_name,
+            username,
+            tweets.len(),
+            index,
+            chunks.len(),
+            chunk,
+        );
         let summary = client
             .summarize(&prompt)
             .await
@@ -330,7 +372,8 @@ async fn summarize_account_with_budget(
     let body = if summaries.len() == 1 {
         summaries.remove(0)
     } else {
-        let prompt = build_account_merge_prompt(window, username, tweets.len(), &summaries);
+        let prompt =
+            build_account_merge_prompt(window, display_name, username, tweets.len(), &summaries);
         let merged = client.summarize(&prompt).await.with_context(|| {
             format!("failed to merge {} account summary chunks", summaries.len())
         })?;
@@ -343,7 +386,12 @@ async fn summarize_account_with_budget(
         merged
     };
 
-    Ok(format_account_llm_section(username, tweets.len(), &body))
+    Ok(format_account_llm_section(
+        display_name,
+        username,
+        tweets.len(),
+        &body,
+    ))
 }
 
 fn build_account_digest_chunks(
@@ -388,6 +436,7 @@ fn format_digest_tweet_input(stored: &StoredTweet, tweet_char_limit: usize) -> S
 
 fn build_account_chunk_prompt(
     window: &DailyDigestWindow,
+    display_name: &str,
     username: &str,
     total_tweets: usize,
     chunk_index: usize,
@@ -395,9 +444,9 @@ fn build_account_chunk_prompt(
     chunk: &str,
 ) -> String {
     format!(
-        "请总结 @{username} 在 {} UTC+8 的推文。\n\
+        "请总结 {display_name}（@{username}）在 {} UTC+8 的推文。\n\
 这是第 {}/{} 组，共 {} 条推文。\n\
-要求：输出 2-4 条中文要点；必须总结主题、观点变化、风险或机会；不要逐条罗列；只保留最关键的原推文链接。\n\n\
+要求：只输出最终摘要，不输出 Markdown，不输出推理过程。输出 2-3 条纯文本编号要点，每条尽量 80 个中文以内；必须总结主题、观点变化、风险或机会；不要逐条罗列；只保留最关键的原推文链接。\n\n\
 推文：\n{}",
         window.digest_date,
         chunk_index + 1,
@@ -409,6 +458,7 @@ fn build_account_chunk_prompt(
 
 fn build_account_merge_prompt(
     window: &DailyDigestWindow,
+    display_name: &str,
     username: &str,
     total_tweets: usize,
     summaries: &[String],
@@ -420,33 +470,46 @@ fn build_account_merge_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
     format!(
-        "请把 @{username} 在 {} UTC+8 的 {} 条推文中间摘要合并成最终账号摘要。\n\
-要求：只输出 2-4 条中文要点；去重；先结论后证据；保留最关键链接；不要逐条罗列。\n\n{}",
+        "请把 {display_name}（@{username}）在 {} UTC+8 的 {} 条推文中间摘要合并成最终账号摘要。\n\
+要求：只输出最终摘要，不输出 Markdown，不输出推理过程。输出 2-3 条纯文本编号要点；去重；先结论后证据；保留最关键链接；不要逐条罗列。\n\n{}",
         window.digest_date, total_tweets, joined
     )
 }
 
-fn format_account_llm_section(username: &str, tweet_count: usize, body: &str) -> String {
-    let body = body.trim();
-    if body.starts_with(&format!("@{username}")) {
-        body.to_string()
-    } else {
-        format!("@{} ({})\n{}", username, plural_tweets(tweet_count), body)
-    }
+fn format_account_llm_section(
+    display_name: &str,
+    username: &str,
+    tweet_count: usize,
+    body: &str,
+) -> String {
+    let body = sanitize_digest_text(body);
+    format!(
+        "{}（@{}，{}）\n{}",
+        display_name,
+        username,
+        plural_tweets(tweet_count),
+        body
+    )
 }
 
-fn format_account_fallback_section(username: &str, tweets: &[StoredTweet]) -> String {
+fn format_account_fallback_section(
+    display_name: &str,
+    username: &str,
+    tweets: &[StoredTweet],
+) -> String {
     let mut lines = vec![format!(
-        "@{} ({}, 本账号使用本地摘要)",
+        "{}（@{}，{}，本账号使用本地摘要）",
+        display_name,
         username,
         plural_tweets(tweets.len())
     )];
-    lines.push("- LLM 未生成可用账号摘要，以下仅保留代表性更新，避免罗列全部推文。".to_string());
+    lines.push("1. LLM 未生成可用账号摘要，以下仅保留代表性更新，避免罗列全部推文。".to_string());
     for stored in tweets.iter().take(DAILY_DIGEST_FALLBACK_TWEETS_PER_ACCOUNT) {
         let time = crate::utils::format_utc8(&stored.tweet.created_at);
         let summary = &stored.tweet.text;
         lines.push(format!(
-            "- {} {} {}",
+            "{}. {} {} {}",
+            lines.len(),
             time,
             truncate_plain(&normalize_whitespace(summary), 100),
             stored.tweet.url
@@ -454,7 +517,8 @@ fn format_account_fallback_section(username: &str, tweets: &[StoredTweet]) -> St
     }
     if tweets.len() > DAILY_DIGEST_FALLBACK_TWEETS_PER_ACCOUNT {
         lines.push(format!(
-            "- 其余 {} 条已省略。",
+            "{}. 其余 {} 条已省略。",
+            lines.len(),
             tweets.len() - DAILY_DIGEST_FALLBACK_TWEETS_PER_ACCOUNT
         ));
     }
@@ -499,6 +563,55 @@ fn normalize_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn sanitize_digest_text(value: &str) -> String {
+    let mut lines = Vec::new();
+    for line in value.lines() {
+        let mut cleaned = line.trim();
+        while let Some(rest) = cleaned.strip_prefix('#') {
+            cleaned = rest.trim_start();
+        }
+        cleaned = cleaned.trim_start_matches(['-', '*', '•']).trim_start();
+        let cleaned = markdown_links_to_plain(cleaned)
+            .replace("**", "")
+            .replace("__", "")
+            .replace('`', "");
+        let cleaned = cleaned.trim();
+        if !cleaned.is_empty() {
+            lines.push(cleaned.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+fn markdown_links_to_plain(value: &str) -> String {
+    let mut output = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('[') {
+        let before = &rest[..start];
+        let candidate = &rest[start..];
+        let Some(mid) = candidate.find("](") else {
+            output.push_str(rest);
+            return output;
+        };
+        let after_mid = &candidate[mid + 2..];
+        let Some(end) = after_mid.find(')') else {
+            output.push_str(rest);
+            return output;
+        };
+        output.push_str(before);
+        let label = &candidate[1..mid];
+        let url = &after_mid[..end];
+        output.push_str(label);
+        if !url.is_empty() {
+            output.push(' ');
+            output.push_str(url);
+        }
+        rest = &after_mid[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
 #[derive(Debug, Clone)]
 struct DigestChatClient {
     http: Client,
@@ -527,7 +640,7 @@ impl DigestChatClient {
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
-            max_tokens: config.max_tokens,
+            max_tokens: config.max_tokens.max(DAILY_DIGEST_MIN_OUTPUT_TOKENS),
             temperature: config.temperature,
             system_prompt: config.system_prompt.clone(),
         })
@@ -718,19 +831,27 @@ mod tests {
             .map(|id| make_stored_tweet(id, &format!("tweet {id}")))
             .collect::<Vec<_>>();
 
-        let section = format_account_fallback_section("openai", &tweets);
+        let section = format_account_fallback_section("OpenAI", "openai", &tweets);
 
-        assert!(section.contains("@openai (7 条, 本账号使用本地摘要)"));
+        assert!(section.contains("OpenAI（@openai，7 条，本账号使用本地摘要）"));
         assert!(section.contains("tweet 1"));
         assert_eq!(section.matches("https://x.com/openai/status/").count(), 5);
         assert!(section.contains("其余 2 条已省略"));
     }
 
     #[test]
-    fn account_llm_section_adds_account_header() {
-        let section = format_account_llm_section("openai", 3, "- 要点一\n- 要点二");
+    fn account_llm_section_adds_display_name_header() {
+        let section = format_account_llm_section("OpenAI", "openai", 3, "1. 要点一\n2. 要点二");
 
-        assert!(section.starts_with("@openai (3 条)\n"));
-        assert!(section.contains("- 要点一"));
+        assert!(section.starts_with("OpenAI（@openai，3 条）\n"));
+        assert!(section.contains("1. 要点一"));
+    }
+
+    #[test]
+    fn digest_text_sanitizer_removes_markdown() {
+        let text =
+            sanitize_digest_text("### **OpenAI**\n- [发布更新](https://x.com/openai/status/1)");
+
+        assert_eq!(text, "OpenAI\n发布更新 https://x.com/openai/status/1");
     }
 }
