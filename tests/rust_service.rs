@@ -686,10 +686,6 @@ impl DeliveryChannel for MockChannel {
         "mock:test".to_string()
     }
 
-    fn send_all(&self) -> bool {
-        true
-    }
-
     fn send_tweet<'a>(&'a self, _tweet: &'a StoredTweet) -> ChannelSendFuture<'a> {
         Box::pin(async {
             Ok(ChannelSendReceipt {
