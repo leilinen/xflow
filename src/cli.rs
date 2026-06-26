@@ -27,6 +27,7 @@ enum Command {
     Fetch(ConfigOpt),
     Serve(ConfigOpt),
     Worker(ConfigOpt),
+    DailyDigest(DailyDigestArgs),
     Backfill(BackfillArgs),
     Telegram {
         #[command(subcommand)]
@@ -57,6 +58,14 @@ struct BackfillArgs {
     /// Stop when tweets are older than this (e.g. "7d", "30d", "12h")
     #[arg(long)]
     since: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DailyDigestArgs {
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +156,18 @@ pub async fn run() -> anyhow::Result<()> {
                 config.fetch.interval_seconds
             );
             worker::run_forever(config, pool).await
+        }
+        Command::DailyDigest(args) => {
+            let (config, pool) = configured_pool(&args.config).await?;
+            let sent =
+                worker::send_daily_digest_once(&config, &pool, chrono::Utc::now(), args.force)
+                    .await?;
+            if sent {
+                println!("Daily digest sent.");
+            } else {
+                println!("Daily digest already delivered; use --force to send again.");
+            }
+            Ok(())
         }
         Command::Backfill(args) => {
             let (config, pool) = configured_pool(&args.config).await?;

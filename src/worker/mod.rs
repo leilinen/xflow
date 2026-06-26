@@ -154,7 +154,7 @@ async fn run_daily_digest_scheduler(config: AppConfig, pool: PgPool) -> anyhow::
         let now = chrono::Utc::now();
         let due = digest::daily_digest_due_now(now, &config.daily_digest)?;
         if due {
-            match send_daily_digest_if_needed(&config, &pool, now).await {
+            match send_daily_digest_once(&config, &pool, now, false).await {
                 Ok(sent) => {
                     if sent {
                         tracing::info!("daily digest delivered");
@@ -187,20 +187,28 @@ async fn sleep_until(when: chrono::DateTime<chrono::Utc>) {
     tokio::time::sleep(duration).await;
 }
 
-async fn send_daily_digest_if_needed(
+pub async fn send_daily_digest_once(
     config: &AppConfig,
     pool: &PgPool,
     now: chrono::DateTime<chrono::Utc>,
+    force: bool,
 ) -> anyhow::Result<bool> {
     let window = digest::daily_digest_window(now, &config.daily_digest)?;
     let channel = telegram::channel_id(&config.telegram)?;
-    if storage::daily_digest_delivered(pool, &window.digest_date, &channel).await? {
+    if !force && storage::daily_digest_delivered(pool, &window.digest_date, &channel).await? {
         tracing::debug!(
             digest_date = %window.digest_date,
             channel = %channel,
             "daily digest already delivered"
         );
         return Ok(false);
+    }
+    if force {
+        tracing::info!(
+            digest_date = %window.digest_date,
+            channel = %channel,
+            "forcing daily digest delivery"
+        );
     }
 
     let generated =
