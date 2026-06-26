@@ -1,4 +1,6 @@
 use chrono::{TimeZone, Utc};
+use sqlx::postgres::PgPoolOptions;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 use xflow::channel::{self, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use xflow::config::{load_config, AppConfig};
@@ -20,7 +22,31 @@ fn test_database_url() -> String {
 async fn test_pool() -> (tempfile::TempDir, sqlx::PgPool) {
     let dir = tempdir().unwrap();
     let url = test_database_url();
-    let pool = db::connect(&url).await.unwrap();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("test_{}_{}", std::process::id(), suffix);
+    sqlx::query(&format!(r#"CREATE SCHEMA "{schema}""#))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query(&format!(r#"SET search_path TO "{schema}", public"#))
+        .execute(&pool)
+        .await
+        .unwrap();
     db::init_db(&pool).await.unwrap();
     (dir, pool)
 }

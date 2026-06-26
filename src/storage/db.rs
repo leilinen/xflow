@@ -136,7 +136,7 @@ pub async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
 
 async fn table_columns(pool: &PgPool, table: &str) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position",
     )
     .bind(table)
     .fetch_all(pool)
