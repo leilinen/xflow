@@ -274,10 +274,10 @@ fn parse_duration(input: &str) -> anyhow::Result<chrono::Duration> {
     if input.is_empty() {
         anyhow::bail!("duration cannot be empty");
     }
-    let (num_str, unit) = if input.ends_with('d') {
-        (&input[..input.len() - 1], 'd')
-    } else if input.ends_with('h') {
-        (&input[..input.len() - 1], 'h')
+    let (num_str, unit) = if let Some(stripped) = input.strip_suffix('d') {
+        (stripped, 'd')
+    } else if let Some(stripped) = input.strip_suffix('h') {
+        (stripped, 'h')
     } else {
         anyhow::bail!("duration must end with 'd' (days) or 'h' (hours), e.g. \"7d\" or \"12h\"");
     };

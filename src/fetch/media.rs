@@ -227,7 +227,7 @@ fn best_mp4_variant(media_item: &Value) -> Option<String> {
             continue;
         }
         let bitrate = v.get("bitrate").and_then(Value::as_i64).unwrap_or(0);
-        if best.map_or(true, |(_, b)| bitrate > b) {
+        if best.is_none_or(|(_, b)| bitrate > b) {
             best = Some((v, bitrate));
         }
     }

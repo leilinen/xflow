@@ -18,6 +18,7 @@ struct TelegramUpdate {
 
 #[derive(Debug, Deserialize)]
 struct TelegramMessage {
+    #[allow(dead_code)]
     message_id: i64,
     chat: TelegramChat,
     text: Option<String>,
@@ -882,8 +883,6 @@ async fn handle_comments_callback(
         } else {
             (msg.chat.id.to_string(), false)
         }
-    } else if is_discussion_group {
-        (msg.chat.id.to_string(), false)
     } else {
         (msg.chat.id.to_string(), false)
     };
@@ -1265,7 +1264,7 @@ async fn cmd_latest(
     args: &str,
 ) {
     // Parse args: "@username [time_range]" e.g. "@openai 7d" or "openai 30d"
-    let parts: Vec<&str> = args.trim().split_whitespace().collect();
+    let parts: Vec<&str> = args.split_whitespace().collect();
     let username = parts
         .first()
         .map(|s| s.trim_start_matches('@').to_string())
@@ -1384,10 +1383,10 @@ fn parse_bot_duration(input: &str) -> anyhow::Result<chrono::Duration> {
     if input.is_empty() {
         anyhow::bail!("empty");
     }
-    let (num_str, unit) = if input.ends_with('d') {
-        (&input[..input.len() - 1], 'd')
-    } else if input.ends_with('h') {
-        (&input[..input.len() - 1], 'h')
+    let (num_str, unit) = if let Some(stripped) = input.strip_suffix('d') {
+        (stripped, 'd')
+    } else if let Some(stripped) = input.strip_suffix('h') {
+        (stripped, 'h')
     } else {
         anyhow::bail!("must end with 'd' or 'h'");
     };
