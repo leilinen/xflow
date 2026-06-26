@@ -26,11 +26,7 @@ pub async fn run_fetch(config: &AppConfig, pool: &PgPool) -> anyhow::Result<Fetc
     let mut fetched = 0;
     let mut analyzed = 0;
     let mut errors = Vec::new();
-    let mut sources = storage::list_sources(pool, true).await?;
-    if sources.is_empty() {
-        sources = config.parsed_sources();
-        storage::ensure_config_sources(pool, &sources).await?;
-    }
+    let sources = storage::list_sources(pool, true).await?;
     for (index, source) in sources.iter().enumerate() {
         if index > 0 {
             delay_between_sources(config).await;

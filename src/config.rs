@@ -1,4 +1,3 @@
-use crate::models::{Source, SourceType};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -65,37 +64,6 @@ impl Default for FetchConfig {
             max_delivery_retries: 3,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SourceConfig {
-    #[serde(default)]
-    pub accounts: Vec<AccountSourceConfig>,
-    #[serde(default)]
-    pub lists: Vec<ListSourceConfig>,
-    #[serde(default)]
-    pub searches: Vec<SearchSourceConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountSourceConfig {
-    pub username: String,
-    pub label: Option<String>,
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListSourceConfig {
-    pub list_id: String,
-    pub label: Option<String>,
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchSourceConfig {
-    pub query: String,
-    pub label: Option<String>,
-    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +264,7 @@ impl Default for TelegramConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -304,8 +272,6 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub fetch: FetchConfig,
-    #[serde(default)]
-    pub sources: SourceConfig,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -316,38 +282,6 @@ pub struct AppConfig {
     pub daily_digest: DailyDigestConfig,
     #[serde(default)]
     pub comments: CommentsConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            fetch: FetchConfig::default(),
-            sources: SourceConfig {
-                accounts: vec![AccountSourceConfig {
-                    username: "openai".to_string(),
-                    label: None,
-                    limit: Some(5),
-                }],
-                lists: vec![ListSourceConfig {
-                    list_id: "ai-builders".to_string(),
-                    label: None,
-                    limit: Some(5),
-                }],
-                searches: vec![SearchSourceConfig {
-                    query: "AI agent".to_string(),
-                    label: None,
-                    limit: Some(5),
-                }],
-            },
-            agent: AgentConfig::default(),
-            telegram: TelegramConfig::default(),
-            translation: TranslationConfig::default(),
-            daily_digest: DailyDigestConfig::default(),
-            comments: CommentsConfig::default(),
-        }
-    }
 }
 
 fn default_command_timeout_seconds() -> u64 {
@@ -391,35 +325,4 @@ pub fn load_config(path: &Path) -> anyhow::Result<AppConfig> {
         AppConfig::default()
     };
     Ok(config)
-}
-
-impl AppConfig {
-    pub fn parsed_sources(&self) -> Vec<Source> {
-        let mut sources = Vec::new();
-        for item in &self.sources.accounts {
-            sources.push(Source {
-                source_type: SourceType::Account,
-                value: item.username.trim_start_matches('@').to_string(),
-                label: item.label.clone(),
-                limit: item.limit.or(Some(self.fetch.default_limit)),
-            });
-        }
-        for item in &self.sources.lists {
-            sources.push(Source {
-                source_type: SourceType::List,
-                value: item.list_id.clone(),
-                label: item.label.clone(),
-                limit: item.limit.or(Some(self.fetch.default_limit)),
-            });
-        }
-        for item in &self.sources.searches {
-            sources.push(Source {
-                source_type: SourceType::Search,
-                value: item.query.clone(),
-                label: item.label.clone(),
-                limit: item.limit.or(Some(self.fetch.default_limit)),
-            });
-        }
-        sources
-    }
 }

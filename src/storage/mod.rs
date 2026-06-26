@@ -177,13 +177,6 @@ pub async fn list_sources(pool: &PgPool, enabled_only: bool) -> anyhow::Result<V
         .collect()
 }
 
-pub async fn ensure_config_sources(pool: &PgPool, sources: &[Source]) -> anyhow::Result<()> {
-    for source in sources {
-        upsert_source(pool, source).await?;
-    }
-    Ok(())
-}
-
 pub async fn upsert_tweet(pool: &PgPool, tweet: &Tweet) -> anyhow::Result<bool> {
     let result = sqlx::query(
         r#"

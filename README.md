@@ -170,13 +170,6 @@ fetch:
   source_delay_min_seconds: 60
   source_delay_max_seconds: 120
 
-sources:
-  accounts:
-    - username: openai
-      limit: 5
-  lists: []
-  searches: []
-
 agent:
   enabled: false
   importance_threshold: 0.45

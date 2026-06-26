@@ -258,6 +258,23 @@ async fn auth_import_rejects_malformed_token_json() {
 async fn fetch_dedupes_and_generates_digest() {
     let (_dir, pool) = test_pool().await;
     let config = AppConfig::default();
+    for (source_type, value, limit) in [
+        (SourceType::Account, "openai", 5),
+        (SourceType::List, "ai-builders", 5),
+        (SourceType::Search, "AI agent", 5),
+    ] {
+        storage::upsert_source(
+            &pool,
+            &Source {
+                source_type,
+                value: value.to_string(),
+                label: None,
+                limit: Some(limit),
+            },
+        )
+        .await
+        .unwrap();
+    }
     let first = pipeline::run_fetch(&config, &pool).await.unwrap();
     let second = pipeline::run_fetch(&config, &pool).await.unwrap();
     assert_eq!(first.sources, 3);
@@ -277,20 +294,6 @@ async fn fetch_dedupes_and_generates_digest() {
     assert_eq!(tweets.len() as i64, first.fetched);
     let markdown = digest::generate_digest(&pool, 0.1).await.unwrap();
     assert!(markdown.starts_with("# xFlow Digest"));
-}
-
-#[tokio::test]
-async fn fetch_seeds_sources_from_config_once() {
-    let (_dir, pool) = test_pool().await;
-    let config = AppConfig::default();
-    assert!(storage::list_sources(&pool, true).await.unwrap().is_empty());
-
-    let result = pipeline::run_fetch(&config, &pool).await.unwrap();
-    let sources = storage::list_sources(&pool, true).await.unwrap();
-
-    assert_eq!(result.sources, 3);
-    assert_eq!(result.failed, 0);
-    assert_eq!(sources.len(), 3);
 }
 
 #[tokio::test]

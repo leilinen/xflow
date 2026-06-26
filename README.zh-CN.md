@@ -67,10 +67,6 @@ fetch:
   fetcher: mock          # 改为 "x_web" 抓取真实数据
   source_delay_min_seconds: 60
   source_delay_max_seconds: 120
-sources:
-  accounts:
-    - username: openai
-      limit: 5
 agent:
   enabled: false         # 规则分析（默认关闭）
   importance_threshold: 0.45
