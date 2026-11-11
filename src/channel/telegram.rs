@@ -337,7 +337,10 @@ pub fn format_tweet_message(stored: &StoredTweet, translation: Option<&str>) -> 
 }
 
 /// Compact caption for photo/video (1024-char limit).
-pub fn format_tweet_caption(stored: &StoredTweet) -> String {
+/// Returns `None` when the tweet text does not fit the caption budget,
+/// signalling the caller to send a full text message instead of a
+/// truncated caption.
+pub fn format_tweet_caption(stored: &StoredTweet) -> Option<String> {
     let header = format!(
         "<b>{}</b> (@{})",
         html_escape(&stored.tweet.author_name),
@@ -351,17 +354,11 @@ pub fn format_tweet_caption(stored: &StoredTweet) -> String {
     let overhead = header.len() + sep.len() + sep.len() + footer.len();
     let budget = TELEGRAM_CAPTION_LIMIT.saturating_sub(overhead);
 
-    let mut text = html_escape(&stored.tweet.text);
+    let text = html_escape(&stored.tweet.text);
     if text.len() > budget {
-        text.truncate(text.floor_char_boundary(budget));
-        if let Some(pos) = text.rfind('&') {
-            if !text[pos..].contains(';') {
-                text.truncate(pos);
-            }
-        }
+        return None;
     }
-
-    [header, text, footer].join(sep)
+    Some([header, text, footer].join(sep))
 }
 
 /// Format a quoted/replied-to tweet as a block message.
@@ -582,6 +579,10 @@ impl TelegramChannel {
         reply_markup: Option<InlineKeyboardMarkup>,
         translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
+        // Captions cap at 1024 chars; when the text does not fit (or a
+        // translation must be shown, which captions do not carry), the full
+        // text follows as a separate reply after the media message.
+        let caption_fit = format_tweet_caption(tweet).is_some();
         let result = match self
             .try_send_media(
                 tweet,
@@ -601,14 +602,13 @@ impl TelegramChannel {
             }
         };
 
-        // If caption was truncated, send full text as a follow-up reply
-        let full_msg = format_tweet_message(tweet, translation);
-        let caption = format_tweet_caption(tweet);
-        if caption.len() < full_msg.len() {
+        let needs_full_text = !caption_fit || translation.is_some();
+        if needs_full_text {
+            let full_msg = format_tweet_message(tweet, translation);
             let reply_params =
                 extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
             let _ = self
-                .send_text_message(&full_msg, reply_params, true, None)
+                .send_text_message(&full_msg, reply_params, true, reply_markup)
                 .await;
         }
 
@@ -623,6 +623,9 @@ impl TelegramChannel {
         reply_markup: Option<InlineKeyboardMarkup>,
         translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
+        // When the text fits the caption budget, attach it to the media;
+        // otherwise send the media bare and let the caller follow up with
+        // the full text message.
         let caption = format_tweet_caption(tweet);
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
 
@@ -650,7 +653,7 @@ impl TelegramChannel {
             let payload = SendPhotoPayload {
                 chat_id: self.credentials.chat_id.clone(),
                 photo: url,
-                caption: Some(caption),
+                caption,
                 parse_mode: self.effective_parse_mode(),
                 reply_parameters: reply_params,
                 reply_markup,
@@ -672,7 +675,7 @@ impl TelegramChannel {
                     InputMedia {
                         type_: "photo".to_string(),
                         media: url,
-                        caption: if i == 0 { Some(caption.clone()) } else { None },
+                        caption: if i == 0 { caption.clone() } else { None },
                         parse_mode: if i == 0 {
                             self.effective_parse_mode()
                         } else {
@@ -698,7 +701,7 @@ impl TelegramChannel {
             let payload = SendVideoPayload {
                 chat_id: self.credentials.chat_id.clone(),
                 video: url,
-                caption: Some(caption),
+                caption,
                 parse_mode: self.effective_parse_mode(),
                 supports_streaming: Some(true),
                 reply_parameters: reply_params,
@@ -716,7 +719,7 @@ impl TelegramChannel {
             let video_payload = SendVideoPayload {
                 chat_id: self.credentials.chat_id.clone(),
                 video: url,
-                caption: Some(caption),
+                caption,
                 parse_mode: self.effective_parse_mode(),
                 supports_streaming: Some(true),
                 reply_parameters: reply_params.clone(),
@@ -1439,9 +1442,16 @@ mod tests {
     }
 
     #[test]
-    fn caption_fits_within_1024_chars() {
+    fn caption_returns_none_when_text_exceeds_budget() {
         let stored = make_stored(&"x".repeat(2000), json!({}));
         let caption = format_tweet_caption(&stored);
+        assert!(caption.is_none(), "oversized text must not be truncated");
+    }
+
+    #[test]
+    fn short_caption_fits_within_1024_chars() {
+        let stored = make_stored(&"x".repeat(800), json!({}));
+        let caption = format_tweet_caption(&stored).expect("800 chars should fit caption");
         assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
         assert!(caption.contains("<b>OpenAI</b> (@openai)"));
         assert!(caption.contains("Open tweet"));
@@ -1450,7 +1460,7 @@ mod tests {
     #[test]
     fn short_caption_not_truncated() {
         let stored = make_stored("hello world", json!({}));
-        let caption = format_tweet_caption(&stored);
+        let caption = format_tweet_caption(&stored).expect("short text should fit caption");
         assert!(caption.contains("hello world"));
         assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
     }
