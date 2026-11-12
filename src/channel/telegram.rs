@@ -385,7 +385,14 @@ enum TelegramSendError {
 
 // --- Message formatting ---
 
-pub fn format_tweet_message(stored: &StoredTweet, translation: Option<&str>) -> String {
+/// The inline "Open tweet" link is only added when the message carries no
+/// "Open on X" URL button (`include_tweet_link`): the button already links
+/// to the tweet itself, so the inline link would be redundant.
+pub fn format_tweet_message(
+    stored: &StoredTweet,
+    translation: Option<&str>,
+    include_tweet_link: bool,
+) -> String {
     let mut parts = vec![
         format!(
             "<b>{}</b> (@{}) · {} UTC+8",
@@ -401,41 +408,78 @@ pub fn format_tweet_message(stored: &StoredTweet, translation: Option<&str>) -> 
             parts.push(format!("<i>{}</i>", html_escape(t)));
         }
     }
-    let footer = format!(
-        "<a href=\"{}\">Open tweet</a>",
-        html_escape(&stored.tweet.url)
-    );
-    parts.push(footer);
-    let message = parts.join("\n\n");
+    let footer = tweet_link_footer(stored, include_tweet_link);
+    let message = join_parts(&parts, footer.as_deref());
     if message.len() <= TELEGRAM_MESSAGE_LIMIT {
         return message;
     }
-    truncate_message(parts, TELEGRAM_MESSAGE_LIMIT)
+    truncate_message(parts, footer.as_deref(), TELEGRAM_MESSAGE_LIMIT)
+}
+
+fn tweet_link_footer(stored: &StoredTweet, include: bool) -> Option<String> {
+    include.then(|| {
+        format!(
+            "<a href=\"{}\">Open tweet</a>",
+            html_escape(&stored.tweet.url)
+        )
+    })
+}
+
+fn join_parts(parts: &[String], footer: Option<&str>) -> String {
+    let sep = "\n\n";
+    match footer {
+        Some(footer) => {
+            let mut all = parts.to_vec();
+            all.push(footer.to_string());
+            all.join(sep)
+        }
+        None => parts.join(sep),
+    }
 }
 
 /// Compact caption for photo/video (1024-char limit).
 /// Returns `None` when the tweet text does not fit the caption budget,
 /// signalling the caller to send a full text message instead of a
 /// truncated caption.
-pub fn format_tweet_caption(stored: &StoredTweet) -> Option<String> {
+pub fn format_tweet_caption(stored: &StoredTweet, include_tweet_link: bool) -> Option<String> {
     let header = format!(
         "<b>{}</b> (@{})",
         html_escape(&stored.tweet.author_name),
         html_escape(&stored.tweet.author_username)
     );
-    let footer = format!(
-        "<a href=\"{}\">Open tweet</a>",
-        html_escape(&stored.tweet.url)
-    );
+    let footer = tweet_link_footer(stored, include_tweet_link);
     let sep = "\n\n";
-    let overhead = header.len() + sep.len() + sep.len() + footer.len();
+    let footer_overhead = footer.as_ref().map(|f| f.len() + sep.len()).unwrap_or(0);
+    let overhead = header.len() + sep.len() + footer_overhead;
     let budget = TELEGRAM_CAPTION_LIMIT.saturating_sub(overhead);
 
     let text = html_escape(&stored.tweet.text);
     if text.len() > budget {
         return None;
     }
-    Some([header, text, footer].join(sep))
+    Some(join_parts(&[header, text], footer.as_deref()))
+}
+
+/// Media groups (albums) cannot carry an inline keyboard, so their caption
+/// must keep the inline tweet link even when the comment buttons are enabled.
+fn caption_needs_tweet_link(media: &[TweetMedium], has_button: bool) -> bool {
+    if !has_button {
+        return true;
+    }
+    let photos = media
+        .iter()
+        .filter(|m| matches!(m, TweetMedium::Photo { .. }))
+        .count();
+    let videos = media
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                TweetMedium::Video { .. } | TweetMedium::AnimatedGif { .. }
+            )
+        })
+        .count();
+    photos > 1 && videos == 0
 }
 
 /// Format a quoted/replied-to tweet as a block message.
@@ -469,7 +513,11 @@ fn format_reply_context_message(reply_ctx: &ReplyContext) -> Option<String> {
 }
 
 /// Format article message.
-fn format_article_message(stored: &StoredTweet, article: &ArticleContent) -> String {
+fn format_article_message(
+    stored: &StoredTweet,
+    article: &ArticleContent,
+    include_tweet_link: bool,
+) -> String {
     let header = format!(
         "<b>{}</b> (@{}) · {} UTC+8 · [Article]",
         html_escape(&stored.tweet.author_name),
@@ -490,39 +538,36 @@ fn format_article_message(stored: &StoredTweet, article: &ArticleContent) -> Str
         parts.push(html_escape(&stored.tweet.text));
     }
 
-    // Footer with both article link and tweet link
-    let mut footer = String::new();
-    footer.push_str(&format!(
-        "<a href=\"{}\">Open article</a>",
-        html_escape(&article.url)
-    ));
-    footer.push_str(&format!(
-        " · <a href=\"{}\">Open tweet</a>",
-        html_escape(&stored.tweet.url)
-    ));
-    parts.push(footer);
+    // Footer with the article link; the tweet link is only added when the
+    // message carries no "Open on X" button pointing at the tweet.
+    let mut footer = format!("<a href=\"{}\">Open article</a>", html_escape(&article.url));
+    if include_tweet_link {
+        footer.push_str(&format!(
+            " · <a href=\"{}\">Open tweet</a>",
+            html_escape(&stored.tweet.url)
+        ));
+    }
 
-    let message = parts.join("\n\n");
+    let message = join_parts(&parts, Some(&footer));
     if message.len() <= TELEGRAM_MESSAGE_LIMIT {
         return message;
     }
     // Truncate: keep header + truncated text + footer
-    truncate_message(parts, TELEGRAM_MESSAGE_LIMIT)
+    truncate_message(parts, Some(&footer), TELEGRAM_MESSAGE_LIMIT)
 }
 
 /// Truncate by removing middle parts (summary, tags) before the footer,
 /// then truncating the tweet text if still too long.
-fn truncate_message(mut parts: Vec<String>, limit: usize) -> String {
-    // Footer is always the last part and must be preserved.
-    let footer = parts.pop().unwrap_or_default();
-    // Build the skeleton: header + text + marker + footer
-    // Drop middle parts (summary, tags).
+fn truncate_message(parts: Vec<String>, footer: Option<&str>, limit: usize) -> String {
+    // Build the skeleton: header + text + marker (+ footer when present).
+    // Drop middle parts (summary, tags, translation).
     let header = parts.first().cloned().unwrap_or_default();
     let mut text = parts.get(1).cloned().unwrap_or_default();
     let marker = TRUNCATION_MARKER.to_string();
     let sep = "\n\n";
-    // Calculate overhead: header + sep + marker + sep + footer + sep
-    let overhead = header.len() + sep.len() + marker.len() + sep.len() + footer.len() + sep.len();
+    // Calculate overhead: header + sep + text + sep + marker + sep + footer
+    let footer_overhead = footer.map(|f| f.len() + sep.len()).unwrap_or(0);
+    let overhead = header.len() + sep.len() + marker.len() + sep.len() + footer_overhead;
     let budget = limit.saturating_sub(overhead);
     if text.len() > budget {
         text.truncate(text.floor_char_boundary(budget));
@@ -533,7 +578,11 @@ fn truncate_message(mut parts: Vec<String>, limit: usize) -> String {
             }
         }
     }
-    [header, text, marker, footer].join(sep)
+    let mut out = vec![header, text, marker];
+    if let Some(footer) = footer {
+        out.push(footer.to_string());
+    }
+    out.join(sep)
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -656,10 +705,14 @@ impl TelegramChannel {
         reply_markup: Option<InlineKeyboardMarkup>,
         translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
+        // The "Open on X" button already links to the tweet, so the inline
+        // "Open tweet" link is only kept where that button cannot be shown.
+        let has_open_button = reply_markup.is_some();
         // Captions cap at 1024 chars; when the text does not fit (or a
         // translation must be shown, which captions do not carry), the full
         // text follows as a separate reply after the media message.
-        let caption_fit = format_tweet_caption(tweet).is_some();
+        let caption_fit =
+            format_tweet_caption(tweet, caption_needs_tweet_link(media, has_open_button)).is_some();
         let result = match self
             .try_send_media(
                 tweet,
@@ -681,7 +734,7 @@ impl TelegramChannel {
 
         let needs_full_text = !caption_fit || translation.is_some();
         if needs_full_text {
-            let full_msg = format_tweet_message(tweet, translation);
+            let full_msg = format_tweet_message(tweet, translation, !has_open_button);
             let reply_params =
                 extract_message_id(&result).map(|id| ReplyParameters { message_id: id });
             let _ = self
@@ -703,7 +756,10 @@ impl TelegramChannel {
         // When the text fits the caption budget, attach it to the media;
         // otherwise send the media bare and let the caller follow up with
         // the full text message.
-        let caption = format_tweet_caption(tweet);
+        let caption = format_tweet_caption(
+            tweet,
+            caption_needs_tweet_link(media, reply_markup.is_some()),
+        );
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
 
         // Separate photos and videos
@@ -846,7 +902,7 @@ impl TelegramChannel {
         reply_to_msg_id: Option<i64>,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let text = format_article_message(tweet, article);
+        let text = format_article_message(tweet, article, reply_markup.is_none());
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, false, reply_markup)
             .await
@@ -861,7 +917,7 @@ impl TelegramChannel {
         reply_markup: Option<InlineKeyboardMarkup>,
         translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let text = format_tweet_message(tweet, translation);
+        let text = format_tweet_message(tweet, translation, reply_markup.is_none());
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(&text, reply_params, false, reply_markup)
             .await
@@ -875,7 +931,7 @@ impl TelegramChannel {
         reply_markup: Option<InlineKeyboardMarkup>,
         translation: Option<&str>,
     ) -> Result<ChannelSendReceipt, super::DeliveryError> {
-        let text = format_tweet_message(tweet, translation);
+        let text = format_tweet_message(tweet, translation, reply_markup.is_none());
         let reply_params = reply_to_msg_id.map(|id| ReplyParameters { message_id: id });
         self.send_text_message(
             &text,
@@ -1402,7 +1458,7 @@ mod tests {
                 raw: json!({}),
             },
         };
-        let message = format_tweet_message(&stored, None);
+        let message = format_tweet_message(&stored, None, true);
         assert!(message.contains("AI &lt;agent&gt; &amp; update"));
         assert!(message.contains("x=1&amp;y=2"));
     }
@@ -1471,7 +1527,7 @@ mod tests {
                 raw: json!({}),
             },
         };
-        let message = format_tweet_message(&stored, None);
+        let message = format_tweet_message(&stored, None, true);
         assert!(message.len() <= TELEGRAM_MESSAGE_LIMIT);
         assert!(message.contains("<b>OpenAI</b> (@openai)"));
         assert!(message.contains("Open tweet"));
@@ -1494,7 +1550,7 @@ mod tests {
                 raw: json!({}),
             },
         };
-        let message = format_tweet_message(&stored, None);
+        let message = format_tweet_message(&stored, None, true);
         assert!(!message.contains(TRUNCATION_MARKER.trim()));
         assert!(message.contains("Short tweet"));
     }
@@ -1502,7 +1558,7 @@ mod tests {
     #[test]
     fn format_tweet_message_with_translation() {
         let stored = make_stored("Hello world from OpenAI!", json!({}));
-        let message = format_tweet_message(&stored, Some("来自OpenAI的你好世界！"));
+        let message = format_tweet_message(&stored, Some("来自OpenAI的你好世界！"), true);
         assert!(message.contains("Hello world from OpenAI!"));
         assert!(message.contains("----------"));
         assert!(message.contains("<i>来自OpenAI的你好世界！</i>"));
@@ -1512,23 +1568,101 @@ mod tests {
     #[test]
     fn format_tweet_message_without_translation() {
         let stored = make_stored("Hello world from OpenAI!", json!({}));
-        let message = format_tweet_message(&stored, None);
+        let message = format_tweet_message(&stored, None, true);
         assert!(message.contains("Hello world from OpenAI!"));
         assert!(!message.contains("----------"));
         assert!(message.contains("Open tweet"));
     }
 
     #[test]
+    fn tweet_message_drops_inline_link_when_open_button_is_present() {
+        let stored = make_stored("Hello world from OpenAI!", json!({}));
+        let message = format_tweet_message(&stored, None, false);
+        assert!(message.contains("Hello world from OpenAI!"));
+        assert!(!message.contains("Open tweet"));
+    }
+
+    #[test]
+    fn truncated_message_drops_inline_link_when_open_button_is_present() {
+        let stored = make_stored(&"A".repeat(5000), json!({}));
+        let message = format_tweet_message(&stored, None, false);
+        assert!(message.len() <= TELEGRAM_MESSAGE_LIMIT);
+        assert!(message.contains(TRUNCATION_MARKER.trim()));
+        assert!(!message.contains("Open tweet"));
+    }
+
+    #[test]
+    fn caption_drops_inline_link_when_open_button_is_present() {
+        let stored = make_stored("hello world", json!({}));
+        let caption = format_tweet_caption(&stored, false).expect("short text should fit caption");
+        assert!(caption.contains("hello world"));
+        assert!(!caption.contains("Open tweet"));
+    }
+
+    #[test]
+    fn album_caption_keeps_link_but_single_media_caption_does_not() {
+        // sendMediaGroup carries no inline keyboard, so an album caption is the
+        // only way back to the tweet; single photo/video posts have the button.
+        let album = vec![
+            TweetMedium::Photo {
+                url: "https://cdn/1.jpg".to_string(),
+            },
+            TweetMedium::Photo {
+                url: "https://cdn/2.jpg".to_string(),
+            },
+        ];
+        assert!(caption_needs_tweet_link(&album, true));
+
+        let photo = vec![TweetMedium::Photo {
+            url: "https://cdn/1.jpg".to_string(),
+        }];
+        assert!(!caption_needs_tweet_link(&photo, true));
+        assert!(caption_needs_tweet_link(&photo, false));
+
+        let video_with_photo = vec![
+            TweetMedium::Video {
+                url: "https://cdn/1.mp4".to_string(),
+            },
+            TweetMedium::Photo {
+                url: "https://cdn/2.jpg".to_string(),
+            },
+        ];
+        assert!(!caption_needs_tweet_link(&video_with_photo, true));
+    }
+
+    #[test]
+    fn open_on_x_button_links_the_tweet_not_the_comments() {
+        let markup = comment_button_markup("1871234567890123456");
+        let buttons = markup.inline_keyboard.concat();
+        let open = buttons
+            .iter()
+            .find(|button| button.text.contains("Open on X"))
+            .expect("Open on X button");
+        assert_eq!(
+            open.url.as_deref(),
+            Some("https://x.com/i/status/1871234567890123456")
+        );
+        let comments = buttons
+            .iter()
+            .find(|button| button.callback_data.is_some())
+            .expect("comments button");
+        assert_eq!(
+            comments.callback_data.as_deref(),
+            Some("comments:1871234567890123456")
+        );
+    }
+
+    #[test]
     fn caption_returns_none_when_text_exceeds_budget() {
         let stored = make_stored(&"x".repeat(2000), json!({}));
-        let caption = format_tweet_caption(&stored);
+        let caption = format_tweet_caption(&stored, true);
         assert!(caption.is_none(), "oversized text must not be truncated");
     }
 
     #[test]
     fn short_caption_fits_within_1024_chars() {
         let stored = make_stored(&"x".repeat(800), json!({}));
-        let caption = format_tweet_caption(&stored).expect("800 chars should fit caption");
+        let caption = format_tweet_caption(&stored, true).expect("800 chars should fit caption");
         assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
         assert!(caption.contains("<b>OpenAI</b> (@openai)"));
         assert!(caption.contains("Open tweet"));
@@ -1537,7 +1671,7 @@ mod tests {
     #[test]
     fn short_caption_not_truncated() {
         let stored = make_stored("hello world", json!({}));
-        let caption = format_tweet_caption(&stored).expect("short text should fit caption");
+        let caption = format_tweet_caption(&stored, true).expect("short text should fit caption");
         assert!(caption.contains("hello world"));
         assert!(caption.len() <= TELEGRAM_CAPTION_LIMIT);
     }
@@ -1577,12 +1711,25 @@ mod tests {
             title: Some("My Article Title".to_string()),
             text: Some("Full article text here.".to_string()),
         };
-        let msg = format_article_message(&stored, &article);
+        let msg = format_article_message(&stored, &article, true);
         assert!(msg.contains("[Article]"));
         assert!(msg.contains("My Article Title"));
         assert!(msg.contains("Full article text here."));
         assert!(msg.contains("Open article"));
         assert!(msg.contains("Open tweet"));
+    }
+
+    #[test]
+    fn article_message_drops_tweet_link_when_open_button_is_present() {
+        let stored = make_stored("check this article", json!({}));
+        let article = ArticleContent {
+            url: "https://x.com/i/article/123".to_string(),
+            title: Some("My Article Title".to_string()),
+            text: Some("Full article text here.".to_string()),
+        };
+        let msg = format_article_message(&stored, &article, false);
+        assert!(msg.contains("Open article"));
+        assert!(!msg.contains("Open tweet"));
     }
 
     #[test]
