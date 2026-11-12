@@ -500,11 +500,24 @@ async fn handle_callback_query(
             return;
         }
 
+        // The pressed channel post is NOT the viewer message (editing a media
+        // post is impossible anyway). `comments:` first renders always send a
+        // NEW viewer message; `cv:` actions carry the viewer's own message id
+        // in callback data semantics and edit in place via the same rule:
+        // the viewer message is the one this bot sent earlier, which we track
+        // in the viewer state cache keyed by (chat, pressed message).
+        tracing::info!(
+            user_id = ?from_id,
+            chat_id = msg.chat.id,
+            pressed_message_id = msg.message_id,
+            view = %data,
+            "comment viewer callback received"
+        );
         let ctx = CallbackContext {
             callback_query_id: &callback.id,
             from_id,
             chat_id: msg.chat.id,
-            message_id: Some(msg.message_id),
+            pressed_message_id: Some(msg.message_id),
         };
 
         // First press: answer AFTER the (possibly slow) X fetch so the client
@@ -814,7 +827,9 @@ struct CallbackContext<'a> {
     /// The user who pressed the button (Telegram `from.id`), when present.
     from_id: Option<i64>,
     chat_id: i64,
-    message_id: Option<i64>,
+    /// The message the button is attached to (the channel post), never the
+    /// viewer message itself.
+    pressed_message_id: Option<i64>,
 }
 
 /// Per-tweet in-memory comment cache with TTL, avoiding repeated X API calls
@@ -1037,10 +1052,54 @@ async fn fetch_replies_cached(
     Ok(replies)
 }
 
+/// Binds each channel post to the viewer message this bot opened for it, so
+/// later presses edit the viewer in place instead of spawning duplicates.
+/// Keyed by (chat_id, pressed_message_id); bounded and TTL-expired.
+fn viewer_state_cache() -> &'static Mutex<std::collections::HashMap<(i64, i64), ViewerStateEntry>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(i64, i64), ViewerStateEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Viewer message id + the instant it was bound.
+type ViewerStateEntry = (i64, std::time::Instant);
+
+const VIEWER_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const VIEWER_STATE_MAX: usize = 256;
+
+fn viewer_state_get(chat_id: i64, pressed_message_id: i64) -> Option<i64> {
+    let mut cache = viewer_state_cache().lock().ok()?;
+    let entry = cache.get_mut(&(chat_id, pressed_message_id))?;
+    if entry.1.elapsed() > VIEWER_STATE_TTL {
+        cache.remove(&(chat_id, pressed_message_id));
+        return None;
+    }
+    Some(entry.0)
+}
+
+fn viewer_state_put(chat_id: i64, pressed_message_id: i64, viewer_message_id: i64) {
+    let Ok(mut cache) = viewer_state_cache().lock() else {
+        return;
+    };
+    if cache.len() >= VIEWER_STATE_MAX && !cache.contains_key(&(chat_id, pressed_message_id)) {
+        if let Some(oldest) = cache.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        (chat_id, pressed_message_id),
+        (viewer_message_id, std::time::Instant::now()),
+    );
+}
+
 /// Where the comment viewer renders and whether it edits an existing message.
+#[derive(Default)]
 struct ViewerTarget<'a> {
     chat_id: &'a str,
+    /// Existing viewer message to edit in place; None = send a new one.
     message_id: Option<i64>,
+    /// Filled by `render_into` when a fresh viewer message was sent.
+    last_sent_message_id: Option<i64>,
 }
 
 /// Entry point for `comments:` (legacy button) and `cv:` callbacks.
@@ -1054,59 +1113,109 @@ async fn handle_comments_view(
     callback: &CallbackContext<'_>,
     view: CommentsView,
 ) {
+    // A viewer message exists only if this bot already sent one for the
+    // pressed channel post. First press sends a fresh viewer message; later
+    // `cv:` presses edit that viewer message in place.
+    let viewer_message_id = callback
+        .pressed_message_id
+        .and_then(|pressed| viewer_state_get(callback.chat_id, pressed));
+
     // Show the viewer in the user's private chat when known, so the channel
     // stays clean; fall back to the chat the button was pressed in.
-    let target_chat_id = match callback.from_id {
+    let (target_chat_id, answered_notice) = match callback.from_id {
         Some(user_id) => {
             let user_chat = user_id.to_string();
-            match telegram::check_private_chat_readable(client, bot_token, &user_chat).await {
-                true => user_chat,
-                false => {
-                    // User has not started the bot: guide them, then fall back.
-                    let _ = answer_callback_query_with_text(
-                        client,
-                        bot_token,
-                        callback.callback_query_id,
-                        Some("先在私聊中 /start 本 bot 即可在私聊查看评论；此次在当前聊天展示。"),
-                    )
-                    .await;
-                    callback.chat_id.to_string()
+            match telegram::send_private_probe(client, bot_token, &user_chat).await {
+                Ok(()) => (user_chat, None),
+                Err(_) => {
+                    // User has not started the bot (or blocked it): guide and
+                    // fall back to the current chat.
+                    let notice =
+                        "先在私聊中 /start 本 bot 即可在私聊查看评论；此次在当前聊天展示。";
+                    (callback.chat_id.to_string(), Some(notice.to_string()))
                 }
             }
         }
-        None => callback.chat_id.to_string(),
+        None => (callback.chat_id.to_string(), None),
     };
 
-    let target = ViewerTarget {
+    let mut target = ViewerTarget {
         chat_id: &target_chat_id,
-        message_id: callback.message_id,
+        message_id: viewer_message_id,
+        last_sent_message_id: None,
     };
 
     let result = match &view {
         CommentsView::Page { tweet_id, page } => {
-            render_comment_page(config, pool, client, bot_token, &target, tweet_id, *page).await
+            render_comment_page(
+                config,
+                pool,
+                client,
+                bot_token,
+                &mut target,
+                tweet_id,
+                *page,
+            )
+            .await
         }
         CommentsView::Replies {
             tweet_id,
             comment_id,
         } => {
             render_replies_view(
-                config, pool, client, bot_token, &target, tweet_id, comment_id,
+                config,
+                pool,
+                client,
+                bot_token,
+                &mut target,
+                tweet_id,
+                comment_id,
             )
             .await
         }
     };
 
-    if let Err(err) = result {
-        tracing::warn!(?err, "comment viewer failed");
-        // Anti-silence: surface the failure as an editable message update or
-        // a plain message in the target chat.
-        let text = format!("评论加载失败：{err}");
-        if let Some(message_id) = target.message_id {
-            let _ =
-                edit_message_text(client, bot_token, target.chat_id, message_id, &text, None).await;
-        } else {
-            let _ = send_reply(client, bot_token, target.chat_id, &text).await;
+    // Answer the callback query: with the fallback notice when present, so
+    // the user always learns where the viewer opened.
+    match &answered_notice {
+        Some(notice) => {
+            let _ = answer_callback_query_with_text(
+                client,
+                bot_token,
+                callback.callback_query_id,
+                Some(notice),
+            )
+            .await;
+        }
+        None => {
+            let _ = answer_callback_query(client, bot_token, callback.callback_query_id).await;
+        }
+    }
+
+    match &result {
+        Ok((_text, _markup)) => {
+            // First successful render: bind the new viewer message to the
+            // pressed channel post so later presses edit in place.
+            if viewer_message_id.is_none() {
+                if let (Some(pressed), Some(sent)) =
+                    (callback.pressed_message_id, target.last_sent_message_id)
+                {
+                    viewer_state_put(callback.chat_id, pressed, sent);
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(?err, "comment viewer failed");
+            // Anti-silence: surface the failure as an editable message update or
+            // a plain message in the target chat.
+            let text = format!("评论加载失败：{err}");
+            if let Some(message_id) = viewer_message_id {
+                let _ =
+                    edit_message_text(client, bot_token, &target_chat_id, message_id, &text, None)
+                        .await;
+            } else {
+                let _ = send_reply(client, bot_token, &target_chat_id, &text).await;
+            }
         }
     }
 }
@@ -1118,7 +1227,7 @@ async fn render_comment_page(
     pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
-    target: &ViewerTarget<'_>,
+    target: &mut ViewerTarget<'_>,
     tweet_id: &str,
     page: usize,
 ) -> RenderResult {
@@ -1179,7 +1288,7 @@ async fn render_replies_view(
     pool: &PgPool,
     client: &reqwest::Client,
     bot_token: &str,
-    target: &ViewerTarget<'_>,
+    target: &mut ViewerTarget<'_>,
     tweet_id: &str,
     comment_id: &str,
 ) -> RenderResult {

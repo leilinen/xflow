@@ -245,26 +245,31 @@ pub fn load_bot_token(config: &TelegramConfig) -> anyhow::Result<String> {
     Ok(bot_token)
 }
 
-/// Best-effort check that the bot can deliver a message to the given chat
-/// (used to detect whether a user has started the bot before sending the
-/// comment viewer to their private chat).
-pub async fn check_private_chat_readable(client: &Client, bot_token: &str, chat_id: &str) -> bool {
-    #[derive(Debug, serde::Deserialize)]
-    struct TelegramResponse {
-        ok: bool,
-    }
+/// Probe whether the bot can open the user's private chat. `getChat` is not
+/// reliable for this (it resolves ids the bot cannot message), so this
+/// actually sends a silent message: Ok = the private chat works, Err = the
+/// user has not started the bot or has blocked it.
+pub async fn send_private_probe(
+    client: &Client,
+    bot_token: &str,
+    chat_id: &str,
+) -> anyhow::Result<()> {
     let response = client
-        .post(telegram_api_url(bot_token, "getChat"))
-        .json(&serde_json::json!({ "chat_id": chat_id }))
+        .post(telegram_api_url(bot_token, "sendMessage"))
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": "✅ 私聊通道已连通。之后按频道里的“💬 X 评论”，评论区会打开在这里。",
+            "disable_notification": true,
+        }))
         .send()
-        .await;
-    match response {
-        Ok(resp) => matches!(
-            resp.json::<TelegramResponse>().await,
-            Ok(TelegramResponse { ok: true })
-        ),
-        Err(_) => false,
+        .await?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
     }
+    let body = response.text().await.unwrap_or_default();
+    anyhow::bail!("probe sendMessage failed: {status} {body}")
 }
 
 pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
