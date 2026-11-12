@@ -1126,10 +1126,17 @@ async fn handle_comments_view(
         Some(user_id) => {
             let user_chat = user_id.to_string();
             match telegram::send_private_probe(client, bot_token, &user_chat).await {
-                Ok(()) => (user_chat, None),
-                Err(_) => {
+                Ok(()) => {
+                    tracing::debug!(
+                        user_id,
+                        "private chat probe ok, viewer opens in private chat"
+                    );
+                    (user_chat, None)
+                }
+                Err(err) => {
                     // User has not started the bot (or blocked it): guide and
                     // fall back to the current chat.
+                    tracing::warn!(?err, user_id, "private chat probe failed, falling back");
                     let notice =
                         "先在私聊中 /start 本 bot 即可在私聊查看评论；此次在当前聊天展示。";
                     (callback.chat_id.to_string(), Some(notice.to_string()))
@@ -1312,7 +1319,7 @@ async fn render_replies_view(
 async fn render_into(
     client: &reqwest::Client,
     bot_token: &str,
-    target: &ViewerTarget<'_>,
+    target: &mut ViewerTarget<'_>,
     text: &str,
     markup: &telegram::InlineKeyboardMarkup,
 ) {
@@ -1329,8 +1336,16 @@ async fn render_into(
             .await;
         }
         None => {
-            let _ =
-                send_viewer_message(client, bot_token, target.chat_id, text, Some(markup)).await;
+            match send_viewer_message(client, bot_token, target.chat_id, text, Some(markup)).await {
+                Ok(sent_id) => target.last_sent_message_id = Some(sent_id),
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        chat_id = %target.chat_id,
+                        "failed to send viewer message"
+                    )
+                }
+            }
         }
     }
 }
