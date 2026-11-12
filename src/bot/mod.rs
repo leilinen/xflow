@@ -1052,6 +1052,44 @@ async fn fetch_replies_cached(
     Ok(replies)
 }
 
+/// Per-user result of the private-chat probe, so the silent probe message is
+/// sent at most once per user per TTL window instead of on every press.
+fn probe_cache() -> &'static Mutex<std::collections::HashMap<i64, std::time::Instant>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<i64, std::time::Instant>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const PROBE_CACHE_MAX: usize = 256;
+
+fn probe_recently_ok(user_id: i64) -> bool {
+    let mut cache = probe_cache().lock().ok();
+    let Some(cache) = cache.as_mut() else {
+        return false;
+    };
+    match cache.get(&user_id) {
+        Some(at) if at.elapsed() <= PROBE_TTL => true,
+        Some(_) => {
+            cache.remove(&user_id);
+            false
+        }
+        None => false,
+    }
+}
+
+fn probe_mark_ok(user_id: i64) {
+    let Ok(mut cache) = probe_cache().lock() else {
+        return;
+    };
+    if cache.len() >= PROBE_CACHE_MAX && !cache.contains_key(&user_id) {
+        if let Some(oldest) = cache.iter().min_by_key(|(_, at)| *at).map(|(k, _)| *k) {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(user_id, std::time::Instant::now());
+}
+
 /// Binds each channel post to the viewer message this bot opened for it, so
 /// later presses edit the viewer in place instead of spawning duplicates.
 /// Keyed by (chat_id, pressed_message_id); bounded and TTL-expired.
@@ -1121,12 +1159,16 @@ async fn handle_comments_view(
         .and_then(|pressed| viewer_state_get(callback.chat_id, pressed));
 
     // Show the viewer in the user's private chat when known, so the channel
-    // stays clean; fall back to the chat the button was pressed in.
+    // stays clean; fall back to the chat the button was pressed in. The
+    // probe (a silent, immediately-deleted message) runs at most once per
+    // user per TTL window.
     let (target_chat_id, answered_notice) = match callback.from_id {
+        Some(user_id) if probe_recently_ok(user_id) => (user_id.to_string(), None),
         Some(user_id) => {
             let user_chat = user_id.to_string();
             match telegram::send_private_probe(client, bot_token, &user_chat).await {
                 Ok(()) => {
+                    probe_mark_ok(user_id);
                     tracing::debug!(
                         user_id,
                         "private chat probe ok, viewer opens in private chat"

@@ -248,28 +248,54 @@ pub fn load_bot_token(config: &TelegramConfig) -> anyhow::Result<String> {
 /// Probe whether the bot can open the user's private chat. `getChat` is not
 /// reliable for this (it resolves ids the bot cannot message), so this
 /// actually sends a silent message: Ok = the private chat works, Err = the
-/// user has not started the bot or has blocked it.
+/// user has not started the bot or has blocked it. The probe message is
+/// deleted immediately after success — the user only sees the viewer itself.
 pub async fn send_private_probe(
     client: &Client,
     bot_token: &str,
     chat_id: &str,
 ) -> anyhow::Result<()> {
+    #[derive(Debug, serde::Deserialize)]
+    struct MessageResult {
+        message_id: i64,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct TelegramResponse {
+        ok: bool,
+        result: Option<MessageResult>,
+    }
+
     let response = client
         .post(telegram_api_url(bot_token, "sendMessage"))
         .json(&serde_json::json!({
             "chat_id": chat_id,
-            "text": "✅ 私聊通道已连通。之后按频道里的“💬 X 评论”，评论区会打开在这里。",
+            "text": "💬 评论区将打开在这里。",
             "disable_notification": true,
         }))
         .send()
         .await?;
 
     let status = response.status();
-    if status.is_success() {
-        return Ok(());
+    let body: TelegramResponse = response.json().await.unwrap_or(TelegramResponse {
+        ok: false,
+        result: None,
+    });
+    if !status.is_success() || !body.ok {
+        anyhow::bail!("probe sendMessage failed: {status}");
     }
-    let body = response.text().await.unwrap_or_default();
-    anyhow::bail!("probe sendMessage failed: {status} {body}")
+
+    // Withdraw the probe so the private chat stays clean.
+    if let Some(message) = body.result {
+        let _ = client
+            .post(telegram_api_url(bot_token, "deleteMessage"))
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message.message_id,
+            }))
+            .send()
+            .await;
+    }
+    Ok(())
 }
 
 pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
