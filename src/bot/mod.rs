@@ -39,6 +39,8 @@ struct TelegramChat {
 
 #[derive(Debug, Deserialize)]
 struct TelegramUser {
+    #[serde(default)]
+    id: i64,
     first_name: String,
     #[serde(default)]
     last_name: Option<String>,
@@ -417,65 +419,6 @@ async fn send_reply(
     Ok(())
 }
 
-async fn send_reply_get_id(
-    client: &reqwest::Client,
-    bot_token: &str,
-    chat_id: &str,
-    text: &str,
-) -> anyhow::Result<i64> {
-    #[derive(Debug, serde::Serialize)]
-    struct SendMessagePayload {
-        chat_id: String,
-        text: String,
-        parse_mode: String,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct MessageResult {
-        message_id: i64,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    struct TelegramResponse {
-        ok: bool,
-        #[serde(default)]
-        description: Option<String>,
-        result: Option<MessageResult>,
-    }
-
-    let text = if text.len() > 4096 {
-        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
-    } else {
-        text.to_string()
-    };
-
-    let response = client
-        .post(telegram::telegram_api_url(bot_token, "sendMessage"))
-        .json(&SendMessagePayload {
-            chat_id: chat_id.to_string(),
-            text,
-            parse_mode: "HTML".to_string(),
-        })
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body: TelegramResponse = response.json().await.unwrap_or(TelegramResponse {
-        ok: false,
-        description: Some(format!("invalid response with status {status}")),
-        result: None,
-    });
-    if !body.ok {
-        anyhow::bail!(
-            "sendMessage failed: {} - {}",
-            status,
-            body.description.unwrap_or_default()
-        );
-    }
-    body.result
-        .map(|r| r.message_id)
-        .ok_or_else(|| anyhow::anyhow!("sendMessage returned no result"))
-}
-
 // --- Callback query handling ---
 
 async fn handle_callback_query(
@@ -485,11 +428,15 @@ async fn handle_callback_query(
     bot_token: &str,
     callback: TelegramCallbackQuery,
 ) {
-    // Always answer the callback to remove the loading spinner
-    let _ = answer_callback_query(client, bot_token, &callback.id).await;
-
-    let Some(data) = &callback.data else { return };
-    let Some(msg) = &callback.message else { return };
+    let Some(data) = &callback.data else {
+        // Still answer so the client spinner does not hang.
+        let _ = answer_callback_query(client, bot_token, &callback.id).await;
+        return;
+    };
+    let Some(msg) = &callback.message else {
+        let _ = answer_callback_query(client, bot_token, &callback.id).await;
+        return;
+    };
 
     if let Some(rest) = data.strip_prefix("latest:") {
         // Parse username:page
@@ -503,6 +450,8 @@ async fn handle_callback_query(
             Err(_) => return,
         };
 
+        // Always answer the callback to remove the loading spinner
+        let _ = answer_callback_query(client, bot_token, &callback.id).await;
         handle_latest_callback(config, pool, client, bot_token, msg, &username, page).await;
     } else if let Some(rest) = data.strip_prefix("latest_more:") {
         // Parse username:current_page — trigger backfill then show next page
@@ -516,6 +465,7 @@ async fn handle_callback_query(
             Err(_) => return,
         };
 
+        let _ = answer_callback_query(client, bot_token, &callback.id).await;
         handle_latest_more_callback(
             config,
             pool,
@@ -526,17 +476,60 @@ async fn handle_callback_query(
             current_page,
         )
         .await;
-    } else if let Some(rest) = data.strip_prefix("comments:") {
-        let parts: Vec<&str> = rest.splitn(2, ':').collect();
-        let tweet_id = parts[0];
-        let page: usize = if parts.len() > 1 {
-            parts[1].parse().unwrap_or(1).max(1)
+    } else if let Some(view) = data
+        .strip_prefix("comments:")
+        .and_then(parse_legacy_comments_data)
+        .or_else(|| parse_comments_view(data))
+    {
+        // Comment viewer: enforce the on-demand fetch allowlist before any
+        // X API traffic.
+        let allowed = fetch_allowed_users();
+        let from_id = if callback.from.id != 0 {
+            Some(callback.from.id)
         } else {
-            1
+            None
+        };
+        if !allowed.is_empty() && !from_id.map(|id| allowed.contains(&id)).unwrap_or(false) {
+            let _ = answer_callback_query_with_text(
+                client,
+                bot_token,
+                &callback.id,
+                Some("当前账号无权触发评论拉取。"),
+            )
+            .await;
+            return;
+        }
+
+        let ctx = CallbackContext {
+            callback_query_id: &callback.id,
+            from_id,
+            chat_id: msg.chat.id,
+            message_id: Some(msg.message_id),
         };
 
-        handle_comments_callback(config, pool, client, bot_token, msg, tweet_id, page).await;
+        // First press: answer AFTER the (possibly slow) X fetch so the client
+        // spinner stays until content is ready; the answer also carries the
+        // friendly notice for fallback cases.
+        handle_comments_view(config, pool, client, bot_token, &ctx, view).await;
+    } else {
+        let _ = answer_callback_query(client, bot_token, &callback.id).await;
     }
+}
+
+/// `comments:{tweet_id}` or `comments:{tweet_id}:{page}` — the legacy
+/// discussion-group button format, now routed to the inline viewer.
+fn parse_legacy_comments_data(rest: &str) -> Option<CommentsView> {
+    let mut parts = rest.splitn(2, ':');
+    let tweet_id = parts.next()?.to_string();
+    if tweet_id.is_empty() {
+        return None;
+    }
+    let page = parts
+        .next()
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    Some(CommentsView::Page { tweet_id, page })
 }
 
 async fn answer_callback_query(
@@ -544,14 +537,26 @@ async fn answer_callback_query(
     bot_token: &str,
     callback_query_id: &str,
 ) -> anyhow::Result<()> {
+    answer_callback_query_with_text(client, bot_token, callback_query_id, None).await
+}
+
+async fn answer_callback_query_with_text(
+    client: &reqwest::Client,
+    bot_token: &str,
+    callback_query_id: &str,
+    text: Option<&str>,
+) -> anyhow::Result<()> {
     #[derive(Debug, serde::Serialize)]
     struct AnswerCallbackPayload {
         callback_query_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     }
     let response = client
         .post(telegram::telegram_api_url(bot_token, "answerCallbackQuery"))
         .json(&AnswerCallbackPayload {
             callback_query_id: callback_query_id.to_string(),
+            text: text.map(str::to_string),
         })
         .send()
         .await?;
@@ -800,23 +805,455 @@ async fn handle_latest_more_callback(
     }
 }
 
-async fn send_reply_to_message(
+// --- Inline comment viewer ---
+
+/// Context extracted from a callback query, decoupled from Telegram's
+/// serde structs so viewer functions stay testable.
+struct CallbackContext<'a> {
+    callback_query_id: &'a str,
+    /// The user who pressed the button (Telegram `from.id`), when present.
+    from_id: Option<i64>,
+    chat_id: i64,
+    message_id: Option<i64>,
+}
+
+/// Per-tweet in-memory comment cache with TTL, avoiding repeated X API calls
+/// when users page back and forth. Bounded; oldest entries are evicted.
+struct CommentCacheEntry {
+    comments: Vec<crate::models::TweetComment>,
+    fetched_at: std::time::Instant,
+}
+
+const COMMENT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const COMMENT_CACHE_MAX_ENTRIES: usize = 64;
+
+use std::sync::{Mutex, OnceLock};
+
+fn comment_cache() -> &'static Mutex<std::collections::HashMap<String, CommentCacheEntry>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, CommentCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cache_get_comments(tweet_id: &str) -> Option<Vec<crate::models::TweetComment>> {
+    let mut cache = comment_cache().lock().ok()?;
+    let entry = cache.get_mut(tweet_id)?;
+    if entry.fetched_at.elapsed() > COMMENT_CACHE_TTL {
+        cache.remove(tweet_id);
+        return None;
+    }
+    Some(entry.comments.clone())
+}
+
+fn cache_put_comments(tweet_id: &str, comments: Vec<crate::models::TweetComment>) {
+    let Ok(mut cache) = comment_cache().lock() else {
+        return;
+    };
+    if cache.len() >= COMMENT_CACHE_MAX_ENTRIES && !cache.contains_key(tweet_id) {
+        // Evict the oldest entry.
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, e)| e.fetched_at)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        tweet_id.to_string(),
+        CommentCacheEntry {
+            comments,
+            fetched_at: std::time::Instant::now(),
+        },
+    );
+}
+
+/// Reply-cache keyed by parent comment id for expanded reply views.
+fn reply_cache() -> &'static Mutex<std::collections::HashMap<String, CommentCacheEntry>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, CommentCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Users allowed to trigger on-demand X fetches via inline buttons.
+/// Empty list means everyone is allowed (single-user deployments).
+fn fetch_allowed_users() -> Vec<i64> {
+    std::env::var("TELEGRAM_ALLOWED_USER_IDS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|part| part.trim().parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const COMMENTS_PER_PAGE: usize = 5;
+
+/// Parsed `comments_view:` callback payload.
+/// List view:  `cv:{tweet_id}:{page}`
+/// Replies:    `cv:{tweet_id}:r:{comment_id}`
+/// Back:       `cv:{tweet_id}:b:{comment_id}` (reply page for comment_id)
+#[derive(Debug, PartialEq)]
+enum CommentsView {
+    Page {
+        tweet_id: String,
+        page: usize,
+    },
+    Replies {
+        tweet_id: String,
+        comment_id: String,
+    },
+}
+
+fn parse_comments_view(data: &str) -> Option<CommentsView> {
+    let rest = data.strip_prefix("cv:")?;
+    let parts: Vec<&str> = rest.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let tweet_id = parts[0].to_string();
+    match parts[1] {
+        "r" | "b" => parts.get(2).map(|cid| CommentsView::Replies {
+            tweet_id,
+            comment_id: (*cid).to_string(),
+        }),
+        page => page.parse::<usize>().ok().map(|page| CommentsView::Page {
+            tweet_id,
+            page: page.max(1),
+        }),
+    }
+}
+
+fn comment_page_keyboard(
+    tweet_id: &str,
+    page: usize,
+    total_pages: usize,
+    comments: &[crate::models::TweetComment],
+) -> telegram::InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<telegram::InlineKeyboardButton>> = Vec::new();
+
+    // Expand-replies row: one button per comment that has replies on this page.
+    for comment in comments {
+        if let Some(count) = comment.reply_count.filter(|c| *c > 0) {
+            rows.push(vec![telegram::InlineKeyboardButton::callback(
+                &format!("↩ @{} 的回复 ({count})", comment.author_username),
+                format!("cv:{}:r:{}", tweet_id, comment.tweet_id),
+            )]);
+        }
+    }
+
+    // Pagination row.
+    let mut pager = Vec::new();
+    if page > 1 {
+        pager.push(telegram::InlineKeyboardButton::callback(
+            "◀",
+            format!("cv:{}:{}", tweet_id, page - 1),
+        ));
+    }
+    pager.push(telegram::InlineKeyboardButton::callback(
+        &format!("{page}/{total_pages}"),
+        format!("cv:{}:{page}", tweet_id),
+    ));
+    if page < total_pages {
+        pager.push(telegram::InlineKeyboardButton::callback(
+            "▶",
+            format!("cv:{}:{}", tweet_id, page + 1),
+        ));
+    }
+    rows.push(pager);
+
+    telegram::InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+fn replies_keyboard(tweet_id: &str, comment_id: &str) -> telegram::InlineKeyboardMarkup {
+    telegram::InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![telegram::InlineKeyboardButton::callback(
+            "◀ 返回评论列表",
+            format!("cv:{tweet_id}:b:{comment_id}"),
+        )]],
+    }
+}
+
+fn format_comment_list(header: &str, comments: &[crate::models::TweetComment]) -> String {
+    let mut lines = vec![header.to_string()];
+    for (idx, comment) in comments.iter().enumerate() {
+        lines.push(format!("{}. {}", idx + 1, format_single_comment(comment)));
+    }
+    lines.join("\n")
+}
+
+async fn fetch_comments_cached(
+    config: &AppConfig,
+    pool: &PgPool,
+    tweet_id: &str,
+) -> anyhow::Result<Vec<crate::models::TweetComment>> {
+    if let Some(cached) = cache_get_comments(tweet_id) {
+        return Ok(cached);
+    }
+    let comments =
+        fetch::fetch_tweet_comments(config, pool, tweet_id, config.comments.max_comments).await?;
+    cache_put_comments(tweet_id, comments.clone());
+    Ok(comments)
+}
+
+async fn fetch_replies_cached(
+    config: &AppConfig,
+    pool: &PgPool,
+    comment_id: &str,
+) -> anyhow::Result<Vec<crate::models::TweetComment>> {
+    {
+        let cache = reply_cache().lock().ok();
+        if let Some(cache) = cache {
+            if let Some(entry) = cache.get(comment_id) {
+                if entry.fetched_at.elapsed() <= COMMENT_CACHE_TTL {
+                    return Ok(entry.comments.clone());
+                }
+            }
+        }
+    }
+    let replies =
+        fetch::fetch_tweet_comments(config, pool, comment_id, config.comments.max_comments).await?;
+    if let Ok(mut cache) = reply_cache().lock() {
+        if cache.len() >= COMMENT_CACHE_MAX_ENTRIES && !cache.contains_key(comment_id) {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.fetched_at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            comment_id.to_string(),
+            CommentCacheEntry {
+                comments: replies.clone(),
+                fetched_at: std::time::Instant::now(),
+            },
+        );
+    }
+    Ok(replies)
+}
+
+/// Where the comment viewer renders and whether it edits an existing message.
+struct ViewerTarget<'a> {
+    chat_id: &'a str,
+    message_id: Option<i64>,
+}
+
+/// Entry point for `comments:` (legacy button) and `cv:` callbacks.
+/// Sends/edits a single "comment viewer" message instead of fanning out
+/// messages into a discussion group.
+async fn handle_comments_view(
+    config: &AppConfig,
+    pool: &PgPool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    callback: &CallbackContext<'_>,
+    view: CommentsView,
+) {
+    // Show the viewer in the user's private chat when known, so the channel
+    // stays clean; fall back to the chat the button was pressed in.
+    let target_chat_id = match callback.from_id {
+        Some(user_id) => {
+            let user_chat = user_id.to_string();
+            match telegram::check_private_chat_readable(client, bot_token, &user_chat).await {
+                true => user_chat,
+                false => {
+                    // User has not started the bot: guide them, then fall back.
+                    let _ = answer_callback_query_with_text(
+                        client,
+                        bot_token,
+                        callback.callback_query_id,
+                        Some("先在私聊中 /start 本 bot 即可在私聊查看评论；此次在当前聊天展示。"),
+                    )
+                    .await;
+                    callback.chat_id.to_string()
+                }
+            }
+        }
+        None => callback.chat_id.to_string(),
+    };
+
+    let target = ViewerTarget {
+        chat_id: &target_chat_id,
+        message_id: callback.message_id,
+    };
+
+    let result = match &view {
+        CommentsView::Page { tweet_id, page } => {
+            render_comment_page(config, pool, client, bot_token, &target, tweet_id, *page).await
+        }
+        CommentsView::Replies {
+            tweet_id,
+            comment_id,
+        } => {
+            render_replies_view(
+                config, pool, client, bot_token, &target, tweet_id, comment_id,
+            )
+            .await
+        }
+    };
+
+    if let Err(err) = result {
+        tracing::warn!(?err, "comment viewer failed");
+        // Anti-silence: surface the failure as an editable message update or
+        // a plain message in the target chat.
+        let text = format!("评论加载失败：{err}");
+        if let Some(message_id) = target.message_id {
+            let _ =
+                edit_message_text(client, bot_token, target.chat_id, message_id, &text, None).await;
+        } else {
+            let _ = send_reply(client, bot_token, target.chat_id, &text).await;
+        }
+    }
+}
+
+type RenderResult = anyhow::Result<(String, telegram::InlineKeyboardMarkup)>;
+
+async fn render_comment_page(
+    config: &AppConfig,
+    pool: &PgPool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    target: &ViewerTarget<'_>,
+    tweet_id: &str,
+    page: usize,
+) -> RenderResult {
+    if !config.comments.enabled {
+        return Ok((
+            "Comment fetching is disabled.".to_string(),
+            telegram::InlineKeyboardMarkup {
+                inline_keyboard: vec![],
+            },
+        ));
+    }
+
+    let comments = fetch_comments_cached(config, pool, tweet_id).await?;
+    if comments.is_empty() {
+        return Ok((
+            "No comments found.".to_string(),
+            telegram::InlineKeyboardMarkup {
+                inline_keyboard: vec![],
+            },
+        ));
+    }
+
+    let total = comments.len();
+    let total_pages = total.div_ceil(COMMENTS_PER_PAGE).max(1);
+    let start = (page - 1) * COMMENTS_PER_PAGE;
+    if start >= total {
+        return Ok((
+            "No more comments.".to_string(),
+            telegram::InlineKeyboardMarkup {
+                inline_keyboard: vec![],
+            },
+        ));
+    }
+    let end = (start + COMMENTS_PER_PAGE).min(total);
+    let page_comments = &comments[start..end];
+
+    let author = storage::get_tweet(pool, tweet_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|stored| (stored.tweet.author_name, stored.tweet.author_username));
+    let header = match author {
+        Some((name, username)) => format!(
+            "💬 <b>{name}</b> (@{username}) 的评论 {end}/{total} 条（第 {page}/{total_pages} 页）"
+        ),
+        None => format!("💬 推文 {tweet_id} 的评论 {end}/{total} 条（第 {page}/{total_pages} 页）"),
+    };
+    let text = format_comment_list(&header, page_comments);
+    let markup = comment_page_keyboard(tweet_id, page, total_pages, page_comments);
+
+    // First render sends a new (silent) message; paging edits in place.
+    render_into(client, bot_token, target, &text, &markup).await;
+    Ok((text, markup))
+}
+
+async fn render_replies_view(
+    config: &AppConfig,
+    pool: &PgPool,
+    client: &reqwest::Client,
+    bot_token: &str,
+    target: &ViewerTarget<'_>,
+    tweet_id: &str,
+    comment_id: &str,
+) -> RenderResult {
+    let replies = fetch_replies_cached(config, pool, comment_id).await?;
+    let text = if replies.is_empty() {
+        format!("该评论暂无已加载的回复。\nhttps://x.com/i/status/{comment_id}")
+    } else {
+        let header = format!(
+            "↩ <b>回复</b>（{} 条）\nhttps://x.com/i/status/{comment_id}",
+            replies.len()
+        );
+        format_comment_list(&header, &replies)
+    };
+    let markup = replies_keyboard(tweet_id, comment_id);
+
+    render_into(client, bot_token, target, &text, &markup).await;
+    Ok((text, markup))
+}
+
+/// First render sends a new silent message; later renders edit in place.
+async fn render_into(
+    client: &reqwest::Client,
+    bot_token: &str,
+    target: &ViewerTarget<'_>,
+    text: &str,
+    markup: &telegram::InlineKeyboardMarkup,
+) {
+    match target.message_id {
+        Some(message_id) => {
+            let _ = edit_message_text(
+                client,
+                bot_token,
+                target.chat_id,
+                message_id,
+                text,
+                Some(markup),
+            )
+            .await;
+        }
+        None => {
+            let _ =
+                send_viewer_message(client, bot_token, target.chat_id, text, Some(markup)).await;
+        }
+    }
+}
+
+async fn send_viewer_message(
     client: &reqwest::Client,
     bot_token: &str,
     chat_id: &str,
-    reply_to_message_id: i64,
     text: &str,
-) -> anyhow::Result<()> {
+    reply_markup: Option<&telegram::InlineKeyboardMarkup>,
+) -> anyhow::Result<i64> {
     #[derive(Debug, serde::Serialize)]
-    struct ReplyParams {
-        message_id: i64,
-    }
-    #[derive(Debug, serde::Serialize)]
-    struct SendMessageWithReply {
+    struct SendMessagePayload {
         chat_id: String,
         text: String,
         parse_mode: String,
-        reply_parameters: ReplyParams,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_thread_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_markup: Option<telegram::InlineKeyboardMarkup>,
+        disable_notification: bool,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct MessageResult {
+        message_id: i64,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct TelegramResponse {
+        ok: bool,
+        #[serde(default)]
+        description: Option<String>,
+        result: Option<MessageResult>,
     }
 
     let text = if text.len() > 4096 {
@@ -827,140 +1264,32 @@ async fn send_reply_to_message(
 
     let response = client
         .post(telegram::telegram_api_url(bot_token, "sendMessage"))
-        .json(&SendMessageWithReply {
+        .json(&SendMessagePayload {
             chat_id: chat_id.to_string(),
             text,
             parse_mode: "HTML".to_string(),
-            reply_parameters: ReplyParams {
-                message_id: reply_to_message_id,
-            },
+            message_thread_id: None,
+            reply_markup: reply_markup.cloned(),
+            disable_notification: true,
         })
         .send()
         .await?;
-
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("sendMessage failed: {status} {body}");
+    let body: TelegramResponse = response.json().await.unwrap_or(TelegramResponse {
+        ok: false,
+        description: Some(format!("invalid response with status {status}")),
+        result: None,
+    });
+    if !body.ok {
+        anyhow::bail!(
+            "sendMessage failed: {} - {}",
+            status,
+            body.description.unwrap_or_default()
+        );
     }
-    Ok(())
-}
-
-async fn handle_comments_callback(
-    config: &AppConfig,
-    pool: &PgPool,
-    client: &reqwest::Client,
-    bot_token: &str,
-    msg: &TelegramCallbackMessage,
-    tweet_id: &str,
-    page: usize,
-) {
-    if !config.comments.enabled {
-        let _ = send_reply(
-            client,
-            bot_token,
-            &msg.chat.id.to_string(),
-            "Comment fetching is disabled.",
-        )
-        .await;
-        return;
-    }
-
-    let is_channel = msg.chat.chat_type == "channel";
-    let discussion_group_id = std::env::var(&config.telegram.discussion_group_id_env).ok();
-    let is_discussion_group = discussion_group_id
-        .as_ref()
-        .map(|gid| msg.chat.id.to_string() == *gid)
-        .unwrap_or(false);
-
-    // Route: channel -> send to group with context header; group pagination -> continue in group; else inline
-    let (send_chat_id, use_context_header) = if is_channel {
-        if let Some(ref group_id) = discussion_group_id {
-            (group_id.clone(), true)
-        } else {
-            (msg.chat.id.to_string(), false)
-        }
-    } else {
-        (msg.chat.id.to_string(), false)
-    };
-
-    tracing::info!(tweet_id = %tweet_id, page, is_channel, is_discussion_group, send_chat_id = %send_chat_id, "fetching comments on demand");
-
-    match fetch::fetch_tweet_comments(config, pool, tweet_id, config.comments.max_comments).await {
-        Ok(comments) => {
-            if comments.is_empty() {
-                let _ = send_reply(client, bot_token, &send_chat_id, "No comments found.").await;
-                return;
-            }
-
-            let per_page = 5;
-            let total = comments.len();
-            let start = (page - 1) * per_page;
-            if start >= total {
-                return;
-            }
-            let end = (start + per_page).min(total);
-            let page_comments = &comments[start..end];
-            let has_more = end < total;
-
-            // For channel posts: send context header to group, thread comments under it
-            let reply_to_id = if use_context_header {
-                let header = match storage::get_tweet(pool, tweet_id).await {
-                    Ok(Some(stored)) => format!(
-                        "<b>Comments</b> for <b>{}</b> (@{})\n{}",
-                        telegram::html_escape(&stored.tweet.author_name),
-                        telegram::html_escape(&stored.tweet.author_username),
-                        stored.tweet.url,
-                    ),
-                    _ => format!("Comments for tweet https://x.com/i/status/{tweet_id}"),
-                };
-                match send_reply_get_id(client, bot_token, &send_chat_id, &header).await {
-                    Ok(id) => Some(id),
-                    Err(err) => {
-                        tracing::warn!(?err, "failed to send comment header to group");
-                        None
-                    }
-                }
-            } else {
-                Some(msg.message_id)
-            };
-
-            for comment in page_comments {
-                let text = format_single_comment(comment);
-                if let Some(id) = reply_to_id {
-                    let _ =
-                        send_reply_to_message(client, bot_token, &send_chat_id, id, &text).await;
-                } else {
-                    let _ = send_reply(client, bot_token, &send_chat_id, &text).await;
-                }
-            }
-
-            if has_more {
-                let callback_data = format!("comments:{tweet_id}:{}", page + 1);
-                let _ = send_reply_with_keyboard(
-                    client,
-                    bot_token,
-                    &send_chat_id,
-                    &format!("Page {}/{} — Load more:", page, total.div_ceil(per_page)),
-                    Some(&telegram::comment_button_markup_with_text(
-                        "Next page >",
-                        &callback_data,
-                    )),
-                )
-                .await;
-            }
-        }
-        Err(err) => {
-            tracing::error!(?err, tweet_id = %tweet_id, "failed to fetch comments");
-            let _ = send_reply(
-                client,
-                bot_token,
-                &send_chat_id,
-                &format!("Failed to fetch comments: {err}"),
-            )
-            .await;
-        }
-    }
+    body.result
+        .map(|r| r.message_id)
+        .ok_or_else(|| anyhow::anyhow!("sendMessage returned no result"))
 }
 
 fn format_single_comment(comment: &crate::models::TweetComment) -> String {
@@ -1023,22 +1352,22 @@ fn format_latest_message(
     };
 
     if page > 1 {
-        buttons.push(telegram::InlineKeyboardButton {
-            text: "< Prev".to_string(),
-            callback_data: format!("latest:{}:{}", user_key, page - 1),
-        });
+        buttons.push(telegram::InlineKeyboardButton::callback(
+            "< Prev",
+            format!("latest:{}:{}", user_key, page - 1),
+        ));
     }
     if page < total_pages {
-        buttons.push(telegram::InlineKeyboardButton {
-            text: "Next >".to_string(),
-            callback_data: format!("latest:{}:{}", user_key, page + 1),
-        });
+        buttons.push(telegram::InlineKeyboardButton::callback(
+            "Next >",
+            format!("latest:{}:{}", user_key, page + 1),
+        ));
     } else if can_load_older && !username.is_empty() {
         // On last page with a specific user, offer to load older tweets
-        buttons.push(telegram::InlineKeyboardButton {
-            text: "Load older".to_string(),
-            callback_data: format!("latest_more:{}:{}", user_key, page),
-        });
+        buttons.push(telegram::InlineKeyboardButton::callback(
+            "Load older",
+            format!("latest_more:{}:{}", user_key, page),
+        ));
     }
 
     let reply_markup = if buttons.is_empty() {
@@ -1061,7 +1390,11 @@ fn cmd_help() -> anyhow::Result<String> {
          /status - Show system status\n\
          /fetch - Trigger an immediate fetch\n\
          /latest @username [7d] - Browse tweets (auto-sync, optional time range)\n\
-         /spam [list|add|remove] - Manage spam keywords"
+         /spam [list|add|remove] - Manage spam keywords\n\n\
+         Channel posts have a \"💬 X 评论\" button: press it to lazily load\n\
+         that tweet's comments from X (pages of 5; press \"↩ @user 的回复\"\n\
+         to expand replies). The viewer opens in your private chat with the\n\
+         bot — send /start to the bot first so it can message you."
         .to_string())
 }
 
@@ -1488,5 +1821,146 @@ mod tests {
         let (cmd, args) = parse_command("/add@xflow_bot @openai");
         assert_eq!(cmd, "/add");
         assert_eq!(args, "@openai");
+    }
+
+    fn make_comment(id: &str, reply_count: Option<u64>) -> crate::models::TweetComment {
+        crate::models::TweetComment {
+            tweet_id: id.to_string(),
+            author_username: "alice".to_string(),
+            author_name: "Alice".to_string(),
+            text: "hello".to_string(),
+            created_at: chrono::Utc::now(),
+            media_urls: vec![],
+            external_links: vec![],
+            reply_count,
+        }
+    }
+
+    #[test]
+    fn parse_legacy_comments_data_with_page() {
+        let view = parse_legacy_comments_data("123456:2").unwrap();
+        assert_eq!(
+            view,
+            CommentsView::Page {
+                tweet_id: "123456".to_string(),
+                page: 2
+            }
+        );
+    }
+
+    #[test]
+    fn parse_legacy_comments_data_defaults_to_page_one() {
+        let view = parse_legacy_comments_data("123456").unwrap();
+        assert_eq!(
+            view,
+            CommentsView::Page {
+                tweet_id: "123456".to_string(),
+                page: 1
+            }
+        );
+    }
+
+    #[test]
+    fn parse_legacy_comments_data_rejects_empty_id() {
+        assert!(parse_legacy_comments_data("").is_none());
+        assert!(parse_legacy_comments_data(":3").is_none());
+    }
+
+    #[test]
+    fn parse_comments_view_page() {
+        let view = parse_comments_view("cv:999:3").unwrap();
+        assert_eq!(
+            view,
+            CommentsView::Page {
+                tweet_id: "999".to_string(),
+                page: 3
+            }
+        );
+    }
+
+    #[test]
+    fn parse_comments_view_replies() {
+        let view = parse_comments_view("cv:999:r:42").unwrap();
+        assert_eq!(
+            view,
+            CommentsView::Replies {
+                tweet_id: "999".to_string(),
+                comment_id: "42".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_comments_view_back_treated_as_replies() {
+        // Back buttons re-render the reply view; paging back to the list uses
+        // cv:{tid}:{page} directly.
+        let view = parse_comments_view("cv:999:b:42").unwrap();
+        assert_eq!(
+            view,
+            CommentsView::Replies {
+                tweet_id: "999".to_string(),
+                comment_id: "42".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn comment_page_keyboard_pager_rows() {
+        let comments: Vec<_> = (1..=5)
+            .map(|i| make_comment(&i.to_string(), if i == 2 { Some(3) } else { None }))
+            .collect();
+        let markup = comment_page_keyboard("777", 2, 4, &comments);
+
+        // One expand row (only comment 2 has replies) + one pager row.
+        assert_eq!(markup.inline_keyboard.len(), 2);
+        let expand = &markup.inline_keyboard[0][0];
+        assert_eq!(expand.callback_data.as_deref(), Some("cv:777:r:2"));
+        assert!(expand.text.contains('3'));
+
+        let pager = &markup.inline_keyboard[1];
+        assert_eq!(pager.len(), 3); // ◀ 2/4 ▶
+        assert_eq!(pager[0].callback_data.as_deref(), Some("cv:777:1"));
+        assert_eq!(pager[1].text, "2/4");
+        assert_eq!(pager[2].callback_data.as_deref(), Some("cv:777:3"));
+    }
+
+    #[test]
+    fn comment_page_keyboard_first_page_has_no_prev() {
+        let comments: Vec<_> = (1..=5)
+            .map(|i| make_comment(&i.to_string(), None))
+            .collect();
+        let markup = comment_page_keyboard("777", 1, 3, &comments);
+        let pager = &markup.inline_keyboard[0];
+        assert_eq!(pager.len(), 2); // 1/3 ▶
+        assert_eq!(pager[0].text, "1/3");
+    }
+
+    #[test]
+    fn comment_page_keyboard_last_page_has_no_next() {
+        let comments: Vec<_> = (1..=5)
+            .map(|i| make_comment(&i.to_string(), None))
+            .collect();
+        let markup = comment_page_keyboard("777", 3, 3, &comments);
+        let pager = &markup.inline_keyboard[0];
+        assert_eq!(pager.len(), 2); // ◀ 3/3
+        assert_eq!(pager[1].text, "3/3");
+    }
+
+    #[test]
+    fn format_comment_list_numbers_entries() {
+        let comments: Vec<_> = (1..=2)
+            .map(|i| make_comment(&i.to_string(), None))
+            .collect();
+        let text = format_comment_list("Header", &comments);
+        assert!(text.starts_with("Header"));
+        assert!(text.contains("1. <b>Alice</b> (@alice): hello"));
+        assert!(text.contains("2. <b>Alice</b> (@alice): hello"));
+    }
+
+    #[test]
+    fn callback_data_fits_telegram_limit() {
+        // Telegram caps callback_data at 64 bytes.
+        let data = format!("cv:{}:r:{}", "12345678901234567890", "98765432109876543210");
+        assert!(data.len() <= 64, "callback_data too long: {}", data.len());
     }
 }

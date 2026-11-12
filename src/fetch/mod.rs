@@ -948,6 +948,8 @@ fn parse_comment_result(result: &Value, focal_tweet_id: &str) -> Option<TweetCom
         })
         .unwrap_or_default();
 
+    let reply_count = legacy.get("reply_count").and_then(Value::as_u64);
+
     Some(TweetComment {
         tweet_id,
         author_username: user.username,
@@ -956,6 +958,7 @@ fn parse_comment_result(result: &Value, focal_tweet_id: &str) -> Option<TweetCom
         created_at,
         media_urls,
         external_links,
+        reply_count,
     })
 }
 

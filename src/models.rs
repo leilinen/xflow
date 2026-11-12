@@ -66,6 +66,10 @@ pub struct TweetComment {
     pub media_urls: Vec<String>,
     #[serde(default)]
     pub external_links: Vec<String>,
+    /// Number of direct replies to this comment, when known from the X API.
+    /// `None` means unknown (e.g. synthesized data in tests or old payloads).
+    #[serde(default)]
+    pub reply_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

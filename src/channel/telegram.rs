@@ -110,7 +110,28 @@ struct LinkPreviewOptions {
 #[derive(Debug, Clone, Serialize)]
 pub struct InlineKeyboardButton {
     pub text: String,
-    pub callback_data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl InlineKeyboardButton {
+    pub fn callback(text: &str, callback_data: String) -> Self {
+        Self {
+            text: text.to_string(),
+            callback_data: Some(callback_data),
+            url: None,
+        }
+    }
+
+    pub fn url_button(text: &str, url: String) -> Self {
+        Self {
+            text: text.to_string(),
+            callback_data: None,
+            url: Some(url),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,19 +141,22 @@ pub struct InlineKeyboardMarkup {
 
 pub fn comment_button_markup(tweet_id: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![InlineKeyboardButton {
-            text: "Load comments".to_string(),
-            callback_data: format!("comments:{}", tweet_id),
-        }]],
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton::callback("💬 X 评论", format!("comments:{tweet_id}")),
+            InlineKeyboardButton::url_button(
+                "Open on X ↗",
+                format!("https://x.com/i/status/{tweet_id}"),
+            ),
+        ]],
     }
 }
 
 pub fn comment_button_markup_with_text(text: &str, callback_data: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![InlineKeyboardButton {
-            text: text.to_string(),
-            callback_data: callback_data.to_string(),
-        }]],
+        inline_keyboard: vec![vec![InlineKeyboardButton::callback(
+            text,
+            callback_data.to_string(),
+        )]],
     }
 }
 
@@ -219,6 +243,28 @@ pub fn load_bot_token(config: &TelegramConfig) -> anyhow::Result<String> {
         )
     })?;
     Ok(bot_token)
+}
+
+/// Best-effort check that the bot can deliver a message to the given chat
+/// (used to detect whether a user has started the bot before sending the
+/// comment viewer to their private chat).
+pub async fn check_private_chat_readable(client: &Client, bot_token: &str, chat_id: &str) -> bool {
+    #[derive(Debug, serde::Deserialize)]
+    struct TelegramResponse {
+        ok: bool,
+    }
+    let response = client
+        .post(telegram_api_url(bot_token, "getChat"))
+        .json(&serde_json::json!({ "chat_id": chat_id }))
+        .send()
+        .await;
+    match response {
+        Ok(resp) => matches!(
+            resp.json::<TelegramResponse>().await,
+            Ok(TelegramResponse { ok: true })
+        ),
+        Err(_) => false,
+    }
 }
 
 pub fn default_bot_commands() -> Vec<TelegramBotCommand> {
