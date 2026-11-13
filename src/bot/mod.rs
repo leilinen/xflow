@@ -587,6 +587,7 @@ async fn edit_message_text(
     chat_id: &str,
     message_id: i64,
     text: &str,
+    parse_mode: Option<&str>,
     reply_markup: Option<&telegram::InlineKeyboardMarkup>,
 ) -> anyhow::Result<()> {
     #[derive(Debug, serde::Serialize)]
@@ -595,15 +596,25 @@ async fn edit_message_text(
         message_id: i64,
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         reply_markup: Option<telegram::InlineKeyboardMarkup>,
     }
+
+    // editMessageText replaces the whole message: without parse_mode Telegram
+    // renders our HTML tags literally, and over-long edits fail outright.
+    let text = match parse_mode {
+        Some("HTML") => truncate_html(text, TELEGRAM_MESSAGE_MAX_CHARS),
+        _ => truncate_plain(text, TELEGRAM_MESSAGE_MAX_CHARS),
+    };
 
     let response = client
         .post(telegram::telegram_api_url(bot_token, "editMessageText"))
         .json(&EditMessagePayload {
             chat_id: chat_id.to_string(),
             message_id,
-            text: text.to_string(),
+            text,
+            parse_mode: parse_mode.map(str::to_string),
             reply_markup: reply_markup.cloned(),
         })
         .send()
@@ -632,11 +643,7 @@ async fn send_reply_with_keyboard(
         reply_markup: Option<telegram::InlineKeyboardMarkup>,
     }
 
-    let text = if text.len() > 4096 {
-        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
-    } else {
-        text.to_string()
-    };
+    let text = truncate_plain(text, TELEGRAM_MESSAGE_MAX_CHARS);
 
     let response = client
         .post(telegram::telegram_api_url(bot_token, "sendMessage"))
@@ -692,6 +699,7 @@ async fn handle_latest_callback(
             msg.message_id,
             "No more tweets.",
             None,
+            None,
         )
         .await;
         return;
@@ -712,6 +720,7 @@ async fn handle_latest_callback(
         &msg.chat.id.to_string(),
         msg.message_id,
         &text,
+        None,
         reply_markup.as_ref(),
     )
     .await
@@ -737,6 +746,7 @@ async fn handle_latest_more_callback(
         msg.message_id,
         &format!("Loading older tweets for @{username}..."),
         None,
+        None,
     )
     .await;
 
@@ -759,6 +769,7 @@ async fn handle_latest_more_callback(
                 &msg.chat.id.to_string(),
                 msg.message_id,
                 &format!("Failed to load older tweets: {err}"),
+                None,
                 None,
             )
             .await;
@@ -791,6 +802,7 @@ async fn handle_latest_more_callback(
             msg.message_id,
             "No older tweets found.",
             None,
+            None,
         )
         .await;
         return;
@@ -810,6 +822,7 @@ async fn handle_latest_more_callback(
         &msg.chat.id.to_string(),
         msg.message_id,
         &text,
+        None,
         reply_markup.as_ref(),
     )
     .await
@@ -905,6 +918,73 @@ fn fetch_allowed_users() -> Vec<i64> {
 
 const COMMENTS_PER_PAGE: usize = 5;
 
+/// Telegram caps message text at 4096 characters.
+const TELEGRAM_MESSAGE_MAX_CHARS: usize = 4096;
+
+/// Per-comment body budget before we ellipsize; keeps pages scannable and
+/// leaves room for several comments inside a single Telegram message.
+const COMMENT_BODY_MAX_CHARS: usize = 500;
+
+/// Cut plain text to `max_chars` characters on a char boundary, adding "…".
+fn truncate_plain(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let cut = text.floor_char_boundary(max_chars.saturating_sub(1));
+    let mut out = text[..cut].to_string();
+    out.push('…');
+    out
+}
+
+/// Cut HTML-formatted text to `max_chars` characters without splitting tags or
+/// entities, then re-close any tags the cut left open.
+fn truncate_html(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    // Reserve room for the ellipsis plus closing tags.
+    let budget = max_chars.saturating_sub(48).max(1);
+    let mut cut = text.floor_char_boundary(budget);
+    // Never cut inside a tag or an entity.
+    if let Some(lt) = text[..cut].rfind('<') {
+        if !text[lt..cut].contains('>') {
+            cut = lt;
+        }
+    }
+    if let Some(amp) = text[..cut].rfind('&') {
+        if !text[amp..cut].contains(';') {
+            cut = amp;
+        }
+    }
+    let head = &text[..cut];
+    let mut open: Vec<&str> = Vec::new();
+    let mut rest = head;
+    while let Some(lt) = rest.find('<') {
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = &after[..gt];
+        rest = &after[gt + 1..];
+        if let Some(name) = tag.strip_prefix('/') {
+            if open.last().is_some_and(|top| *top == name) {
+                open.pop();
+            }
+        } else if !tag.ends_with('/') {
+            if let Some(name) = tag.split_whitespace().next() {
+                open.push(name);
+            }
+        }
+    }
+    let mut out = String::with_capacity(max_chars);
+    out.push_str(head);
+    out.push('…');
+    for name in open.iter().rev() {
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
+    out
+}
+
 /// Parsed `comments_view:` callback payload.
 /// List view:  `cv:{tweet_id}:{page}`
 /// Replies:    `cv:{tweet_id}:r:{comment_id}`
@@ -948,11 +1028,17 @@ fn comment_page_keyboard(
 ) -> telegram::InlineKeyboardMarkup {
     let mut rows: Vec<Vec<telegram::InlineKeyboardButton>> = Vec::new();
 
-    // Expand-replies row: one button per comment that has replies on this page.
-    for comment in comments {
+    // Expand-replies row: one button per comment that has replies on this
+    // page, numbered to match the list above.
+    let start = (page.saturating_sub(1)) * COMMENTS_PER_PAGE;
+    for (idx, comment) in comments.iter().enumerate() {
         if let Some(count) = comment.reply_count.filter(|c| *c > 0) {
             rows.push(vec![telegram::InlineKeyboardButton::callback(
-                &format!("↩ @{} 的回复 ({count})", comment.author_username),
+                &format!(
+                    "↩ {}. @{} 的回复 ({count})",
+                    start + idx + 1,
+                    comment.author_username
+                ),
                 format!("cv:{}:r:{}", tweet_id, comment.tweet_id),
             )]);
         }
@@ -992,12 +1078,21 @@ fn replies_keyboard(tweet_id: &str, comment_id: &str) -> telegram::InlineKeyboar
     }
 }
 
-fn format_comment_list(header: &str, comments: &[crate::models::TweetComment]) -> String {
-    let mut lines = vec![header.to_string()];
+fn format_comment_list(
+    header: &str,
+    comments: &[crate::models::TweetComment],
+    start_index: usize,
+    parent_username: Option<&str>,
+) -> String {
+    let mut blocks = vec![header.to_string()];
     for (idx, comment) in comments.iter().enumerate() {
-        lines.push(format!("{}. {}", idx + 1, format_single_comment(comment)));
+        blocks.push(format_single_comment(
+            comment,
+            start_index + idx + 1,
+            parent_username,
+        ));
     }
-    lines.join("\n")
+    blocks.join("\n\n")
 }
 
 async fn fetch_comments_cached(
@@ -1259,9 +1354,16 @@ async fn handle_comments_view(
             // a plain message in the target chat.
             let text = format!("评论加载失败：{err}");
             if let Some(message_id) = viewer_message_id {
-                let _ =
-                    edit_message_text(client, bot_token, &target_chat_id, message_id, &text, None)
-                        .await;
+                let _ = edit_message_text(
+                    client,
+                    bot_token,
+                    &target_chat_id,
+                    message_id,
+                    &text,
+                    None,
+                    None,
+                )
+                .await;
             } else {
                 let _ = send_reply(client, bot_token, &target_chat_id, &text).await;
             }
@@ -1318,13 +1420,19 @@ async fn render_comment_page(
         .ok()
         .flatten()
         .map(|stored| (stored.tweet.author_name, stored.tweet.author_username));
-    let header = match author {
+    let range = format!("{}–{end}", start + 1);
+    let header = match &author {
         Some((name, username)) => format!(
-            "💬 <b>{name}</b> (@{username}) 的评论 {end}/{total} 条（第 {page}/{total_pages} 页）"
+            "💬 <b>{}</b> (<a href=\"https://x.com/{username}\">@{username}</a>) 的评论 · 共 {total} 条 · 第 {page}/{total_pages} 页（{range}）",
+            telegram::html_escape(name),
         ),
-        None => format!("💬 推文 {tweet_id} 的评论 {end}/{total} 条（第 {page}/{total_pages} 页）"),
+        None => format!(
+            "💬 推文 {tweet_id} 的评论 · 共 {total} 条 · 第 {page}/{total_pages} 页（{range}）"
+        ),
     };
-    let text = format_comment_list(&header, page_comments);
+    let header = format!("{header}\n🔗 <a href=\"https://x.com/i/status/{tweet_id}\">原推文</a>");
+    let parent_username = author.as_ref().map(|(_, username)| username.as_str());
+    let text = format_comment_list(&header, page_comments, start, parent_username);
     let markup = comment_page_keyboard(tweet_id, page, total_pages, page_comments);
 
     // First render sends a new (silent) message; paging edits in place.
@@ -1342,14 +1450,22 @@ async fn render_replies_view(
     comment_id: &str,
 ) -> RenderResult {
     let replies = fetch_replies_cached(config, pool, comment_id).await?;
+    let parent = cache_get_comments(tweet_id)
+        .and_then(|list| list.into_iter().find(|c| c.tweet_id == comment_id));
+    let parent_username = parent.as_ref().map(|c| c.author_username.clone());
+    let link = format!("🔗 <a href=\"https://x.com/i/status/{comment_id}\">原评论</a>");
     let text = if replies.is_empty() {
-        format!("该评论暂无已加载的回复。\nhttps://x.com/i/status/{comment_id}")
+        format!("该评论暂无已加载的回复。\n{link}")
     } else {
-        let header = format!(
-            "↩ <b>回复</b>（{} 条）\nhttps://x.com/i/status/{comment_id}",
-            replies.len()
-        );
-        format_comment_list(&header, &replies)
+        let header = match &parent {
+            Some(parent) => format!(
+                "↩ <b>@{}</b> 的回复（{} 条）\n{link}",
+                telegram::html_escape(&parent.author_username),
+                replies.len()
+            ),
+            None => format!("↩ <b>回复</b>（{} 条）\n{link}", replies.len()),
+        };
+        format_comment_list(&header, &replies, 0, parent_username.as_deref())
     };
     let markup = replies_keyboard(tweet_id, comment_id);
 
@@ -1373,6 +1489,7 @@ async fn render_into(
                 target.chat_id,
                 message_id,
                 text,
+                Some("HTML"),
                 Some(markup),
             )
             .await;
@@ -1422,11 +1539,7 @@ async fn send_viewer_message(
         result: Option<MessageResult>,
     }
 
-    let text = if text.len() > 4096 {
-        format!("{}\n...", &text[..text.floor_char_boundary(4090)])
-    } else {
-        text.to_string()
-    };
+    let text = truncate_html(text, TELEGRAM_MESSAGE_MAX_CHARS);
 
     let response = client
         .post(telegram::telegram_api_url(bot_token, "sendMessage"))
@@ -1458,22 +1571,115 @@ async fn send_viewer_message(
         .ok_or_else(|| anyhow::anyhow!("sendMessage returned no result"))
 }
 
-fn format_single_comment(comment: &crate::models::TweetComment) -> String {
-    let mut parts = vec![format!(
-        "<b>{}</b> (@{}): {}",
-        telegram::html_escape(&comment.author_name),
-        telegram::html_escape(&comment.author_username),
-        telegram::html_escape(&comment.text),
-    )];
+fn format_single_comment(
+    comment: &crate::models::TweetComment,
+    number: usize,
+    parent_username: Option<&str>,
+) -> String {
+    let profile = format!("https://x.com/{}", comment.author_username);
+    let permalink = format!("https://x.com/i/status/{}", comment.tweet_id);
+    let time = crate::utils::format_utc8(&comment.created_at);
 
-    for url in &comment.media_urls {
-        parts.push(format!("\n  <a href=\"{}\">[image]</a>", url));
+    let mut out = format!(
+        "<b>{}. {}</b> <a href=\"{}\">@{}</a> · <a href=\"{}\">{}</a>",
+        number,
+        telegram::html_escape(&comment.author_name),
+        telegram::html_escape(&profile),
+        telegram::html_escape(&comment.author_username),
+        telegram::html_escape(&permalink),
+        time,
+    );
+
+    let body = clean_comment_body(
+        &comment.text,
+        parent_username,
+        Some(comment.author_username.as_str()),
+    );
+    if !body.is_empty() {
+        out.push_str("\n<blockquote>");
+        out.push_str(&telegram::html_escape(&body));
+        out.push_str("</blockquote>");
+    }
+
+    let mut attachments = Vec::new();
+    for (idx, url) in comment.media_urls.iter().enumerate() {
+        attachments.push(format!(
+            "🖼 <a href=\"{}\">图{}</a>",
+            telegram::html_escape(url),
+            idx + 1
+        ));
     }
     for url in &comment.external_links {
-        parts.push(format!("\n  <a href=\"{}\">{}</a>", url, url));
+        attachments.push(format!(
+            "🔗 <a href=\"{}\">{}</a>",
+            telegram::html_escape(url),
+            telegram::html_escape(&link_label(url))
+        ));
+    }
+    if !attachments.is_empty() {
+        out.push('\n');
+        out.push_str(&attachments.join(" "));
+    }
+    out
+}
+
+/// Normalize a comment body for display: drop leading mentions of the thread
+/// parent / the author itself (pure noise in reply threads), collapse runs of
+/// blank lines and ellipsize over-long bodies.
+fn clean_comment_body(
+    text: &str,
+    parent_username: Option<&str>,
+    self_username: Option<&str>,
+) -> String {
+    let mut body = text.replace("\r\n", "\n").replace('\r', "\n");
+    loop {
+        let trimmed = body.trim_start();
+        let Some(rest) = trimmed.strip_prefix('@') else {
+            break;
+        };
+        let name_len = rest
+            .char_indices()
+            .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        let name = &rest[..name_len];
+        let is_noise =
+            |candidate: Option<&str>| candidate.is_some_and(|c| c.eq_ignore_ascii_case(name));
+        if !is_noise(parent_username) && !is_noise(self_username) {
+            break;
+        }
+        body = rest[name_len..].to_string();
     }
 
-    parts.join("")
+    let mut collapsed = String::with_capacity(body.len());
+    let mut blank_run = 0usize;
+    for line in body.split('\n') {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        if !collapsed.is_empty() {
+            collapsed.push('\n');
+        }
+        collapsed.push_str(line.trim_end());
+    }
+    truncate_plain(collapsed.trim(), COMMENT_BODY_MAX_CHARS)
+}
+
+/// Short human label for an external link (host without scheme/www).
+fn link_label(url: &str) -> String {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    if host.is_empty() {
+        "link".to_string()
+    } else {
+        host.to_string()
+    }
 }
 
 fn format_latest_message(
@@ -2117,10 +2323,109 @@ mod tests {
         let comments: Vec<_> = (1..=2)
             .map(|i| make_comment(&i.to_string(), None))
             .collect();
-        let text = format_comment_list("Header", &comments);
+        let text = format_comment_list("Header", &comments, 0, None);
         assert!(text.starts_with("Header"));
-        assert!(text.contains("1. <b>Alice</b> (@alice): hello"));
-        assert!(text.contains("2. <b>Alice</b> (@alice): hello"));
+        assert!(text.contains("<b>1. Alice</b>"));
+        assert!(text.contains("<b>2. Alice</b>"));
+        assert!(text.contains("<blockquote>hello</blockquote>"));
+        // Entries are separated by a blank line so bodies never blend.
+        assert!(text.contains("</blockquote>\n\n<b>2."));
+    }
+
+    #[test]
+    fn format_comment_list_numbering_continues_across_pages() {
+        let comments: Vec<_> = (6..=7)
+            .map(|i| make_comment(&i.to_string(), None))
+            .collect();
+        let text = format_comment_list("Header", &comments, 5, None);
+        assert!(text.contains("<b>6. Alice</b>"));
+        assert!(text.contains("<b>7. Alice</b>"));
+    }
+
+    fn make_comment_with_text(id: &str, text: &str) -> crate::models::TweetComment {
+        let mut comment = make_comment(id, None);
+        comment.text = text.to_string();
+        comment
+    }
+
+    #[test]
+    fn format_single_comment_links_author_and_permalink() {
+        let comment = make_comment("42", None);
+        let out = format_single_comment(&comment, 1, None);
+        assert!(out.contains("<a href=\"https://x.com/alice\">@alice</a>"));
+        assert!(out.contains("<a href=\"https://x.com/i/status/42\">"));
+    }
+
+    #[test]
+    fn format_single_comment_strips_parent_mention() {
+        let comment = make_comment_with_text("1", "@wufantouzi 屁股决定脑袋这事");
+        let out = format_single_comment(&comment, 1, Some("wufantouzi"));
+        assert!(out.contains("<blockquote>屁股决定脑袋这事</blockquote>"));
+    }
+
+    #[test]
+    fn format_single_comment_keeps_unrelated_mentions() {
+        let comment = make_comment_with_text("1", "@someone_else 看这里");
+        let out = format_single_comment(&comment, 1, Some("wufantouzi"));
+        assert!(out.contains("<blockquote>@someone_else 看这里</blockquote>"));
+    }
+
+    #[test]
+    fn format_single_comment_multiline_body_stays_one_blockquote() {
+        let comment = make_comment_with_text("1", "第一段\n\n第二段\n\n\n第三段");
+        let out = format_single_comment(&comment, 1, None);
+        assert!(out.contains("<blockquote>第一段\n\n第二段\n\n第三段</blockquote>"));
+        assert_eq!(out.matches("<blockquote>").count(), 1);
+    }
+
+    #[test]
+    fn format_single_comment_truncates_long_body() {
+        let comment = make_comment_with_text("1", &"长".repeat(COMMENT_BODY_MAX_CHARS + 50));
+        let out = format_single_comment(&comment, 1, None);
+        assert!(out.ends_with("…</blockquote>"));
+        assert_eq!(out.matches('…').count(), 1);
+    }
+
+    #[test]
+    fn format_single_comment_attachments_line() {
+        let mut comment = make_comment("1", None);
+        comment.media_urls = vec!["https://pbs.example.com/a.jpg".to_string()];
+        comment.external_links = vec!["https://www.example.com/path".to_string()];
+        let out = format_single_comment(&comment, 1, None);
+        assert!(out.contains("🖼 <a href=\"https://pbs.example.com/a.jpg\">图1</a>"));
+        assert!(out.contains("🔗 <a href=\"https://www.example.com/path\">example.com</a>"));
+    }
+
+    #[test]
+    fn truncate_plain_appends_ellipsis() {
+        assert_eq!(truncate_plain(&"x".repeat(10), 5), "xxxx…");
+        assert_eq!(truncate_plain("short", 5), "short");
+    }
+
+    #[test]
+    fn truncate_html_closes_open_tags() {
+        let text = format!(
+            "<b>bold</b> <a href=\"https://x.com\">{}</a>",
+            "字".repeat(5000)
+        );
+        let out = truncate_html(&text, 200);
+        assert!(out.chars().count() <= 200);
+        assert!(out.ends_with("</a>"));
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn truncate_html_does_not_split_entities() {
+        let text = format!("{}&amp;{}", "a".repeat(40), "b".repeat(4000));
+        let out = truncate_html(&text, 90);
+        assert!(!out.contains('&'));
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_html_keeps_short_text() {
+        let text = "<b>ok</b> &amp; fine";
+        assert_eq!(truncate_html(text, 4096), text);
     }
 
     #[test]
