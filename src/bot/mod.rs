@@ -896,6 +896,57 @@ fn cache_put_comments(tweet_id: &str, comments: Vec<crate::models::TweetComment>
     );
 }
 
+/// Page-1 list snapshot per tweet, so a replies view opened without a prior
+/// list render (e.g. after a restart, or straight from the channel button)
+/// can still compute the parent comment's page for its Back button.
+struct PagedComments {
+    comments: Vec<crate::models::TweetComment>,
+    fetched_at: std::time::Instant,
+}
+
+fn paged_comments_cache() -> &'static Mutex<std::collections::HashMap<String, PagedComments>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, PagedComments>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Returns the 1-based list page containing `comment_id`, or None when the
+/// tweet's page-1 snapshot is absent or expired.
+fn cache_get_comment_page(tweet_id: &str, comment_id: &str) -> Option<usize> {
+    let cache = paged_comments_cache().lock().ok()?;
+    let entry = cache.get(tweet_id)?;
+    if entry.fetched_at.elapsed() > COMMENT_CACHE_TTL {
+        return None;
+    }
+    let idx = entry
+        .comments
+        .iter()
+        .position(|c| c.tweet_id == comment_id)?;
+    Some(idx / COMMENTS_PER_PAGE + 1)
+}
+
+fn cache_put_paged_comments(tweet_id: &str, comments: &[crate::models::TweetComment]) {
+    let Ok(mut cache) = paged_comments_cache().lock() else {
+        return;
+    };
+    if cache.len() >= COMMENT_CACHE_MAX_ENTRIES && !cache.contains_key(tweet_id) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, e)| e.fetched_at)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        tweet_id.to_string(),
+        PagedComments {
+            comments: comments.to_vec(),
+            fetched_at: std::time::Instant::now(),
+        },
+    );
+}
+
 /// Reply-cache keyed by parent comment id for expanded reply views.
 fn reply_cache() -> &'static Mutex<std::collections::HashMap<String, CommentCacheEntry>> {
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, CommentCacheEntry>>> =
@@ -988,7 +1039,7 @@ fn truncate_html(text: &str, max_chars: usize) -> String {
 /// Parsed `comments_view:` callback payload.
 /// List view:  `cv:{tweet_id}:{page}`
 /// Replies:    `cv:{tweet_id}:r:{comment_id}`
-/// Back:       `cv:{tweet_id}:b:{comment_id}` (reply page for comment_id)
+/// Back:       `cv:{tweet_id}:b:{comment_id}` (list page containing comment_id)
 #[derive(Debug, PartialEq)]
 enum CommentsView {
     Page {
@@ -996,6 +1047,10 @@ enum CommentsView {
         page: usize,
     },
     Replies {
+        tweet_id: String,
+        comment_id: String,
+    },
+    Back {
         tweet_id: String,
         comment_id: String,
     },
@@ -1009,7 +1064,11 @@ fn parse_comments_view(data: &str) -> Option<CommentsView> {
     }
     let tweet_id = parts[0].to_string();
     match parts[1] {
-        "r" | "b" => parts.get(2).map(|cid| CommentsView::Replies {
+        "r" => parts.get(2).map(|cid| CommentsView::Replies {
+            tweet_id,
+            comment_id: (*cid).to_string(),
+        }),
+        "b" => parts.get(2).map(|cid| CommentsView::Back {
             tweet_id,
             comment_id: (*cid).to_string(),
         }),
@@ -1069,11 +1128,14 @@ fn comment_page_keyboard(
     }
 }
 
-fn replies_keyboard(tweet_id: &str, comment_id: &str) -> telegram::InlineKeyboardMarkup {
+/// Back row for the replies view. The callback carries the list page that
+/// contains the parent comment, so "返回" restores that page instead of
+/// always dropping the user back to page 1.
+fn replies_keyboard(tweet_id: &str, page: usize) -> telegram::InlineKeyboardMarkup {
     telegram::InlineKeyboardMarkup {
         inline_keyboard: vec![vec![telegram::InlineKeyboardButton::callback(
             "◀ 返回评论列表",
-            format!("cv:{tweet_id}:b:{comment_id}"),
+            format!("cv:{tweet_id}:{page}"),
         )]],
     }
 }
@@ -1106,6 +1168,8 @@ async fn fetch_comments_cached(
     let comments =
         fetch::fetch_tweet_comments(config, pool, tweet_id, config.comments.max_comments).await?;
     cache_put_comments(tweet_id, comments.clone());
+    // Snapshot for replies-view Back buttons (parent comment → list page).
+    cache_put_paged_comments(tweet_id, &comments);
     Ok(comments)
 }
 
@@ -1225,6 +1289,47 @@ fn viewer_state_put(chat_id: i64, pressed_message_id: i64, viewer_message_id: i6
     );
 }
 
+/// Timestamped viewer message id list per chat.
+type OwnViewerEntries = Vec<(i64, std::time::Instant)>;
+
+/// Tracks the message ids of viewer messages this bot sent, per chat, so a
+/// `cv:` press on the viewer itself resolves to that viewer (edit in place)
+/// even when the viewer was not opened through the (chat, pressed post)
+/// binding above. Bounded and TTL-expired like the other caches.
+fn own_viewer_cache() -> &'static Mutex<std::collections::HashMap<i64, OwnViewerEntries>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<i64, OwnViewerEntries>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+const OWN_VIEWER_MAX_PER_CHAT: usize = 8;
+
+fn viewer_message_is_own(chat_id: i64, message_id: i64) -> bool {
+    let mut cache = own_viewer_cache().lock().ok();
+    let Some(cache) = cache.as_mut() else {
+        return false;
+    };
+    let Some(entries) = cache.get_mut(&chat_id) else {
+        return false;
+    };
+    entries.retain(|(_, at)| at.elapsed() <= VIEWER_STATE_TTL);
+    entries.iter().any(|(id, _)| *id == message_id)
+}
+
+fn own_viewer_mark(chat_id: &str, message_id: i64) {
+    let Ok(mut cache) = own_viewer_cache().lock() else {
+        return;
+    };
+    let Ok(chat_id) = chat_id.parse::<i64>() else {
+        return;
+    };
+    let entries = cache.entry(chat_id).or_default();
+    entries.push((message_id, std::time::Instant::now()));
+    if entries.len() > OWN_VIEWER_MAX_PER_CHAT {
+        entries.remove(0);
+    }
+}
+
 /// Where the comment viewer renders and whether it edits an existing message.
 #[derive(Default)]
 struct ViewerTarget<'a> {
@@ -1247,11 +1352,20 @@ async fn handle_comments_view(
     view: CommentsView,
 ) {
     // A viewer message exists only if this bot already sent one for the
-    // pressed channel post. First press sends a fresh viewer message; later
-    // `cv:` presses edit that viewer message in place.
+    // pressed channel post, or the pressed message is itself a viewer this
+    // bot sent earlier (an in-place `cv:` press on the viewer message).
+    // First press sends a fresh viewer message; later `cv:` presses edit
+    // that viewer message in place.
     let viewer_message_id = callback
         .pressed_message_id
-        .and_then(|pressed| viewer_state_get(callback.chat_id, pressed));
+        .and_then(|pressed| viewer_state_get(callback.chat_id, pressed))
+        .or_else(|| {
+            // The pressed message is the viewer itself only when the viewer
+            // was opened in this same chat (private-chat fallback reuses the
+            // chat id; the private-chat target does not).
+            let pressed = callback.pressed_message_id?;
+            viewer_message_is_own(callback.chat_id, pressed).then_some(pressed)
+        });
 
     // Show the viewer in the user's private chat when known, so the channel
     // stays clean; fall back to the chat the button was pressed in. The
@@ -1317,6 +1431,13 @@ async fn handle_comments_view(
             )
             .await
         }
+        CommentsView::Back {
+            tweet_id,
+            comment_id,
+        } => {
+            let page = cache_get_comment_page(tweet_id, comment_id).unwrap_or(1);
+            render_comment_page(config, pool, client, bot_token, &mut target, tweet_id, page).await
+        }
     };
 
     // Answer the callback query: with the fallback notice when present, so
@@ -1339,12 +1460,18 @@ async fn handle_comments_view(
     match &result {
         Ok((_text, _markup)) => {
             // First successful render: bind the new viewer message to the
-            // pressed channel post so later presses edit in place.
+            // pressed channel post so later presses edit in place, and mark
+            // the viewer as this bot's own message so `cv:` presses on the
+            // viewer itself also resolve to it.
             if viewer_message_id.is_none() {
                 if let (Some(pressed), Some(sent)) =
                     (callback.pressed_message_id, target.last_sent_message_id)
                 {
                     viewer_state_put(callback.chat_id, pressed, sent);
+                    // Mark under the chat the viewer was actually sent to
+                    // (private chat when the probe succeeded), since that is
+                    // where later `cv:` presses on the viewer will arrive.
+                    own_viewer_mark(&target_chat_id, sent);
                 }
             }
         }
@@ -1450,9 +1577,13 @@ async fn render_replies_view(
     comment_id: &str,
 ) -> RenderResult {
     let replies = fetch_replies_cached(config, pool, comment_id).await?;
+    // The parent comment may come from the fresh cache of this viewer session
+    // or, after a restart, be re-derived from the DB-backed tweet fetch.
     let parent = cache_get_comments(tweet_id)
         .and_then(|list| list.into_iter().find(|c| c.tweet_id == comment_id));
     let parent_username = parent.as_ref().map(|c| c.author_username.clone());
+    // Back returns to the list page containing the parent comment.
+    let back_page = cache_get_comment_page(tweet_id, comment_id).unwrap_or(1);
     let link = format!("🔗 <a href=\"https://x.com/i/status/{comment_id}\">原评论</a>");
     let text = if replies.is_empty() {
         format!("该评论暂无已加载的回复。\n{link}")
@@ -1467,7 +1598,7 @@ async fn render_replies_view(
         };
         format_comment_list(&header, &replies, 0, parent_username.as_deref())
     };
-    let markup = replies_keyboard(tweet_id, comment_id);
+    let markup = replies_keyboard(tweet_id, back_page);
 
     render_into(client, bot_token, target, &text, &markup).await;
     Ok((text, markup))
@@ -2263,17 +2394,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_comments_view_back_treated_as_replies() {
-        // Back buttons re-render the reply view; paging back to the list uses
-        // cv:{tid}:{page} directly.
+    fn parse_comments_view_back_carries_parent() {
+        // Back buttons carry the parent comment id; the list page is
+        // resolved from the page-1 snapshot at render time.
         let view = parse_comments_view("cv:999:b:42").unwrap();
         assert_eq!(
             view,
-            CommentsView::Replies {
+            CommentsView::Back {
                 tweet_id: "999".to_string(),
                 comment_id: "42".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn cache_comment_page_roundtrip() {
+        let comments: Vec<_> = (1..=12)
+            .map(|i| make_comment(&i.to_string(), None))
+            .collect();
+        cache_put_paged_comments("page-tweet", &comments);
+        // COMMENTS_PER_PAGE = 5 → ids 1-5 page 1, 6-10 page 2, 11-12 page 3.
+        assert_eq!(cache_get_comment_page("page-tweet", "1"), Some(1));
+        assert_eq!(cache_get_comment_page("page-tweet", "5"), Some(1));
+        assert_eq!(cache_get_comment_page("page-tweet", "6"), Some(2));
+        assert_eq!(cache_get_comment_page("page-tweet", "10"), Some(2));
+        assert_eq!(cache_get_comment_page("page-tweet", "11"), Some(3));
+        assert_eq!(cache_get_comment_page("page-tweet", "99"), None);
+        assert_eq!(cache_get_comment_page("unknown-tweet", "1"), None);
+    }
+
+    #[test]
+    fn replies_keyboard_back_targets_parent_page() {
+        let markup = replies_keyboard("777", 3);
+        let back = &markup.inline_keyboard[0][0];
+        assert_eq!(back.callback_data.as_deref(), Some("cv:777:3"));
     }
 
     #[test]
