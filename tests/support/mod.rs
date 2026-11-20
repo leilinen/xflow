@@ -84,17 +84,24 @@ impl Drop for TestDatabase {
         let cleanup = std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("create cleanup runtime");
             runtime.block_on(async move {
-                pool.close().await;
                 let admin_pool = PgPoolOptions::new()
                     .max_connections(1)
                     .connect(&database_url)
                     .await
                     .expect("reconnect to clean up test schema");
+                sqlx::query("SET statement_timeout TO '5s'")
+                    .execute(&admin_pool)
+                    .await
+                    .expect("bound test schema cleanup");
                 sqlx::query(&format!(r#"DROP SCHEMA "{schema}" CASCADE"#))
                     .execute(&admin_pool)
                     .await
                     .expect("drop isolated test schema");
                 admin_pool.close().await;
+                // Pool shutdown is cleanup, not test behavior. Never let a
+                // leaked checkout turn the CI process into an unbounded wait;
+                // dropping the final handle still closes remaining sockets.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pool.close()).await;
             });
         });
         if cleanup.join().is_err() && !std::thread::panicking() {
