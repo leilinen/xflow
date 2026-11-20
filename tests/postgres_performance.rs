@@ -27,36 +27,6 @@ fn tweets(prefix: &str, count: usize) -> Vec<Tweet> {
         .collect()
 }
 
-async fn sequential_upsert(pool: &sqlx::PgPool, tweets: &[Tweet]) {
-    for tweet in tweets {
-        sqlx::query(
-            r#"
-            INSERT INTO tweets (
-                tweet_id, source_type, source_value, author_username, author_name,
-                text, url, created_at, fetched_at, raw_json
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT(tweet_id) DO UPDATE SET
-                fetched_at=excluded.fetched_at,
-                raw_json=excluded.raw_json
-            "#,
-        )
-        .bind(&tweet.tweet_id)
-        .bind(tweet.source_type.as_str())
-        .bind(&tweet.source_value)
-        .bind(&tweet.author_username)
-        .bind(&tweet.author_name)
-        .bind(&tweet.text)
-        .bind(&tweet.url)
-        .bind(tweet.created_at.to_rfc3339())
-        .bind(tweet.fetched_at.to_rfc3339())
-        .bind(tweet.raw.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-}
-
 fn milliseconds(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1_000.0
 }
@@ -75,7 +45,6 @@ async fn acquire_wait_ms(pool: &sqlx::PgPool) -> f64 {
 
 async fn measure_count(database: &TestDatabase, count: usize) -> Vec<Value> {
     let batch_tweets = tweets(&format!("batch-{count}"), count);
-    let sequential_tweets = tweets(&format!("sequential-{count}"), count);
     let batches = count.div_ceil(storage::TWEET_UPSERT_BATCH_SIZE);
 
     let start = Instant::now();
@@ -87,22 +56,12 @@ async fn measure_count(database: &TestDatabase, count: usize) -> Vec<Value> {
     let batch_new_wait_ms = acquire_wait_ms(database.pg_pool()).await;
 
     let start = Instant::now();
-    sequential_upsert(database.pg_pool(), &sequential_tweets).await;
-    let sequential_new_ms = milliseconds(start);
-    let sequential_new_wait_ms = acquire_wait_ms(database.pg_pool()).await;
-
-    let start = Instant::now();
     let batch_repeated = storage::upsert_tweets(database, &batch_tweets)
         .await
         .unwrap();
     let batch_repeated_ms = milliseconds(start);
     assert_eq!((batch_repeated.new, batch_repeated.duplicate), (0, count));
     let batch_repeated_wait_ms = acquire_wait_ms(database.pg_pool()).await;
-
-    let start = Instant::now();
-    sequential_upsert(database.pg_pool(), &sequential_tweets).await;
-    let sequential_repeated_ms = milliseconds(start);
-    let sequential_repeated_wait_ms = acquire_wait_ms(database.pg_pool()).await;
 
     vec![
         json!({
@@ -112,10 +71,7 @@ async fn measure_count(database: &TestDatabase, count: usize) -> Vec<Value> {
             "batch_tweets_per_second": throughput(count, batch_new_ms),
             "batch_estimated_round_trips": batches * 3,
             "batch_post_run_acquire_wait_ms": batch_new_wait_ms,
-            "sequential_ms": sequential_new_ms,
-            "sequential_tweets_per_second": throughput(count, sequential_new_ms),
-            "sequential_estimated_round_trips": count,
-            "sequential_post_run_acquire_wait_ms": sequential_new_wait_ms,
+            "previous_sequential_estimated_round_trips": count,
         }),
         json!({
             "count": count,
@@ -124,10 +80,7 @@ async fn measure_count(database: &TestDatabase, count: usize) -> Vec<Value> {
             "batch_tweets_per_second": throughput(count, batch_repeated_ms),
             "batch_estimated_round_trips": batches * 4,
             "batch_post_run_acquire_wait_ms": batch_repeated_wait_ms,
-            "sequential_ms": sequential_repeated_ms,
-            "sequential_tweets_per_second": throughput(count, sequential_repeated_ms),
-            "sequential_estimated_round_trips": count,
-            "sequential_post_run_acquire_wait_ms": sequential_repeated_wait_ms,
+            "previous_sequential_estimated_round_trips": count,
         }),
     ]
 }
@@ -135,9 +88,7 @@ async fn measure_count(database: &TestDatabase, count: usize) -> Vec<Value> {
 #[tokio::test]
 #[ignore = "executed explicitly by the PostgreSQL performance CI job"]
 async fn postgres_batch_upsert_performance() {
-    // The benchmark compares SQL/network round trips, not durable WAL latency.
-    // A single connection plus asynchronous commit keeps the 1,000 individual
-    // baseline commits repeatable on noisy hosted-runner storage.
+    // The benchmark compares SQL/network trends, not durable WAL latency.
     let database = TestDatabase::new(1).await;
     sqlx::query("SET synchronous_commit TO OFF")
         .execute(database.pg_pool())
@@ -153,7 +104,7 @@ async fn postgres_batch_upsert_performance() {
         "postgres": "16",
         "batch_size": storage::TWEET_UPSERT_BATCH_SIZE,
         "synchronous_commit": "off for performance trend only",
-        "round_trip_note": "Batch estimates include BEGIN, DML statements, and COMMIT; sequential baseline uses one UPSERT statement per tweet.",
+        "round_trip_note": "Batch estimates include BEGIN, DML statements, and COMMIT. The previous sequential path required one UPSERT statement per tweet; it is not executed by this trend test.",
         "measurements": measurements,
     });
     let output = serde_json::to_string_pretty(&report).unwrap();
