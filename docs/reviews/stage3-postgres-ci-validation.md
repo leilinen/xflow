@@ -50,7 +50,10 @@ The sequential comparison is a test-only one-statement-per-Tweet PostgreSQL
 UPSERT baseline. The removed advisory-lock implementation is not restored for
 benchmarking. Round-trip counts are protocol estimates: batch figures include
 `BEGIN`, application DML statements, and `COMMIT`; sequential figures count one
-UPSERT statement per Tweet.
+UPSERT statement per Tweet. The isolated performance connection uses
+`synchronous_commit=off` so hosted-runner storage durability variance does not
+turn the 1,000 individual baseline commits into a disk benchmark. Integration
+tests continue to use PostgreSQL's default durability setting.
 
 ## Known limitations
 

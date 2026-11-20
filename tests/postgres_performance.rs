@@ -135,14 +135,24 @@ async fn measure_count(database: &TestDatabase, count: usize) -> Vec<Value> {
 #[tokio::test]
 #[ignore = "executed explicitly by the PostgreSQL performance CI job"]
 async fn postgres_batch_upsert_performance() {
-    let database = TestDatabase::new(5).await;
+    // The benchmark compares SQL/network round trips, not durable WAL latency.
+    // A single connection plus asynchronous commit keeps the 1,000 individual
+    // baseline commits repeatable on noisy hosted-runner storage.
+    let database = TestDatabase::new(1).await;
+    sqlx::query("SET synchronous_commit TO OFF")
+        .execute(database.pg_pool())
+        .await
+        .unwrap();
     let mut measurements = Vec::new();
+    println!("measuring 100-Tweet PostgreSQL scenarios");
     measurements.extend(measure_count(&database, 100).await);
+    println!("measuring 1,000-Tweet PostgreSQL scenarios");
     measurements.extend(measure_count(&database, 1_000).await);
 
     let report = json!({
         "postgres": "16",
         "batch_size": storage::TWEET_UPSERT_BATCH_SIZE,
+        "synchronous_commit": "off for performance trend only",
         "round_trip_note": "Batch estimates include BEGIN, DML statements, and COMMIT; sequential baseline uses one UPSERT statement per tweet.",
         "measurements": measurements,
     });

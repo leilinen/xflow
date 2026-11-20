@@ -11,6 +11,10 @@ env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: true
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: fmt / clippy / unit tests
@@ -71,6 +75,7 @@ jobs:
   postgres-performance:
     name: PostgreSQL 16 performance trend
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16
