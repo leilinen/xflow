@@ -44,17 +44,11 @@ pub async fn backfill_user(
     let (tweets, pages) = fetcher
         .fetch_user_tweets_paginated(&source, &user, max_pages, page_delay, cutoff)
         .await?;
-    let total = tweets.len();
-    let mut new = 0;
-    for tweet in &tweets {
-        if storage::upsert_tweet(pool, tweet).await? {
-            new += 1;
-        }
-    }
+    let summary = storage::upsert_tweets(pool, &tweets).await?;
     Ok(BackfillResult {
-        total,
-        new,
-        duplicate: total - new,
+        total: summary.total,
+        new: summary.new,
+        duplicate: summary.duplicate,
         pages,
     })
 }
@@ -96,6 +90,21 @@ pub async fn fetch_tweet_comments(
     fetcher
         .fetch_comments(tweet_id, max_comments, &spam_keywords)
         .await
+}
+
+/// Fetch one tweet by id through TweetDetail.
+///
+/// TweetDetail contains the focal tweet alongside replies and may contain
+/// quoted tweets. The focal result is selected by its exact id rather than by
+/// response order.
+pub async fn fetch_single_tweet(
+    config: &AppConfig,
+    pool: &PgPool,
+    tweet_id: &str,
+) -> anyhow::Result<Tweet> {
+    validate_tweet_id(tweet_id)?;
+    let fetcher = XWebFetcher::new(config, pool).await?;
+    fetcher.fetch_single_tweet(tweet_id).await
 }
 
 pub async fn verify_auth(
@@ -410,6 +419,23 @@ impl XWebFetcher {
         max_comments: usize,
         spam_keywords: &[String],
     ) -> anyhow::Result<Vec<TweetComment>> {
+        let value = self.fetch_tweet_detail(tweet_id).await?;
+        let mut comments = collect_comments(&value, tweet_id);
+        // Filter spam
+        let lower_keywords: Vec<String> = spam_keywords.iter().map(|k| k.to_lowercase()).collect();
+        comments.retain(|c| !is_spam(&c.text, &lower_keywords));
+        comments.truncate(max_comments);
+        Ok(comments)
+    }
+
+    async fn fetch_single_tweet(&self, tweet_id: &str) -> anyhow::Result<Tweet> {
+        validate_tweet_id(tweet_id)?;
+
+        let value = self.fetch_tweet_detail(tweet_id).await?;
+        parse_focal_tweet(&value, tweet_id)
+    }
+
+    async fn fetch_tweet_detail(&self, tweet_id: &str) -> anyhow::Result<Value> {
         let variables = json!({
             "focalTweetId": tweet_id,
             "count": 20,
@@ -437,21 +463,14 @@ impl XWebFetcher {
         let field_toggles = json!({
             "withArticlePlainText": false
         });
-        let value = self
-            .graphql_get(
-                &self.tweet_detail_query_id,
-                "TweetDetail",
-                variables,
-                features,
-                Some(field_toggles),
-            )
-            .await?;
-        let mut comments = collect_comments(&value, tweet_id);
-        // Filter spam
-        let lower_keywords: Vec<String> = spam_keywords.iter().map(|k| k.to_lowercase()).collect();
-        comments.retain(|c| !is_spam(&c.text, &lower_keywords));
-        comments.truncate(max_comments);
-        Ok(comments)
+        self.graphql_get(
+            &self.tweet_detail_query_id,
+            "TweetDetail",
+            variables,
+            features,
+            Some(field_toggles),
+        )
+        .await
     }
 
     async fn graphql_get(
@@ -603,6 +622,17 @@ impl XWebFetcher {
     fn cookie_header(&self) -> String {
         format!("auth_token={}; ct0={}", self.auth.auth_token, self.auth.ct0)
     }
+}
+
+fn validate_tweet_id(tweet_id: &str) -> anyhow::Result<()> {
+    if tweet_id.is_empty()
+        || tweet_id.len() > 20
+        || !tweet_id.bytes().all(|byte| byte.is_ascii_digit())
+        || tweet_id.parse::<u64>().is_err()
+    {
+        anyhow::bail!("tweet id must be a 1-20 digit unsigned integer");
+    }
+    Ok(())
 }
 
 fn parse_i64_header(headers: &header::HeaderMap, name: &str) -> Option<i64> {
@@ -779,6 +809,67 @@ fn parse_tweet_result(result: &Value, source: &Source, fallback_user: &XUser) ->
         fetched_at: Utc::now(),
         raw: tweet.clone(),
     })
+}
+
+/// Parse the exact focal tweet from a TweetDetail response.
+///
+/// The response is walked only to locate `tweet_results.result` candidates;
+/// each candidate must expose the requested id before it is parsed. This
+/// prevents replies or quoted tweets that happen to appear first in the
+/// response from being returned as the focal tweet.
+fn parse_focal_tweet(value: &Value, focal_tweet_id: &str) -> anyhow::Result<Tweet> {
+    let result = find_focal_tweet_result(value, focal_tweet_id).ok_or_else(|| {
+        anyhow::anyhow!("TweetDetail response did not contain focal tweet {focal_tweet_id}")
+    })?;
+    let tweet_node = unwrap_tweet_result(result);
+    let user = tweet_node
+        .pointer("/core/user_results/result")
+        .and_then(parse_user_result)
+        .ok_or_else(|| {
+            anyhow::anyhow!("TweetDetail focal tweet {focal_tweet_id} did not contain an author")
+        })?;
+    let source = Source {
+        source_type: SourceType::Account,
+        value: user.username.clone(),
+        label: None,
+        limit: None,
+    };
+    parse_tweet_result(result, &source, &user).ok_or_else(|| {
+        anyhow::anyhow!("TweetDetail focal tweet {focal_tweet_id} could not be parsed")
+    })
+}
+
+fn find_focal_tweet_result<'a>(value: &'a Value, focal_tweet_id: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            if let Some(result) = map
+                .get("tweet_results")
+                .and_then(|tweet_results| tweet_results.get("result"))
+            {
+                if tweet_result_id(result) == Some(focal_tweet_id) {
+                    return Some(result);
+                }
+            }
+            map.values()
+                .find_map(|child| find_focal_tweet_result(child, focal_tweet_id))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_focal_tweet_result(item, focal_tweet_id)),
+        _ => None,
+    }
+}
+
+fn tweet_result_id(result: &Value) -> Option<&str> {
+    let tweet = unwrap_tweet_result(result);
+    tweet
+        .get("rest_id")
+        .or_else(|| tweet.pointer("/legacy/id_str"))
+        .and_then(Value::as_str)
+}
+
+fn unwrap_tweet_result(result: &Value) -> &Value {
+    result.get("tweet").unwrap_or(result)
 }
 
 fn note_tweet_text(tweet: &Value) -> Option<String> {
@@ -972,9 +1063,12 @@ fn is_spam(text: &str, lower_keywords: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_tweets, parse_user, random_user_agent, XUser};
+    use super::{
+        collect_tweets, parse_focal_tweet, parse_user, random_user_agent, validate_tweet_id, XUser,
+    };
+    use crate::fetch::media::{extract_media, extract_reply_context, TweetMedium};
     use crate::models::{Source, SourceType};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::HashSet;
 
     #[test]
@@ -1072,5 +1166,95 @@ mod tests {
     fn random_user_agent_varies_across_calls() {
         let agents: HashSet<&str> = (0..50).map(|_| random_user_agent()).collect();
         assert!(agents.len() > 1, "user agent should vary across calls");
+    }
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let raw = match name {
+            "plain" => include_str!("../../tests/fixtures/tweet_detail/plain.json"),
+            "photo" => include_str!("../../tests/fixtures/tweet_detail/photo.json"),
+            "video" => include_str!("../../tests/fixtures/tweet_detail/video.json"),
+            "quote" => include_str!("../../tests/fixtures/tweet_detail/quote.json"),
+            "long_text" => include_str!("../../tests/fixtures/tweet_detail/long_text.json"),
+            "visibility" => {
+                include_str!("../../tests/fixtures/tweet_detail/visibility_wrapper.json")
+            }
+            other => panic!("unknown fixture: {other}"),
+        };
+        serde_json::from_str(raw).expect("fixture must be valid JSON")
+    }
+
+    #[test]
+    fn focal_selection_ignores_reply_that_appears_first() {
+        let tweet = parse_focal_tweet(&fixture("plain"), "100").unwrap();
+        assert_eq!(tweet.tweet_id, "100");
+        assert_eq!(tweet.author_username, "focal_author");
+        assert_eq!(tweet.source_value, "focal_author");
+        assert_eq!(tweet.text, "plain focal tweet");
+    }
+
+    #[test]
+    fn focal_selection_rejects_missing_id() {
+        let error = parse_focal_tweet(&fixture("plain"), "999").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not contain focal tweet 999"));
+    }
+
+    #[test]
+    fn single_tweet_id_validation_rejects_invalid_values() {
+        assert!(validate_tweet_id("").is_err());
+        assert!(validate_tweet_id("-1").is_err());
+        assert!(validate_tweet_id("１２３").is_err());
+        assert!(validate_tweet_id("18446744073709551616").is_err());
+        assert!(validate_tweet_id("12345678901234567890").is_ok());
+    }
+
+    #[test]
+    fn focal_photo_raw_is_consumable_by_media_parser() {
+        let tweet = parse_focal_tweet(&fixture("photo"), "200").unwrap();
+        let media = extract_media(&tweet.raw);
+        assert_eq!(media.len(), 1);
+        assert!(matches!(media[0], TweetMedium::Photo { .. }));
+    }
+
+    #[test]
+    fn focal_video_raw_is_consumable_by_media_parser() {
+        let tweet = parse_focal_tweet(&fixture("video"), "300").unwrap();
+        let media = extract_media(&tweet.raw);
+        assert_eq!(media.len(), 1);
+        assert_eq!(
+            media[0],
+            TweetMedium::Video {
+                url: "https://video.twimg.com/focal-high.mp4".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn focal_quote_raw_is_consumable_by_quote_parser() {
+        let tweet = parse_focal_tweet(&fixture("quote"), "400").unwrap();
+        let context = extract_reply_context(&tweet.raw).unwrap();
+        let quoted = context.quoted_tweet.unwrap();
+        assert_eq!(quoted.tweet_id, "401");
+        assert_eq!(quoted.author_username, "quoted_author");
+        assert_eq!(quoted.text, "quoted tweet body");
+    }
+
+    #[test]
+    fn focal_long_text_prefers_note_tweet_text() {
+        let tweet = parse_focal_tweet(&fixture("long_text"), "500").unwrap();
+        assert_eq!(tweet.text, "full long-form focal tweet text");
+    }
+
+    #[test]
+    fn focal_visibility_wrapper_is_unwrapped_and_preserves_raw_tweet() {
+        let tweet = parse_focal_tweet(&fixture("visibility"), "600").unwrap();
+        assert_eq!(tweet.tweet_id, "600");
+        assert_eq!(tweet.text, "visible focal tweet");
+        assert_eq!(
+            tweet.raw.get("rest_id").and_then(Value::as_str),
+            Some("600")
+        );
+        assert!(tweet.raw.get("tweet").is_none());
     }
 }

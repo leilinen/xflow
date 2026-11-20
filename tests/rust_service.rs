@@ -1,7 +1,11 @@
+mod support;
+
 use chrono::{TimeZone, Utc};
-use sqlx::postgres::PgPoolOptions;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use support::TestDatabase;
 use tempfile::tempdir;
+use tokio::sync::Barrier;
+use tokio::time::{timeout, Duration};
 use xflow::channel::{self, ChannelSendFuture, ChannelSendReceipt, DeliveryChannel};
 use xflow::config::{load_config, AppConfig};
 use xflow::fetch::auth;
@@ -12,42 +16,427 @@ use xflow::storage::{self, TokenImport, TweetFilter};
 use xflow::worker;
 use xflow::worker::pipeline;
 
-fn test_database_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/xflow_test".to_string())
+async fn test_pool() -> TestDatabase {
+    TestDatabase::new(5).await
 }
 
-/// Creates a unique PG schema for test isolation using a random suffix.
-async fn test_pool() -> (tempfile::TempDir, sqlx::PgPool) {
-    let dir = tempdir().unwrap();
-    let url = test_database_url();
-    let admin_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .unwrap();
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let schema = format!("test_{}_{}", std::process::id(), suffix);
-    sqlx::query(&format!(r#"CREATE SCHEMA "{schema}""#))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
-    admin_pool.close().await;
+fn test_tweet(tweet_id: &str, text: &str) -> Tweet {
+    Tweet {
+        tweet_id: tweet_id.to_string(),
+        source_type: SourceType::Account,
+        source_value: "openai".to_string(),
+        author_username: "openai".to_string(),
+        author_name: "OpenAI".to_string(),
+        text: text.to_string(),
+        url: format!("https://x.com/openai/status/{tweet_id}"),
+        created_at: Utc::now(),
+        fetched_at: Utc::now(),
+        raw: serde_json::json!({"version": text}),
+    }
+}
 
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
+#[tokio::test]
+async fn favorite_insert_is_idempotent_and_preserves_first_created_at() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("favorite-1", "first");
+    storage::upsert_tweet(&pool, &tweet).await.unwrap();
+
+    assert!(storage::add_favorite(&pool, 7, &tweet.tweet_id)
+        .await
+        .unwrap());
+    let first_created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM telegram_favorites WHERE chat_id = 7 AND tweet_id = $1",
+    )
+    .bind(&tweet.tweet_id)
+    .fetch_one(pool.pg_pool())
+    .await
+    .unwrap();
+
+    assert!(!storage::add_favorite(&pool, 7, &tweet.tweet_id)
+        .await
+        .unwrap());
+    let second_created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM telegram_favorites WHERE chat_id = 7 AND tweet_id = $1",
+    )
+    .bind(&tweet.tweet_id)
+    .fetch_one(pool.pg_pool())
+    .await
+    .unwrap();
+    assert_eq!(first_created_at, second_created_at);
+    assert_eq!(
+        storage::list_favorites(&pool, 7, 10, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_favorite_inserts_create_one_row() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("favorite-concurrent", "concurrent");
+    storage::upsert_tweet(&pool, &tweet).await.unwrap();
+
+    let (first, second) = tokio::join!(
+        storage::add_favorite(&pool, 7, &tweet.tweet_id),
+        storage::add_favorite(&pool, 7, &tweet.tweet_id)
+    );
+    let inserted = [first.unwrap(), second.unwrap()]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    assert_eq!(inserted, 1);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM telegram_favorites WHERE chat_id = 7 AND tweet_id = $1",
+    )
+    .bind(&tweet.tweet_id)
+    .fetch_one(pool.pg_pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn different_chats_can_favorite_the_same_tweet() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("favorite-two-chats", "shared");
+    storage::upsert_tweet(&pool, &tweet).await.unwrap();
+    assert!(storage::add_favorite(&pool, 7, &tweet.tweet_id)
+        .await
+        .unwrap());
+    assert!(storage::add_favorite(&pool, 8, &tweet.tweet_id)
+        .await
+        .unwrap());
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM telegram_favorites WHERE tweet_id = $1")
+            .bind(&tweet.tweet_id)
+            .fetch_one(pool.pg_pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn favorite_foreign_key_rejects_missing_tweet_and_cascades_delete() {
+    let pool = test_pool().await;
+    assert!(storage::add_favorite(&pool, 7, "missing-tweet")
+        .await
+        .is_err());
+
+    let tweet = test_tweet("favorite-cascade", "cascade");
+    storage::upsert_tweet(&pool, &tweet).await.unwrap();
+    storage::add_favorite(&pool, 7, &tweet.tweet_id)
         .await
         .unwrap();
-    sqlx::query(&format!(r#"SET search_path TO "{schema}", public"#))
-        .execute(&pool)
+    sqlx::query("DELETE FROM tweets WHERE tweet_id = $1")
+        .bind(&tweet.tweet_id)
+        .execute(pool.pg_pool())
         .await
         .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM telegram_favorites WHERE tweet_id = $1")
+            .bind(&tweet.tweet_id)
+            .fetch_one(pool.pg_pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn favorites_use_descending_keyset_pagination() {
+    let pool = test_pool().await;
+    for (tweet_id, created_at) in [
+        ("page-a", "2026-01-01T00:00:01Z"),
+        // Equal timestamps exercise the tweet_id tie-breaker in the cursor.
+        ("page-b", "2026-01-01T00:00:03Z"),
+        ("page-c", "2026-01-01T00:00:03Z"),
+    ] {
+        storage::upsert_tweet(&pool, &test_tweet(tweet_id, tweet_id))
+            .await
+            .unwrap();
+        storage::add_favorite(&pool, 7, tweet_id).await.unwrap();
+        sqlx::query(
+            "UPDATE telegram_favorites SET created_at = $1::timestamptz WHERE chat_id = 7 AND tweet_id = $2",
+        )
+        .bind(created_at)
+        .bind(tweet_id)
+        .execute(pool.pg_pool())
+        .await
+        .unwrap();
+    }
+
+    let first = storage::list_favorites(&pool, 7, 2, None).await.unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|favorite| favorite.tweet.tweet.tweet_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["page-c", "page-b"]
+    );
+    let second = storage::list_favorites(&pool, 7, 2, Some(&first[1].cursor()))
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].tweet.tweet.tweet_id, "page-a");
+}
+
+#[tokio::test]
+async fn tweet_upsert_and_backfill_summary_distinguish_insert_from_update() {
+    let pool = test_pool().await;
+    let first = test_tweet("upsert-1", "v1");
+    assert!(storage::upsert_tweet(&pool, &first).await.unwrap());
+
+    let mut updated = first.clone();
+    updated.fetched_at = Utc::now() + chrono::Duration::seconds(1);
+    updated.raw = serde_json::json!({"version": "v2"});
+    assert!(!storage::upsert_tweet(&pool, &updated).await.unwrap());
+    let stored = storage::get_tweet(&pool, &first.tweet_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.tweet.raw, serde_json::json!({"version": "v2"}));
+
+    let batch = vec![test_tweet("backfill-a", "a"), test_tweet("backfill-b", "b")];
+    let initial = storage::upsert_tweets(&pool, &batch).await.unwrap();
+    assert_eq!((initial.total, initial.new, initial.duplicate), (2, 2, 0));
+    let repeated = storage::upsert_tweets(&pool, &batch).await.unwrap();
+    assert_eq!(
+        (repeated.total, repeated.new, repeated.duplicate),
+        (2, 0, 2)
+    );
+}
+
+#[tokio::test]
+async fn concurrent_upserts_for_same_tweet_report_one_insert_without_deadlock() {
+    let pool = test_pool().await;
+    let barrier = Arc::new(Barrier::new(3));
+    let mut first = test_tweet("upsert-concurrent-same", "first");
+    first.raw = serde_json::json!({"version": "first"});
+    let mut second = test_tweet("upsert-concurrent-same", "second");
+    second.raw = serde_json::json!({"version": "second"});
+
+    let first_pool = pool.pg_pool().clone();
+    let first_barrier = barrier.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        storage::upsert_tweet(&first_pool, &first).await
+    });
+    let second_pool = pool.pg_pool().clone();
+    let second_barrier = barrier.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        storage::upsert_tweet(&second_pool, &second).await
+    });
+    barrier.wait().await;
+
+    let (first_result, second_result) = timeout(Duration::from_secs(5), async {
+        (first_task.await.unwrap(), second_task.await.unwrap())
+    })
+    .await
+    .expect("same-id UPSERTs must not deadlock");
+    let inserted = [first_result.unwrap(), second_result.unwrap()]
+        .into_iter()
+        .filter(|inserted| *inserted)
+        .count();
+    assert_eq!(inserted, 1);
+    let stored = storage::get_tweet(&pool, "upsert-concurrent-same")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        stored.tweet.raw["version"].as_str(),
+        Some("first" | "second")
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_upserts_for_different_tweets_complete_independently() {
+    let pool = test_pool().await;
+    let barrier = Arc::new(Barrier::new(3));
+    let first_pool = pool.pg_pool().clone();
+    let first_barrier = barrier.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        storage::upsert_tweet(&first_pool, &test_tweet("upsert-concurrent-a", "a")).await
+    });
+    let second_pool = pool.pg_pool().clone();
+    let second_barrier = barrier.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        storage::upsert_tweet(&second_pool, &test_tweet("upsert-concurrent-b", "b")).await
+    });
+    barrier.wait().await;
+
+    let (first, second) = timeout(Duration::from_secs(5), async {
+        (first_task.await.unwrap(), second_task.await.unwrap())
+    })
+    .await
+    .expect("different-id UPSERTs must not block indefinitely");
+    assert!(first.unwrap());
+    assert!(second.unwrap());
+}
+
+#[tokio::test]
+async fn concurrent_tweet_and_favorite_transactions_are_idempotent() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("transaction-concurrent", "shared");
+    let barrier = Arc::new(Barrier::new(3));
+
+    let first_pool = pool.pg_pool().clone();
+    let first_tweet = tweet.clone();
+    let first_barrier = barrier.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        storage::save_tweet_and_favorite(&first_pool, 7, &first_tweet).await
+    });
+    let second_pool = pool.pg_pool().clone();
+    let second_barrier = barrier.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        storage::save_tweet_and_favorite(&second_pool, 7, &tweet).await
+    });
+    barrier.wait().await;
+
+    let (first, second) = timeout(Duration::from_secs(5), async {
+        (first_task.await.unwrap(), second_task.await.unwrap())
+    })
+    .await
+    .expect("concurrent Tweet + Favorite transactions must not deadlock");
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.tweet_inserted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.favorite_inserted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        storage::list_favorites(&pool, 7, 10, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn batch_upsert_handles_duplicate_ids_and_keeps_last_payload() {
+    let pool = test_pool().await;
+    let batch = vec![
+        test_tweet("batch-duplicate", "first"),
+        test_tweet("batch-unique", "unique"),
+        test_tweet("batch-duplicate", "last"),
+    ];
+    let initial = storage::upsert_tweets(&pool, &batch).await.unwrap();
+    assert_eq!((initial.total, initial.new, initial.duplicate), (3, 2, 1));
+    assert_eq!(
+        storage::get_tweet(&pool, "batch-duplicate")
+            .await
+            .unwrap()
+            .unwrap()
+            .tweet
+            .raw["version"],
+        "last"
+    );
+
+    let repeated = storage::upsert_tweets(&pool, &batch).await.unwrap();
+    assert_eq!(
+        (repeated.total, repeated.new, repeated.duplicate),
+        (3, 0, 3)
+    );
+}
+
+#[tokio::test]
+async fn overlapping_batches_use_consistent_lock_order() {
+    let pool = test_pool().await;
+    let first = vec![
+        test_tweet("batch-lock-a", "a1"),
+        test_tweet("batch-lock-b", "b1"),
+    ];
+    let second = vec![
+        test_tweet("batch-lock-b", "b2"),
+        test_tweet("batch-lock-a", "a2"),
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let first_pool = pool.pg_pool().clone();
+    let first_barrier = barrier.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        storage::upsert_tweets(&first_pool, &first).await
+    });
+    let second_pool = pool.pg_pool().clone();
+    let second_barrier = barrier.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        storage::upsert_tweets(&second_pool, &second).await
+    });
+    barrier.wait().await;
+
+    timeout(Duration::from_secs(5), async {
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("overlapping batches must not deadlock");
+}
+
+#[tokio::test]
+async fn tweet_and_favorite_transaction_is_idempotent_and_rolls_back_on_failure() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("transaction-ok", "ok");
+    let first = storage::save_tweet_and_favorite(&pool, 7, &tweet)
+        .await
+        .unwrap();
+    assert!(first.tweet_inserted);
+    assert!(first.favorite_inserted);
+    let repeated = storage::save_tweet_and_favorite(&pool, 7, &tweet)
+        .await
+        .unwrap();
+    assert!(!repeated.tweet_inserted);
+    assert!(!repeated.favorite_inserted);
+
+    sqlx::query(
+        "ALTER TABLE telegram_favorites ADD CONSTRAINT reject_negative_chat CHECK (chat_id >= 0)",
+    )
+    .execute(pool.pg_pool())
+    .await
+    .unwrap();
+    let rejected = test_tweet("transaction-rollback", "rollback");
+    assert!(storage::save_tweet_and_favorite(&pool, -1, &rejected)
+        .await
+        .is_err());
+    assert!(storage::get_tweet(&pool, &rejected.tweet_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn database_initialization_is_repeatable_with_favorite_schema() {
+    let pool = test_pool().await;
     db::init_db(&pool).await.unwrap();
-    (dir, pool)
+    db::init_db(&pool).await.unwrap();
+    let data_type: String = sqlx::query_scalar(
+        r#"
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'telegram_favorites'
+          AND column_name = 'created_at'
+        "#,
+    )
+    .fetch_one(pool.pg_pool())
+    .await
+    .unwrap();
+    assert_eq!(data_type, "timestamp with time zone");
 }
 
 #[test]
@@ -104,7 +493,7 @@ fn token_validation_rejects_bad_shapes() {
 
 #[tokio::test]
 async fn auth_import_list_check_delete() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token = TokenImport {
         label: "account1".to_string(),
         domain: "x.com".to_string(),
@@ -130,7 +519,7 @@ async fn auth_import_list_check_delete() {
 
 #[tokio::test]
 async fn auth_selection_skips_rejected_and_limited_accounts() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token = TokenImport {
         label: "account1".to_string(),
         domain: "x.com".to_string(),
@@ -164,7 +553,7 @@ async fn auth_selection_skips_rejected_and_limited_accounts() {
 
 #[tokio::test]
 async fn auth_rate_limit_updates_are_upserted() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token = TokenImport {
         label: "account1".to_string(),
         domain: "x.com".to_string(),
@@ -201,7 +590,7 @@ async fn auth_rate_limit_updates_are_upserted() {
 
 #[tokio::test]
 async fn x_web_fetcher_stops_before_rate_limit_margin() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token = TokenImport {
         label: "account1".to_string(),
         domain: "x.com".to_string(),
@@ -245,8 +634,8 @@ async fn x_web_fetcher_stops_before_rate_limit_margin() {
 
 #[tokio::test]
 async fn auth_import_rejects_malformed_token_json() {
-    let (dir, pool) = test_pool().await;
-    let path = dir.path().join("bad-token.json");
+    let pool = test_pool().await;
+    let path = pool.path().join("bad-token.json");
     std::fs::write(&path, r#"{"label":"account1","auth_token":"short"}"#).unwrap();
     let err = auth::import_token_json(&pool, &path).await.unwrap_err();
     assert!(err.to_string().contains("missing field"));
@@ -254,7 +643,7 @@ async fn auth_import_rejects_malformed_token_json() {
 
 #[tokio::test]
 async fn fetch_dedupes_and_generates_digest() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let config = AppConfig::default();
     for (source_type, value, limit) in [
         (SourceType::Account, "openai", 5),
@@ -294,7 +683,7 @@ async fn fetch_dedupes_and_generates_digest() {
 
 #[tokio::test]
 async fn fetch_uses_enabled_database_sources() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let config = AppConfig::default();
     storage::upsert_source(
         &pool,
@@ -329,7 +718,7 @@ async fn fetch_uses_enabled_database_sources() {
 
 #[tokio::test]
 async fn fetch_continues_after_source_failures() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_source(
         &pool,
         &Source {
@@ -374,7 +763,7 @@ async fn fetch_continues_after_source_failures() {
         .all(|error| error.message.contains("supports only account sources")));
     let error_states: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM fetch_state WHERE last_status = 'error'")
-            .fetch_one(&pool)
+            .fetch_one(pool.pg_pool())
             .await
             .unwrap();
     assert_eq!(error_states, 2);
@@ -382,7 +771,7 @@ async fn fetch_continues_after_source_failures() {
 
 #[tokio::test]
 async fn fetch_state_reports_per_source_count() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_source(
         &pool,
         &Source {
@@ -413,7 +802,7 @@ async fn fetch_state_reports_per_source_count() {
     assert_eq!(result.failed, 0);
     let mut messages: Vec<String> =
         sqlx::query_scalar("SELECT message FROM fetch_state WHERE last_status = 'ok'")
-            .fetch_all(&pool)
+            .fetch_all(pool.pg_pool())
             .await
             .unwrap();
     messages.sort();
@@ -428,7 +817,7 @@ async fn fetch_state_reports_per_source_count() {
 
 #[tokio::test]
 async fn worker_returns_result_after_source_fetch_failure() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_source(
         &pool,
         &Source {
@@ -461,7 +850,7 @@ async fn worker_returns_result_after_source_fetch_failure() {
 
 #[tokio::test]
 async fn x_web_fetcher_requires_auth_account() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let mut config = AppConfig::default();
     config.fetch.fetcher = "x_web".to_string();
     let source = Source {
@@ -480,7 +869,7 @@ async fn x_web_fetcher_requires_auth_account() {
 
 #[tokio::test]
 async fn x_web_fetcher_rejects_non_account_sources() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token = TokenImport {
         label: "account1".to_string(),
         domain: "x.com".to_string(),
@@ -505,7 +894,7 @@ async fn x_web_fetcher_rejects_non_account_sources() {
 
 #[tokio::test]
 async fn rss_generation_contains_items() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_tweet(
         &pool,
         &Tweet {
@@ -539,7 +928,7 @@ async fn rss_generation_contains_items() {
 
 #[tokio::test]
 async fn daily_digest_query_uses_account_sources_and_window() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let inside = Utc.with_ymd_and_hms(2026, 6, 26, 2, 0, 0).unwrap();
     let outside = Utc.with_ymd_and_hms(2026, 6, 25, 8, 0, 0).unwrap();
     let window_start = Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap();
@@ -590,7 +979,7 @@ async fn daily_digest_query_uses_account_sources_and_window() {
 
 #[tokio::test]
 async fn daily_digest_run_records_delivery_and_dedupes() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let start = Utc.with_ymd_and_hms(2026, 6, 25, 10, 0, 0).unwrap();
     let end = Utc.with_ymd_and_hms(2026, 6, 26, 10, 0, 0).unwrap();
 
@@ -637,7 +1026,7 @@ async fn daily_digest_run_records_delivery_and_dedupes() {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM daily_digest_runs WHERE digest_date = '2026-06-26'",
     )
-    .fetch_one(&pool)
+    .fetch_one(pool.pg_pool())
     .await
     .unwrap();
     assert_eq!(count, 1);
@@ -645,7 +1034,7 @@ async fn daily_digest_run_records_delivery_and_dedupes() {
 
 #[tokio::test]
 async fn tweet_username_filter_is_case_insensitive() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_tweet(
         &pool,
         &Tweet {
@@ -697,7 +1086,7 @@ impl DeliveryChannel for MockChannel {
 
 #[tokio::test]
 async fn channel_delivery_records_prevent_duplicate_sends() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_tweet(
         &pool,
         &Tweet {
@@ -732,7 +1121,7 @@ async fn channel_delivery_records_prevent_duplicate_sends() {
 
 #[tokio::test]
 async fn save_delivery_upsert_deduplicates() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_tweet(
         &pool,
         &Tweet {
@@ -774,14 +1163,14 @@ async fn save_delivery_upsert_deduplicates() {
     .unwrap();
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE tweet_id = 'dup-1'")
-        .fetch_one(&pool)
+        .fetch_one(pool.pg_pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
 
     let status: String =
         sqlx::query_scalar("SELECT status FROM deliveries WHERE tweet_id = 'dup-1'")
-            .fetch_one(&pool)
+            .fetch_one(pool.pg_pool())
             .await
             .unwrap();
     assert_eq!(status, "delivered");
@@ -789,7 +1178,7 @@ async fn save_delivery_upsert_deduplicates() {
 
 #[tokio::test]
 async fn deliveries_unique_constraint_allows_different_channels() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     storage::upsert_tweet(
         &pool,
         &Tweet {
@@ -831,7 +1220,7 @@ async fn deliveries_unique_constraint_allows_different_channels() {
 
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE tweet_id = 'multi-1'")
-            .fetch_one(&pool)
+            .fetch_one(pool.pg_pool())
             .await
             .unwrap();
     assert_eq!(count, 2);
@@ -839,7 +1228,7 @@ async fn deliveries_unique_constraint_allows_different_channels() {
 
 #[tokio::test]
 async fn next_auth_rotates_by_last_used_at() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token_a = TokenImport {
         label: "alpha".to_string(),
         domain: "x.com".to_string(),
@@ -883,7 +1272,7 @@ async fn next_auth_rotates_by_last_used_at() {
 
 #[tokio::test]
 async fn next_auth_skips_limited_and_rejected() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     let token_a = TokenImport {
         label: "alpha".to_string(),
         domain: "x.com".to_string(),
@@ -921,7 +1310,7 @@ async fn next_auth_skips_limited_and_rejected() {
 
 #[tokio::test]
 async fn check_token_freshness_detects_stale_tokens() {
-    let (_dir, pool) = test_pool().await;
+    let pool = test_pool().await;
     // Import a token and manually set updated_at to 10 days ago.
     let token = TokenImport {
         label: "stale_one".to_string(),
@@ -935,7 +1324,7 @@ async fn check_token_freshness_detects_stale_tokens() {
     sqlx::query("UPDATE auth_accounts SET updated_at = $1 WHERE label = $2")
         .bind(&ten_days_ago)
         .bind("stale_one")
-        .execute(&pool)
+        .execute(pool.pg_pool())
         .await
         .unwrap();
 

@@ -1,3 +1,5 @@
+mod share;
+
 use crate::channel;
 use crate::channel::telegram;
 use crate::config::AppConfig;
@@ -7,6 +9,8 @@ use crate::storage;
 use crate::worker::pipeline;
 use serde::Deserialize;
 use sqlx::PgPool;
+
+use self::share::PrivateMessageRoute;
 
 #[derive(Debug, Deserialize)]
 struct TelegramUpdate {
@@ -87,7 +91,7 @@ fn is_group_chat(chat: &TelegramChat) -> bool {
 
 pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
     let bot_token = telegram::load_bot_token(&config.telegram)?;
-    let allowed_chat_id = std::env::var(&config.telegram.chat_id_env).ok();
+    let allowed_chat_id = load_allowed_private_chat_id(&config.telegram.chat_id_env)?;
     let bot_username = get_bot_username(&bot_token).await;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
@@ -108,17 +112,23 @@ pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
                         let is_group = is_group_chat(&message.chat);
                         let is_channel = message.chat.chat_type == "channel";
 
-                        // In private chat: check authorization
-                        if !is_group && !is_channel {
-                            if let Some(ref allowed) = allowed_chat_id {
-                                if message.chat.id.to_string() != *allowed {
-                                    tracing::warn!(
-                                        chat_id = message.chat.id,
-                                        "ignoring message from unauthorized chat"
-                                    );
-                                    continue;
-                                }
-                            }
+                        let is_private = message.chat.chat_type == "private";
+
+                        // Private chat access is fail-closed. Authorization is
+                        // checked before inspecting message text or URLs.
+                        if is_private && message.chat.id != allowed_chat_id {
+                            tracing::warn!(
+                                chat_id = message.chat.id,
+                                "ignoring message from unauthorized private chat"
+                            );
+                            continue;
+                        }
+                        if !is_private && !is_group && !is_channel {
+                            tracing::warn!(
+                                chat_type = %message.chat.chat_type,
+                                "ignoring message with unsupported chat type"
+                            );
+                            continue;
                         }
 
                         let Some(text) = message.text else {
@@ -137,17 +147,43 @@ pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
                             continue;
                         }
 
-                        let sender_name = message.from.as_ref().map(|u| u.display_name());
-                        handle_command(
-                            &config,
-                            &pool,
-                            &client,
-                            &bot_token,
-                            message.chat.id,
-                            &text,
-                            sender_name.as_deref(),
-                        )
-                        .await;
+                        let should_handle_command = if is_private {
+                            match share::route_private_message(
+                                &message.chat.chat_type,
+                                message.chat.id,
+                                allowed_chat_id,
+                                &text,
+                            ) {
+                                PrivateMessageRoute::Share(request) => {
+                                    tracing::info!(
+                                        tweet_id = %request.tweet_id,
+                                        status = "recognized",
+                                        "Share to Bot request recognized"
+                                    );
+                                    // Stage 2 intentionally stops at routing.
+                                    // No X request, database write, or card send.
+                                    false
+                                }
+                                PrivateMessageRoute::Command => true,
+                                PrivateMessageRoute::Other => false,
+                            }
+                        } else {
+                            true
+                        };
+
+                        if should_handle_command {
+                            let sender_name = message.from.as_ref().map(|u| u.display_name());
+                            handle_command(
+                                &config,
+                                &pool,
+                                &client,
+                                &bot_token,
+                                message.chat.id,
+                                &text,
+                                sender_name.as_deref(),
+                            )
+                            .await;
+                        }
                     }
 
                     if let Some(callback) = update.callback_query {
@@ -161,6 +197,20 @@ pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
+}
+
+fn load_allowed_private_chat_id(env_name: &str) -> anyhow::Result<i64> {
+    let value = std::env::var(env_name).ok();
+    parse_allowed_private_chat_id(value.as_deref())
+}
+
+fn parse_allowed_private_chat_id(value: Option<&str>) -> anyhow::Result<i64> {
+    let value = value.ok_or_else(|| {
+        anyhow::anyhow!("required Telegram private chat allowlist is not configured")
+    })?;
+    value.parse::<i64>().map_err(|_| {
+        anyhow::anyhow!("Telegram private chat allowlist must be a valid integer chat id")
+    })
 }
 
 async fn get_bot_username(bot_token: &str) -> Option<String> {
@@ -2297,6 +2347,31 @@ async fn cmd_spam(pool: &PgPool, args: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_chat_allowlist_is_fail_closed() {
+        assert!(parse_allowed_private_chat_id(None).is_err());
+        assert!(parse_allowed_private_chat_id(Some("")).is_err());
+        assert!(parse_allowed_private_chat_id(Some("not-a-chat-id")).is_err());
+        assert_eq!(parse_allowed_private_chat_id(Some("12345")).unwrap(), 12345);
+    }
+
+    #[test]
+    fn callback_update_remains_separate_from_message_routing() {
+        let update: TelegramUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 7, "first_name": "Test"},
+                "message": {"message_id": 9, "chat": {"id": 7, "type": "private"}},
+                "data": "comments:123"
+            }
+        }))
+        .unwrap();
+        assert!(update.message.is_none());
+        assert!(update.channel_post.is_none());
+        assert!(update.callback_query.is_some());
+    }
 
     #[test]
     fn parse_command_basic() {

@@ -1,0 +1,12 @@
+{
+  "_fixture_note": "synthetic redacted structural sample",
+  "data": {"timeline": {"tweet_results": {"result": {
+    "rest_id": "200",
+    "core": {"user_results": {"result": {"rest_id": "20", "legacy": {"screen_name": "photo_author", "name": "Photo Author"}}}},
+    "legacy": {
+      "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+      "full_text": "photo focal tweet",
+      "extended_entities": {"media": [{"type": "photo", "media_url_https": "https://pbs.twimg.com/media/focal.jpg"}]}
+    }
+  }}}}
+}

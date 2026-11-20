@@ -1,0 +1,12 @@
+{
+  "_fixture_note": "synthetic redacted structural sample",
+  "data": {"timeline": {"tweet_results": {"result": {
+    "__typename": "TweetWithVisibilityResults",
+    "tweet": {
+      "rest_id": "600",
+      "core": {"user_results": {"result": {"rest_id": "60", "legacy": {"screen_name": "visible_author", "name": "Visible Author"}}}},
+      "legacy": {"created_at": "Wed Oct 10 20:19:24 +0000 2018", "full_text": "visible focal tweet"}
+    },
+    "limitedActionResults": {"limited_actions": []}
+  }}}}
+}

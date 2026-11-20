@@ -1,0 +1,37 @@
+{
+  "_fixture_note": "synthetic redacted structural sample",
+  "data": {
+    "threaded_conversation_with_injections_v2": {
+      "instructions": [{
+        "entries": [
+          {
+            "content": {
+              "itemContent": {
+                "tweet_results": {
+                  "result": {
+                    "rest_id": "101",
+                    "core": {"user_results": {"result": {"rest_id": "2", "legacy": {"screen_name": "reply_author", "name": "Reply Author"}}}},
+                    "legacy": {"created_at": "Wed Oct 10 20:20:24 +0000 2018", "full_text": "reply before focal", "in_reply_to_status_id_str": "100"}
+                  }
+                }
+              }
+            }
+          },
+          {
+            "content": {
+              "itemContent": {
+                "tweet_results": {
+                  "result": {
+                    "rest_id": "100",
+                    "core": {"user_results": {"result": {"rest_id": "1", "legacy": {"screen_name": "focal_author", "name": "Focal Author"}}}},
+                    "legacy": {"created_at": "Wed Oct 10 20:19:24 +0000 2018", "full_text": "plain focal tweet"}
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }]
+    }
+  }
+}

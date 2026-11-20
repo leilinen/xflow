@@ -52,6 +52,17 @@ CREATE TABLE IF NOT EXISTS tweets (
     raw_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS telegram_favorites (
+    chat_id BIGINT NOT NULL,
+    tweet_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (chat_id, tweet_id),
+    FOREIGN KEY (tweet_id) REFERENCES tweets(tweet_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_favorites_chat_created_tweet
+ON telegram_favorites (chat_id, created_at DESC, tweet_id DESC);
+
 CREATE TABLE IF NOT EXISTS fetch_state (
     source_type TEXT NOT NULL,
     source_value TEXT NOT NULL,

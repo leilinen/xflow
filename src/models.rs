@@ -77,3 +77,25 @@ pub struct StoredTweet {
     #[serde(flatten)]
     pub tweet: Tweet,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FavoriteCursor {
+    pub created_at: DateTime<Utc>,
+    pub tweet_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramFavorite {
+    pub chat_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub tweet: StoredTweet,
+}
+
+impl TelegramFavorite {
+    pub fn cursor(&self) -> FavoriteCursor {
+        FavoriteCursor {
+            created_at: self.created_at,
+            tweet_id: self.tweet.tweet.tweet_id.clone(),
+        }
+    }
+}

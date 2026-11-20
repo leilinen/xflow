@@ -1,0 +1,18 @@
+{
+  "_fixture_note": "synthetic redacted structural sample",
+  "data": {"timeline": {"tweet_results": {"result": {
+    "rest_id": "300",
+    "core": {"user_results": {"result": {"rest_id": "30", "legacy": {"screen_name": "video_author", "name": "Video Author"}}}},
+    "legacy": {
+      "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+      "full_text": "video focal tweet",
+      "extended_entities": {"media": [{
+        "type": "video",
+        "video_info": {"variants": [
+          {"content_type": "video/mp4", "bitrate": 256000, "url": "https://video.twimg.com/focal-low.mp4"},
+          {"content_type": "video/mp4", "bitrate": 832000, "url": "https://video.twimg.com/focal-high.mp4"}
+        ]}
+      }]}
+    }
+  }}}}
+}

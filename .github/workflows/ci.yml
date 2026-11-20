@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'stage3-*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,7 +13,32 @@ env:
 
 jobs:
   check:
-    name: fmt / clippy / test
+    name: fmt / clippy / unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install SQLite dev headers
+        run: sudo apt-get install -y libsqlite3-dev
+
+      - name: Check formatting
+        run: cargo fmt --check --all
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+  postgres-integration:
+    name: PostgreSQL 16 integration tests
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -36,25 +62,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install SQLite dev headers
-        run: sudo apt-get install -y libsqlite3-dev
+      - name: Run PostgreSQL integration tests
+        run: cargo test --test rust_service -- --test-threads=1
 
-      - name: Check formatting
-        run: cargo fmt --check --all
+  postgres-performance:
+    name: PostgreSQL 16 performance trend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: xflow_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/xflow_test
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
 
-      - name: Run tests
-        run: cargo test
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run PostgreSQL performance trend test
+        run: cargo test --test postgres_performance -- --ignored --nocapture --test-threads=1
+
+      - name: Upload PostgreSQL performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-postgres-performance
+          path: target/stage3-postgres-performance.json
+          if-no-files-found: error
 
   docker:
     name: Build and push Docker image
-    needs: check
+    needs: [check, postgres-integration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

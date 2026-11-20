@@ -1,12 +1,15 @@
 pub mod db;
 
-use crate::models::{Source, SourceType, StoredTweet, Tweet};
+use crate::models::{FavoriteCursor, Source, SourceType, StoredTweet, TelegramFavorite, Tweet};
 use crate::utils::{mask_token, to_json_value};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use sqlx::postgres::{PgConnection, PgQueryResult, PgRow};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row};
+use std::collections::{HashMap, HashSet};
+
+pub const TWEET_UPSERT_BATCH_SIZE: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthAccount {
@@ -88,6 +91,19 @@ pub struct DailyDigestRunUpdate<'a> {
     pub status: &'a str,
     pub payload: &'a Value,
     pub error: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TweetUpsertSummary {
+    pub total: usize,
+    pub new: usize,
+    pub duplicate: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FavoriteWriteResult {
+    pub tweet_inserted: bool,
+    pub favorite_inserted: bool,
 }
 
 pub async fn upsert_source(pool: &PgPool, source: &Source) -> anyhow::Result<()> {
@@ -176,32 +192,214 @@ pub async fn list_sources(pool: &PgPool, enabled_only: bool) -> anyhow::Result<V
         .collect()
 }
 
+/// Insert or refresh a tweet, returning `true` only when the row was newly
+/// inserted. Conflicting rows are updated and return `false`.
 pub async fn upsert_tweet(pool: &PgPool, tweet: &Tweet) -> anyhow::Result<bool> {
-    let result = sqlx::query(
+    let mut connection = pool.acquire().await?;
+    upsert_tweet_with(&mut connection, tweet).await
+}
+
+async fn upsert_tweet_with(connection: &mut PgConnection, tweet: &Tweet) -> anyhow::Result<bool> {
+    let tweets = [tweet];
+    if !insert_new_tweets(connection, &tweets).await?.is_empty() {
+        return Ok(true);
+    }
+    update_existing_tweets(connection, &tweets).await?;
+    Ok(false)
+}
+
+/// Persist a backfill batch using the same insert/update distinction as
+/// [`upsert_tweet`].
+pub async fn upsert_tweets(pool: &PgPool, tweets: &[Tweet]) -> anyhow::Result<TweetUpsertSummary> {
+    // Keep the last occurrence so duplicate ids retain the same final payload
+    // as the previous sequential implementation. Sorting gives concurrent
+    // batches a consistent unique-index lock order and avoids deadlocks.
+    let mut by_id = HashMap::with_capacity(tweets.len());
+    for tweet in tweets {
+        by_id.insert(tweet.tweet_id.as_str(), tweet);
+    }
+    let mut unique: Vec<&Tweet> = by_id.into_values().collect();
+    unique.sort_unstable_by(|left, right| left.tweet_id.cmp(&right.tweet_id));
+
+    let mut new = 0;
+    for batch in unique.chunks(TWEET_UPSERT_BATCH_SIZE) {
+        let mut transaction = pool.begin().await?;
+        let inserted = insert_new_tweets(&mut transaction, batch).await?;
+        new += inserted.len();
+
+        if inserted.len() != batch.len() {
+            let inserted: HashSet<&str> = inserted.iter().map(String::as_str).collect();
+            let existing: Vec<&Tweet> = batch
+                .iter()
+                .copied()
+                .filter(|tweet| !inserted.contains(tweet.tweet_id.as_str()))
+                .collect();
+            update_existing_tweets(&mut transaction, &existing).await?;
+        }
+        transaction.commit().await?;
+    }
+    Ok(TweetUpsertSummary {
+        total: tweets.len(),
+        new,
+        duplicate: tweets.len() - new,
+    })
+}
+
+async fn insert_new_tweets(
+    connection: &mut PgConnection,
+    tweets: &[&Tweet],
+) -> anyhow::Result<Vec<String>> {
+    if tweets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = QueryBuilder::<Postgres>::new(
         r#"
         INSERT INTO tweets (
             tweet_id, source_type, source_value, author_username, author_name,
             text, url, created_at, fetched_at, raw_json
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT(tweet_id) DO UPDATE SET
-            fetched_at=excluded.fetched_at,
-            raw_json=excluded.raw_json
+        "#,
+    );
+    query.push_values(tweets, |mut row, tweet| {
+        row.push_bind(&tweet.tweet_id)
+            .push_bind(tweet.source_type.as_str())
+            .push_bind(&tweet.source_value)
+            .push_bind(&tweet.author_username)
+            .push_bind(&tweet.author_name)
+            .push_bind(&tweet.text)
+            .push_bind(&tweet.url)
+            .push_bind(tweet.created_at.to_rfc3339())
+            .push_bind(tweet.fetched_at.to_rfc3339())
+            .push_bind(tweet.raw.to_string());
+    });
+    query.push(" ON CONFLICT(tweet_id) DO NOTHING RETURNING tweet_id");
+    Ok(query
+        .build_query_scalar::<String>()
+        .fetch_all(&mut *connection)
+        .await?)
+}
+
+async fn update_existing_tweets(
+    connection: &mut PgConnection,
+    tweets: &[&Tweet],
+) -> anyhow::Result<()> {
+    if tweets.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<Postgres>::new(
+        r#"
+        UPDATE tweets AS stored
+        SET fetched_at = incoming.fetched_at,
+            raw_json = incoming.raw_json
+        FROM (
+        "#,
+    );
+    query.push_values(tweets, |mut row, tweet| {
+        row.push_bind(&tweet.tweet_id)
+            .push_bind(tweet.fetched_at.to_rfc3339())
+            .push_bind(tweet.raw.to_string());
+    });
+    query.push(
+        r#"
+        ) AS incoming(tweet_id, fetched_at, raw_json)
+        WHERE stored.tweet_id = incoming.tweet_id
+        "#,
+    );
+    let result = query.build().execute(&mut *connection).await?;
+    anyhow::ensure!(
+        result.rows_affected() == tweets.len() as u64,
+        "tweet disappeared while resolving an upsert conflict"
+    );
+    Ok(())
+}
+
+/// Add a favorite for a chat id that has already been authorized by the Bot
+/// boundary. This repository deliberately performs no Telegram authorization.
+pub async fn add_favorite(pool: &PgPool, chat_id: i64, tweet_id: &str) -> anyhow::Result<bool> {
+    add_favorite_with(pool, chat_id, tweet_id).await
+}
+
+async fn add_favorite_with<'e, E>(executor: E, chat_id: i64, tweet_id: &str) -> anyhow::Result<bool>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let result: PgQueryResult = sqlx::query(
+        r#"
+        INSERT INTO telegram_favorites (chat_id, tweet_id)
+        VALUES ($1, $2)
+        ON CONFLICT (chat_id, tweet_id) DO NOTHING
         "#,
     )
-    .bind(&tweet.tweet_id)
-    .bind(tweet.source_type.as_str())
-    .bind(&tweet.source_value)
-    .bind(&tweet.author_username)
-    .bind(&tweet.author_name)
-    .bind(&tweet.text)
-    .bind(&tweet.url)
-    .bind(tweet.created_at.to_rfc3339())
-    .bind(tweet.fetched_at.to_rfc3339())
-    .bind(tweet.raw.to_string())
-    .execute(pool)
+    .bind(chat_id)
+    .bind(tweet_id)
+    .execute(executor)
     .await?;
-    Ok(result.rows_affected() > 0)
+    Ok(result.rows_affected() == 1)
+}
+
+/// List favorites for a chat id already authorized by the Bot boundary.
+/// Pagination is keyset-based over `(created_at DESC, tweet_id DESC)`.
+pub async fn list_favorites(
+    pool: &PgPool,
+    chat_id: i64,
+    limit: i64,
+    cursor: Option<&FavoriteCursor>,
+) -> anyhow::Result<Vec<TelegramFavorite>> {
+    let limit = limit.clamp(1, 100);
+    let rows = if let Some(cursor) = cursor {
+        sqlx::query(
+            r#"
+            SELECT t.*, f.chat_id AS favorite_chat_id, f.created_at AS favorite_created_at
+            FROM telegram_favorites f
+            JOIN tweets t ON t.tweet_id = f.tweet_id
+            WHERE f.chat_id = $1
+              AND (f.created_at, f.tweet_id) < ($2, $3)
+            ORDER BY f.created_at DESC, f.tweet_id DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(chat_id)
+        .bind(cursor.created_at)
+        .bind(&cursor.tweet_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT t.*, f.chat_id AS favorite_chat_id, f.created_at AS favorite_created_at
+            FROM telegram_favorites f
+            JOIN tweets t ON t.tweet_id = f.tweet_id
+            WHERE f.chat_id = $1
+            ORDER BY f.created_at DESC, f.tweet_id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(chat_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.into_iter().map(row_to_favorite).collect()
+}
+
+/// Atomically save a fetched tweet and favorite it for an already-authorized
+/// chat. External X and Telegram calls must happen outside this transaction.
+pub async fn save_tweet_and_favorite(
+    pool: &PgPool,
+    chat_id: i64,
+    tweet: &Tweet,
+) -> anyhow::Result<FavoriteWriteResult> {
+    let mut transaction = pool.begin().await?;
+    let tweet_inserted = upsert_tweet_with(&mut transaction, tweet).await?;
+    let favorite_inserted = add_favorite_with(&mut *transaction, chat_id, &tweet.tweet_id).await?;
+    transaction.commit().await?;
+    Ok(FavoriteWriteResult {
+        tweet_inserted,
+        favorite_inserted,
+    })
 }
 
 pub async fn save_fetch_state(
@@ -725,6 +923,17 @@ fn row_to_tweet(row: PgRow) -> anyhow::Result<StoredTweet> {
         raw,
     };
     Ok(StoredTweet { tweet })
+}
+
+fn row_to_favorite(row: PgRow) -> anyhow::Result<TelegramFavorite> {
+    let chat_id = row.get("favorite_chat_id");
+    let created_at = row.get("favorite_created_at");
+    let tweet = row_to_tweet(row)?;
+    Ok(TelegramFavorite {
+        chat_id,
+        created_at,
+        tweet,
+    })
 }
 
 pub async fn check_token_freshness(

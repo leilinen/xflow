@@ -1,0 +1,17 @@
+{
+  "_fixture_note": "synthetic redacted structural sample",
+  "data": {"timeline": {"tweet_results": {"result": {
+    "rest_id": "400",
+    "core": {"user_results": {"result": {"rest_id": "40", "legacy": {"screen_name": "quote_author", "name": "Quote Author"}}}},
+    "legacy": {
+      "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+      "full_text": "focal commentary",
+      "quoted_status_id_str": "401"
+    },
+    "quoted_status_results": {"result": {
+      "rest_id": "401",
+      "core": {"user_results": {"result": {"legacy": {"screen_name": "quoted_author"}}}},
+      "legacy": {"full_text": "quoted tweet body"}
+    }}
+  }}}}
+}
