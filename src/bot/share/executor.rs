@@ -25,27 +25,27 @@ use crate::shutdown::ShutdownHandle;
 
 /// Buffered queue capacity. At most this many requests are buffered plus one
 /// in-flight task outside the buffer.
-pub(crate) const SHARE_QUEUE_CAPACITY: usize = 8;
+pub const SHARE_QUEUE_CAPACITY: usize = 8;
 
 /// Graceful-shutdown drain deadline: the single in-flight task may take at
 /// most this long to finish before it is aborted. This bounds the drain wait;
 /// it does not guarantee that every external HTTP request fits within it.
-pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Outcome of one share task as reported by the processor.
-pub(crate) type ShareTaskResult = Result<(), anyhow::Error>;
+pub type ShareTaskResult = Result<(), anyhow::Error>;
 
 /// Processor future. Boxed so processors can be simple closures.
-pub(crate) type ShareTaskFuture = Pin<Box<dyn Future<Output = ShareTaskResult> + Send>>;
+pub type ShareTaskFuture = Pin<Box<dyn Future<Output = ShareTaskResult> + Send>>;
 
-/// Handles exactly one request. Stage 4B replaces the production instance
-/// with the real lookup/fetch/persist/send pipeline.
-pub(crate) type ShareTaskProcessor = Arc<dyn Fn(ShareRequest) -> ShareTaskFuture + Send + Sync>;
+/// Handles exactly one request. The production instance is the Stage 4B
+/// lookup/fetch/persist/send pipeline.
+pub type ShareTaskProcessor = Arc<dyn Fn(ShareRequest) -> ShareTaskFuture + Send + Sync>;
 
 /// Why a request was not accepted. The request is returned so the caller can
-/// log it (and, in Stage 4B, notify the user) without losing it.
+/// log it and notify the user (queue full) without losing it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TryEnqueueError {
+pub enum TryEnqueueError {
     /// The queue already holds its capacity of pending requests.
     QueueFull(ShareRequest),
     /// The executor is shut down and no longer accepts requests.
@@ -54,16 +54,16 @@ pub(crate) enum TryEnqueueError {
 
 /// What happened to queued and in-flight work during executor shutdown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ExecutorSummary {
+pub struct ExecutorSummary {
     /// Requests accepted but never started; each one also produced a
     /// structured warn log when it was dropped.
-    pub(crate) dropped_queued: usize,
+    pub dropped_queued: usize,
     /// The in-flight task exceeded the drain deadline and was aborted.
-    pub(crate) aborted_inflight: bool,
+    pub aborted_inflight: bool,
 }
 
 #[derive(Debug)]
-pub(crate) struct ShareExecutor {
+pub struct ShareExecutor {
     request_tx: mpsc::Sender<ShareRequest>,
     shutdown: ShutdownHandle,
     supervisor: JoinHandle<ExecutorSummary>,
@@ -71,12 +71,12 @@ pub(crate) struct ShareExecutor {
 
 impl ShareExecutor {
     /// Start the executor with the production 60s drain deadline.
-    pub(crate) fn start(processor: ShareTaskProcessor, shutdown: ShutdownHandle) -> Self {
+    pub fn start(processor: ShareTaskProcessor, shutdown: ShutdownHandle) -> Self {
         Self::start_with_drain_timeout(processor, shutdown, SHUTDOWN_DRAIN_TIMEOUT)
     }
 
     /// Start the executor with an explicit drain deadline (used by tests).
-    pub(crate) fn start_with_drain_timeout(
+    pub fn start_with_drain_timeout(
         processor: ShareTaskProcessor,
         shutdown: ShutdownHandle,
         drain_timeout: Duration,
@@ -96,7 +96,7 @@ impl ShareExecutor {
     }
 
     /// Non-blocking enqueue. Never waits for queue space.
-    pub(crate) fn try_enqueue(&self, request: ShareRequest) -> Result<(), TryEnqueueError> {
+    pub fn try_enqueue(&self, request: ShareRequest) -> Result<(), TryEnqueueError> {
         if self.shutdown.is_triggered() {
             return Err(TryEnqueueError::Closed(request));
         }
@@ -113,7 +113,7 @@ impl ShareExecutor {
 
     /// Wait for the supervisor to finish. Must be called after shutdown is
     /// triggered; the supervisor's own drain is bounded by the deadline.
-    pub(crate) async fn join(self) -> ExecutorSummary {
+    pub async fn join(self) -> ExecutorSummary {
         match self.supervisor.await {
             Ok(summary) => summary,
             Err(err) => {
@@ -300,20 +300,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "<non-string panic payload>".to_string()
     }
-}
-
-/// Production processor for Stage 4A. The real Share pipeline (database
-/// lookup, X fetch, persistence, card send) lands in Stage 4B. This must
-/// never pretend success: every accepted request is reported as explicitly
-/// not processed via the executor's `failed` outcome log.
-pub(crate) fn pipeline_disabled_processor() -> ShareTaskProcessor {
-    Arc::new(move |_request: ShareRequest| {
-        Box::pin(async move {
-            Err(anyhow::anyhow!(
-                "share pipeline is not enabled yet (stage 4b pending); request was accepted but not processed"
-            ))
-        })
-    })
 }
 
 #[cfg(test)]

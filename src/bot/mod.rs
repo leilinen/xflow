@@ -1,4 +1,6 @@
-mod share;
+pub mod share;
+
+use std::sync::Arc;
 
 use crate::channel;
 use crate::channel::telegram;
@@ -11,7 +13,7 @@ use crate::worker::pipeline;
 use serde::Deserialize;
 use sqlx::PgPool;
 
-use self::share::executor::{pipeline_disabled_processor, ShareExecutor, TryEnqueueError};
+use self::share::executor::ShareExecutor;
 use self::share::PrivateMessageRoute;
 
 #[derive(Debug, Deserialize)]
@@ -104,9 +106,14 @@ pub async fn run_poller(
         .build()?;
     let mut offset: Option<i64> = None;
 
-    // Stage 4A: the executor runs with a processor that reports every request
-    // as not processed. Stage 4B swaps in the real pipeline here.
-    let executor = ShareExecutor::start(pipeline_disabled_processor(), shutdown.clone());
+    // Stage 4B: the real share pipeline runs behind the Stage 4A executor
+    // (unchanged: bounded queue, single worker, panic isolation, graceful
+    // shutdown).
+    let share_pipeline = share::pipeline::build_share_pipeline(&config, &pool)?;
+    let executor = ShareExecutor::start(
+        share::pipeline::share_pipeline_processor(Arc::clone(&share_pipeline)),
+        shutdown.clone(),
+    );
 
     tracing::info!("Telegram bot poller started");
 
@@ -180,12 +187,17 @@ pub async fn run_poller(
                                                 status = "recognized",
                                                 "Share to Bot request recognized"
                                             );
-                                            // Stage 4A: accepted into the bounded
-                                            // executor; its processor reports every
-                                            // request as not processed. No X request,
-                                            // database write, or card send happens yet.
+                                            // Enqueued into the bounded executor; the
+                                            // pipeline processor runs the real
+                                            // cache → X → persist → send flow. A
+                                            // queue-full rejection answers the user
+                                            // with a best-effort busy notice.
                                             if let Err(error) = executor.try_enqueue(request) {
-                                                log_enqueue_rejected(&error);
+                                                share::pipeline::handle_enqueue_rejection(
+                                                    share_pipeline.sender.as_ref(),
+                                                    &error,
+                                                )
+                                                .await;
                                             }
                                             false
                                         }
@@ -240,23 +252,6 @@ pub async fn run_poller(
         "Telegram bot poller stopped"
     );
     Ok(())
-}
-
-fn log_enqueue_rejected(error: &TryEnqueueError) {
-    match error {
-        TryEnqueueError::QueueFull(request) => tracing::warn!(
-            chat_id = request.chat_id,
-            tweet_id = %request.tweet_id,
-            status = "queue_full",
-            "share queue is full; request was not accepted for processing"
-        ),
-        TryEnqueueError::Closed(request) => tracing::warn!(
-            chat_id = request.chat_id,
-            tweet_id = %request.tweet_id,
-            status = "executor_closed",
-            "share executor is shut down; request was not accepted for processing"
-        ),
-    }
 }
 
 fn load_allowed_private_chat_id(env_name: &str) -> anyhow::Result<i64> {

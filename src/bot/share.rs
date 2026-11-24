@@ -1,6 +1,7 @@
 use reqwest::Url;
 
-pub(crate) mod executor;
+pub mod executor;
+pub mod pipeline;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedTweetUrl {
@@ -9,12 +10,11 @@ pub(crate) struct ParsedTweetUrl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShareRequest {
-    pub(crate) chat_id: i64,
-    pub(crate) tweet_id: String,
+pub struct ShareRequest {
+    pub chat_id: i64,
+    pub tweet_id: String,
     /// Consumed by the Stage 4B pipeline; not read by the Stage 4A executor.
-    #[allow(dead_code)]
-    pub(crate) canonical_url: String,
+    pub canonical_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

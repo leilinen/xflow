@@ -1386,3 +1386,507 @@ fn adjust_interval_stays_at_base_when_all_ok() {
     assert_eq!(interval, 900);
     assert_eq!(successes, 6);
 }
+
+// === Stage 4B: Share pipeline (cache → X fetch → persist → private card send) ===
+//
+// These tests run the real `SharePipeline` against a real PostgreSQL schema
+// (via the production `PgShareTweetStore`) while the X fetcher and the
+// Telegram sender are fakes. This proves the storage semantics (favorites,
+// transaction consistency, untouched `deliveries`) without any network I/O.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use xflow::bot::share::executor::TryEnqueueError;
+use xflow::bot::share::pipeline::{
+    handle_enqueue_rejection, PgShareTweetStore, ShareCardSender, SharePipeline, SharePortFuture,
+    ShareTweetSource, ShareTweetStore, SHARE_BUSY_NOTICE,
+};
+use xflow::bot::share::ShareRequest;
+use xflow::storage::FavoriteWriteResult;
+
+struct ProbeShareStore {
+    inner: PgShareTweetStore,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    fail_get: Arc<AtomicBool>,
+    fail_save: Arc<AtomicBool>,
+}
+
+impl ProbeShareStore {
+    fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            inner: PgShareTweetStore::new(pool),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail_get: Arc::new(AtomicBool::new(false)),
+            fail_save: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl ShareTweetStore for ProbeShareStore {
+    fn get_tweet<'a>(
+        &'a self,
+        tweet_id: &'a str,
+    ) -> SharePortFuture<'a, anyhow::Result<Option<StoredTweet>>> {
+        Box::pin(async move {
+            self.record("get_tweet");
+            if self.fail_get.load(Ordering::SeqCst) {
+                anyhow::bail!("injected share db lookup failure");
+            }
+            self.inner.get_tweet(tweet_id).await
+        })
+    }
+
+    fn add_favorite<'a>(
+        &'a self,
+        chat_id: i64,
+        tweet_id: &'a str,
+    ) -> SharePortFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move {
+            self.record("add_favorite");
+            self.inner.add_favorite(chat_id, tweet_id).await
+        })
+    }
+
+    fn save_tweet_and_favorite<'a>(
+        &'a self,
+        chat_id: i64,
+        tweet: &'a Tweet,
+    ) -> SharePortFuture<'a, anyhow::Result<FavoriteWriteResult>> {
+        Box::pin(async move {
+            self.record("save_tweet_and_favorite");
+            if self.fail_save.load(Ordering::SeqCst) {
+                anyhow::bail!("injected share save failure");
+            }
+            self.inner.save_tweet_and_favorite(chat_id, tweet).await
+        })
+    }
+}
+
+struct FakeShareSource {
+    tweet: Option<Tweet>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl FakeShareSource {
+    fn returning(tweet: Tweet) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                tweet: Some(tweet),
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+
+    fn failing() -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                tweet: None,
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+}
+
+impl ShareTweetSource for FakeShareSource {
+    fn fetch_single_tweet<'a>(
+        &'a self,
+        _tweet_id: &'a str,
+    ) -> SharePortFuture<'a, anyhow::Result<Tweet>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.tweet {
+                Some(tweet) => Ok(tweet.clone()),
+                None => anyhow::bail!("injected X fetch failure"),
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct FakeShareSender {
+    cards: Arc<Mutex<Vec<(i64, String)>>>,
+    busy: Arc<Mutex<Vec<i64>>>,
+    fail_cards: Arc<AtomicBool>,
+}
+
+impl FakeShareSender {
+    fn cards(&self) -> Vec<(i64, String)> {
+        self.cards.lock().unwrap().clone()
+    }
+
+    fn busy(&self) -> Vec<i64> {
+        self.busy.lock().unwrap().clone()
+    }
+}
+
+impl ShareCardSender for FakeShareSender {
+    fn send_tweet_card<'a>(
+        &'a self,
+        chat_id: i64,
+        tweet: &'a StoredTweet,
+    ) -> SharePortFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            if self.fail_cards.load(Ordering::SeqCst) {
+                anyhow::bail!("injected Telegram send failure");
+            }
+            self.cards
+                .lock()
+                .unwrap()
+                .push((chat_id, tweet.tweet.tweet_id.clone()));
+            Ok(())
+        })
+    }
+
+    fn send_busy_notice<'a>(&'a self, chat_id: i64) -> SharePortFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.busy.lock().unwrap().push(chat_id);
+            Ok(())
+        })
+    }
+}
+
+async fn build_share_test_pipeline(
+    pool: &support::TestDatabase,
+    source: FakeShareSource,
+    sender: FakeShareSender,
+) -> (
+    Arc<SharePipeline>,
+    Arc<ProbeShareStore>,
+    Arc<AtomicUsize>,
+    FakeShareSender,
+) {
+    let store = Arc::new(ProbeShareStore::new(pool.pg_pool().clone()));
+    let source_calls = Arc::clone(&source.calls);
+    // Keep the inner Arcs for the assertion view before upcasting to the
+    // trait object stored inside the pipeline.
+    let sender_view = FakeShareSender {
+        cards: Arc::clone(&sender.cards),
+        busy: Arc::clone(&sender.busy),
+        fail_cards: Arc::clone(&sender.fail_cards),
+    };
+    let sender: Arc<dyn ShareCardSender> = Arc::new(sender);
+    let pipeline = Arc::new(SharePipeline::new(
+        store.clone(),
+        Arc::new(source),
+        Arc::clone(&sender),
+    ));
+    (pipeline, store, source_calls, sender_view)
+}
+
+fn share_request(tweet_id: &str) -> ShareRequest {
+    ShareRequest {
+        chat_id: 7,
+        tweet_id: tweet_id.to_string(),
+        canonical_url: format!("https://x.com/i/status/{tweet_id}"),
+    }
+}
+
+async fn deliveries_count(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*)::bigint FROM deliveries")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn favorites_count(pool: &sqlx::PgPool, chat_id: i64, tweet_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM telegram_favorites WHERE chat_id = $1 AND tweet_id = $2",
+    )
+    .bind(chat_id)
+    .bind(tweet_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn tweet_raw_json(pool: &sqlx::PgPool, tweet_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT raw_json FROM tweets WHERE tweet_id = $1")
+        .bind(tweet_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn share_cache_hit_adds_favorite_and_skips_x_fetch() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("share-hit-1", "cached text");
+    storage::upsert_tweet(pool.pg_pool(), &tweet).await.unwrap();
+
+    let (source, source_calls) = FakeShareSource::failing();
+    let (pipeline, store, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+
+    pipeline
+        .handle(share_request("share-hit-1"))
+        .await
+        .expect("cache hit path must succeed");
+
+    assert_eq!(
+        store.calls(),
+        vec!["get_tweet", "add_favorite"],
+        "cache hit must only add the favorite"
+    );
+    assert_eq!(
+        source_calls.load(Ordering::SeqCst),
+        0,
+        "X must not be called"
+    );
+    assert_eq!(sender.cards(), vec![(7, "share-hit-1".to_string())]);
+    assert_eq!(favorites_count(pool.pg_pool(), 7, "share-hit-1").await, 1);
+    assert_eq!(deliveries_count(pool.pg_pool()).await, 0);
+}
+
+#[tokio::test]
+async fn share_cache_miss_fetches_saves_and_sends() {
+    let pool = test_pool().await;
+    let (source, source_calls) =
+        FakeShareSource::returning(test_tweet("share-miss-1", "fresh text"));
+    let (pipeline, store, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+
+    pipeline
+        .handle(share_request("share-miss-1"))
+        .await
+        .expect("cache miss path must succeed");
+
+    assert_eq!(
+        store.calls(),
+        vec!["get_tweet", "save_tweet_and_favorite"],
+        "miss path must save tweet and favorite in one transaction"
+    );
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sender.cards(), vec![(7, "share-miss-1".to_string())]);
+    let raw = tweet_raw_json(pool.pg_pool(), "share-miss-1").await;
+    assert!(raw.is_some());
+    assert!(raw.unwrap().contains("fresh text"));
+    assert_eq!(favorites_count(pool.pg_pool(), 7, "share-miss-1").await, 1);
+    assert_eq!(deliveries_count(pool.pg_pool()).await, 0);
+}
+
+#[tokio::test]
+async fn share_cache_incomplete_refetches_and_updates() {
+    let pool = test_pool().await;
+    let mut damaged = test_tweet("share-inc-1", "old");
+    // storage::get_tweet masks unreadable raw_json into an empty object;
+    // an empty raw object is the pipeline's "cache incomplete" signal.
+    damaged.raw = serde_json::json!({});
+    storage::upsert_tweet(pool.pg_pool(), &damaged)
+        .await
+        .unwrap();
+
+    let (source, source_calls) =
+        FakeShareSource::returning(test_tweet("share-inc-1", "refetched text"));
+    let (pipeline, store, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+
+    pipeline
+        .handle(share_request("share-inc-1"))
+        .await
+        .expect("incomplete cache path must succeed");
+
+    assert_eq!(
+        store.calls(),
+        vec!["get_tweet", "save_tweet_and_favorite"],
+        "incomplete cache must refetch and re-save"
+    );
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    let raw = tweet_raw_json(pool.pg_pool(), "share-inc-1")
+        .await
+        .expect("tweet row must exist");
+    assert!(
+        raw.contains("refetched text"),
+        "damaged raw must be replaced"
+    );
+    assert_eq!(favorites_count(pool.pg_pool(), 7, "share-inc-1").await, 1);
+    assert_eq!(sender.cards().len(), 1);
+    assert_eq!(deliveries_count(pool.pg_pool()).await, 0);
+}
+
+#[tokio::test]
+async fn share_db_error_does_not_reach_x_api() {
+    let pool = test_pool().await;
+    let (source, source_calls) =
+        FakeShareSource::returning(test_tweet("share-dberr-1", "never used"));
+    let (pipeline, store, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+    store.fail_get.store(true, Ordering::SeqCst);
+
+    let err = pipeline
+        .handle(share_request("share-dberr-1"))
+        .await
+        .expect_err("db error must fail the request");
+    assert!(err.to_string().contains("db lookup failed"));
+
+    assert_eq!(
+        source_calls.load(Ordering::SeqCst),
+        0,
+        "db error must not trigger X"
+    );
+    assert!(
+        sender.cards().is_empty(),
+        "nothing may be sent after a db error"
+    );
+    assert_eq!(store.calls(), vec!["get_tweet"]);
+    assert_eq!(favorites_count(pool.pg_pool(), 7, "share-dberr-1").await, 0);
+}
+
+#[tokio::test]
+async fn share_x_fetch_failure_saves_nothing_and_sends_nothing() {
+    let pool = test_pool().await;
+    let (source, _) = FakeShareSource::failing();
+    let (pipeline, store, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+
+    pipeline
+        .handle(share_request("share-xfail-1"))
+        .await
+        .expect_err("X fetch failure must fail the request");
+
+    assert_eq!(store.calls(), vec!["get_tweet"], "no save, no favorite");
+    assert_eq!(favorites_count(pool.pg_pool(), 7, "share-xfail-1").await, 0);
+    assert!(tweet_raw_json(pool.pg_pool(), "share-xfail-1")
+        .await
+        .is_none());
+    assert!(sender.cards().is_empty());
+}
+
+#[tokio::test]
+async fn share_save_failure_does_not_send_telegram_message() {
+    let pool = test_pool().await;
+    let (source, _) = FakeShareSource::returning(test_tweet("share-savefail-1", "fresh"));
+    let (pipeline, store, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+    store.fail_save.store(true, Ordering::SeqCst);
+
+    pipeline
+        .handle(share_request("share-savefail-1"))
+        .await
+        .expect_err("save failure must fail the request");
+
+    assert!(
+        sender.cards().is_empty(),
+        "no card may be sent after save failure"
+    );
+    assert!(tweet_raw_json(pool.pg_pool(), "share-savefail-1")
+        .await
+        .is_none());
+    assert_eq!(
+        favorites_count(pool.pg_pool(), 7, "share-savefail-1").await,
+        0
+    );
+    assert_eq!(deliveries_count(pool.pg_pool()).await, 0);
+}
+
+#[tokio::test]
+async fn share_send_failure_keeps_favorite_and_writes_no_deliveries() {
+    let pool = test_pool().await;
+    let (source, _) = FakeShareSource::returning(test_tweet("share-sendfail-1", "fresh"));
+    let sender = FakeShareSender {
+        fail_cards: Arc::new(AtomicBool::new(true)),
+        ..FakeShareSender::default()
+    };
+    let (pipeline, _, _, _) = build_share_test_pipeline(&pool, source, sender).await;
+
+    pipeline
+        .handle(share_request("share-sendfail-1"))
+        .await
+        .expect_err("send failure must fail the request");
+
+    assert_eq!(
+        favorites_count(pool.pg_pool(), 7, "share-sendfail-1").await,
+        1,
+        "saved favorite must be kept when Telegram send fails"
+    );
+    assert_eq!(deliveries_count(pool.pg_pool()).await, 0);
+}
+
+#[tokio::test]
+async fn share_repeat_share_resends_card_and_preserves_first_favorite_time() {
+    let pool = test_pool().await;
+    let tweet = test_tweet("share-repeat-1", "cached");
+    storage::upsert_tweet(pool.pg_pool(), &tweet).await.unwrap();
+
+    let (source, _) = FakeShareSource::failing();
+    let (pipeline, _, _, sender) =
+        build_share_test_pipeline(&pool, source, FakeShareSender::default()).await;
+
+    pipeline
+        .handle(share_request("share-repeat-1"))
+        .await
+        .unwrap();
+    let first_created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM telegram_favorites WHERE chat_id = 7 AND tweet_id = $1",
+    )
+    .bind("share-repeat-1")
+    .fetch_one(pool.pg_pool())
+    .await
+    .unwrap();
+
+    pipeline
+        .handle(share_request("share-repeat-1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sender.cards().len(),
+        2,
+        "the same tweet may be shared and re-sent"
+    );
+    assert_eq!(
+        favorites_count(pool.pg_pool(), 7, "share-repeat-1").await,
+        1,
+        "repeated share must not duplicate the favorite row"
+    );
+    let second_created_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM telegram_favorites WHERE chat_id = 7 AND tweet_id = $1",
+    )
+    .bind("share-repeat-1")
+    .fetch_one(pool.pg_pool())
+    .await
+    .unwrap();
+    assert_eq!(first_created_at, second_created_at);
+    assert_eq!(deliveries_count(pool.pg_pool()).await, 0);
+}
+
+#[tokio::test]
+async fn share_busy_notice_sent_only_when_queue_full() {
+    let sender = FakeShareSender::default();
+
+    handle_enqueue_rejection(
+        &sender,
+        &TryEnqueueError::QueueFull(share_request("share-busy-1")),
+    )
+    .await;
+    assert_eq!(
+        sender.busy(),
+        vec![7],
+        "queue full must notify the requester"
+    );
+
+    handle_enqueue_rejection(
+        &sender,
+        &TryEnqueueError::Closed(share_request("share-busy-2")),
+    )
+    .await;
+    assert_eq!(
+        sender.busy().len(),
+        1,
+        "closed executor must not send a busy notice"
+    );
+    assert!(sender.cards().is_empty());
+    assert_eq!(SHARE_BUSY_NOTICE, "当前处理队列繁忙，请稍后重新分享。");
+}
