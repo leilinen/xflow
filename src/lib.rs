@@ -7,6 +7,7 @@ pub mod fetch;
 pub mod lang;
 pub mod models;
 pub mod server;
+pub mod shutdown;
 pub mod storage;
 pub mod translate;
 pub mod utils;

@@ -59,31 +59,50 @@ pub fn adjust_interval(
 }
 
 pub async fn run_forever(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
-    if config.telegram.enabled {
+    let shutdown = crate::shutdown::ShutdownToken::new();
+    let mut shutdown_handle = shutdown.handle();
+    let poller_shutdown = config.telegram.enabled.then(|| shutdown.handle());
+    tokio::spawn(crate::shutdown::monitor_signals(shutdown));
+
+    let poller_join = if let Some(poller_shutdown) = poller_shutdown {
         let bot_config = config.clone();
         let bot_pool = pool.clone();
-        tokio::spawn(async move {
-            if let Err(err) = crate::bot::run_poller(bot_config, bot_pool).await {
+        Some(tokio::spawn(async move {
+            if let Err(err) = crate::bot::run_poller(bot_config, bot_pool, poller_shutdown).await {
                 tracing::error!(?err, "bot poller crashed");
             }
-        });
-    }
-    if config.telegram.enabled && config.daily_digest.enabled {
+        }))
+    } else {
+        None
+    };
+    let digest_join = if config.telegram.enabled && config.daily_digest.enabled {
         let digest_config = config.clone();
         let digest_pool = pool.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             if let Err(err) = run_daily_digest_scheduler(digest_config, digest_pool).await {
                 tracing::error!(?err, "daily digest scheduler crashed");
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     let base_interval = config.fetch.interval_seconds;
     let mut current_interval = base_interval;
     let mut consecutive_successes: u32 = 0;
 
     loop {
-        let cycle_result = run_once(&config, &pool).await;
+        let cycle_result = tokio::select! {
+            biased;
+            _ = shutdown_handle.wait() => {
+                tracing::info!(
+                    reason = "shutdown_signal",
+                    "worker stopping: no new fetch cycle will start"
+                );
+                break;
+            }
+            cycle_result = run_once(&config, &pool) => cycle_result,
+        };
         match &cycle_result {
             Ok(result) => {
                 tracing::info!(?result, "worker cycle complete");
@@ -128,8 +147,33 @@ pub async fn run_forever(config: AppConfig, pool: PgPool) -> anyhow::Result<()> 
             next_cycle_in = current_interval,
             "sleeping until next cycle"
         );
-        tokio::time::sleep(Duration::from_secs(current_interval)).await;
+        tokio::select! {
+            biased;
+            _ = shutdown_handle.wait() => {
+                tracing::info!(reason = "shutdown_signal", "worker stopping between cycles");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(current_interval)) => {}
+        }
     }
+
+    // Wait for the poller: it stops receiving updates and waits (bounded by
+    // the executor's drain deadline) for the share executor to finish. The
+    // digest scheduler is not part of the share shutdown contract; abort it.
+    if let Some(poller) = poller_join {
+        match poller.await {
+            Ok(()) => tracing::info!("bot poller stopped"),
+            Err(join_err) if join_err.is_panic() => {
+                tracing::error!(?join_err, "bot poller panicked during shutdown")
+            }
+            Err(join_err) => tracing::warn!(?join_err, "bot poller join was cancelled"),
+        }
+    }
+    if let Some(digest) = digest_join {
+        digest.abort();
+    }
+    tracing::info!("worker stopped");
+    Ok(())
 }
 
 async fn warn_stale_tokens(pool: &PgPool) {

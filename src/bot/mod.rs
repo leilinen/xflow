@@ -5,11 +5,13 @@ use crate::channel::telegram;
 use crate::config::AppConfig;
 use crate::fetch;
 use crate::models::{Source, SourceType};
+use crate::shutdown::ShutdownHandle;
 use crate::storage;
 use crate::worker::pipeline;
 use serde::Deserialize;
 use sqlx::PgPool;
 
+use self::share::executor::{pipeline_disabled_processor, ShareExecutor, TryEnqueueError};
 use self::share::PrivateMessageRoute;
 
 #[derive(Debug, Deserialize)]
@@ -89,7 +91,11 @@ fn is_group_chat(chat: &TelegramChat) -> bool {
     chat.chat_type == "group" || chat.chat_type == "supergroup"
 }
 
-pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
+pub async fn run_poller(
+    config: AppConfig,
+    pool: PgPool,
+    mut shutdown: ShutdownHandle,
+) -> anyhow::Result<()> {
     let bot_token = telegram::load_bot_token(&config.telegram)?;
     let allowed_chat_id = load_allowed_private_chat_id(&config.telegram.chat_id_env)?;
     let bot_username = get_bot_username(&bot_token).await;
@@ -98,104 +104,158 @@ pub async fn run_poller(config: AppConfig, pool: PgPool) -> anyhow::Result<()> {
         .build()?;
     let mut offset: Option<i64> = None;
 
+    // Stage 4A: the executor runs with a processor that reports every request
+    // as not processed. Stage 4B swaps in the real pipeline here.
+    let executor = ShareExecutor::start(pipeline_disabled_processor(), shutdown.clone());
+
     tracing::info!("Telegram bot poller started");
 
     loop {
-        match poll_updates(&client, &bot_token, offset).await {
-            Ok(updates) => {
-                for update in updates {
-                    offset = Some(update.update_id + 1);
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => {
+                tracing::info!(
+                    reason = "shutdown_signal",
+                    "poller stopping: no longer receiving updates"
+                );
+                break;
+            }
+            result = poll_updates(&client, &bot_token, offset) => {
+                match result {
+                    Ok(updates) => {
+                        for update in updates {
+                            offset = Some(update.update_id + 1);
 
-                    // Process channel_post (commands sent in channels)
-                    let message = update.message.or(update.channel_post);
-                    if let Some(message) = message {
-                        let is_group = is_group_chat(&message.chat);
-                        let is_channel = message.chat.chat_type == "channel";
+                            // Process channel_post (commands sent in channels)
+                            let message = update.message.or(update.channel_post);
+                            if let Some(message) = message {
+                                let is_group = is_group_chat(&message.chat);
+                                let is_channel = message.chat.chat_type == "channel";
 
-                        let is_private = message.chat.chat_type == "private";
+                                let is_private = message.chat.chat_type == "private";
 
-                        // Private chat access is fail-closed. Authorization is
-                        // checked before inspecting message text or URLs.
-                        if is_private && message.chat.id != allowed_chat_id {
-                            tracing::warn!(
-                                chat_id = message.chat.id,
-                                "ignoring message from unauthorized private chat"
-                            );
-                            continue;
-                        }
-                        if !is_private && !is_group && !is_channel {
-                            tracing::warn!(
-                                chat_type = %message.chat.chat_type,
-                                "ignoring message with unsupported chat type"
-                            );
-                            continue;
-                        }
-
-                        let Some(text) = message.text else {
-                            continue;
-                        };
-
-                        // In groups: only respond to replies to bot or @mentions
-                        if is_group
-                            && !is_bot_addressed(
-                                &text,
-                                &message.entities,
-                                &message.reply_to_message,
-                                bot_username.as_deref(),
-                            )
-                        {
-                            continue;
-                        }
-
-                        let should_handle_command = if is_private {
-                            match share::route_private_message(
-                                &message.chat.chat_type,
-                                message.chat.id,
-                                allowed_chat_id,
-                                &text,
-                            ) {
-                                PrivateMessageRoute::Share(request) => {
-                                    tracing::info!(
-                                        tweet_id = %request.tweet_id,
-                                        status = "recognized",
-                                        "Share to Bot request recognized"
+                                // Private chat access is fail-closed. Authorization is
+                                // checked before inspecting message text or URLs.
+                                if is_private && message.chat.id != allowed_chat_id {
+                                    tracing::warn!(
+                                        chat_id = message.chat.id,
+                                        "ignoring message from unauthorized private chat"
                                     );
-                                    // Stage 2 intentionally stops at routing.
-                                    // No X request, database write, or card send.
-                                    false
+                                    continue;
                                 }
-                                PrivateMessageRoute::Command => true,
-                                PrivateMessageRoute::Other => false,
-                            }
-                        } else {
-                            true
-                        };
+                                if !is_private && !is_group && !is_channel {
+                                    tracing::warn!(
+                                        chat_type = %message.chat.chat_type,
+                                        "ignoring message with unsupported chat type"
+                                    );
+                                    continue;
+                                }
 
-                        if should_handle_command {
-                            let sender_name = message.from.as_ref().map(|u| u.display_name());
-                            handle_command(
-                                &config,
-                                &pool,
-                                &client,
-                                &bot_token,
-                                message.chat.id,
-                                &text,
-                                sender_name.as_deref(),
-                            )
-                            .await;
+                                let Some(text) = message.text else {
+                                    continue;
+                                };
+
+                                // In groups: only respond to replies to bot or @mentions
+                                if is_group
+                                    && !is_bot_addressed(
+                                        &text,
+                                        &message.entities,
+                                        &message.reply_to_message,
+                                        bot_username.as_deref(),
+                                    )
+                                {
+                                    continue;
+                                }
+
+                                let should_handle_command = if is_private {
+                                    match share::route_private_message(
+                                        &message.chat.chat_type,
+                                        message.chat.id,
+                                        allowed_chat_id,
+                                        &text,
+                                    ) {
+                                        PrivateMessageRoute::Share(request) => {
+                                            tracing::info!(
+                                                tweet_id = %request.tweet_id,
+                                                status = "recognized",
+                                                "Share to Bot request recognized"
+                                            );
+                                            // Stage 4A: accepted into the bounded
+                                            // executor; its processor reports every
+                                            // request as not processed. No X request,
+                                            // database write, or card send happens yet.
+                                            if let Err(error) = executor.try_enqueue(request) {
+                                                log_enqueue_rejected(&error);
+                                            }
+                                            false
+                                        }
+                                        PrivateMessageRoute::Command => true,
+                                        PrivateMessageRoute::Other => false,
+                                    }
+                                } else {
+                                    true
+                                };
+
+                                if should_handle_command {
+                                    let sender_name = message.from.as_ref().map(|u| u.display_name());
+                                    handle_command(
+                                        &config,
+                                        &pool,
+                                        &client,
+                                        &bot_token,
+                                        message.chat.id,
+                                        &text,
+                                        sender_name.as_deref(),
+                                    )
+                                    .await;
+                                }
+                            }
+
+                            if let Some(callback) = update.callback_query {
+                                handle_callback_query(&config, &pool, &client, &bot_token, callback)
+                                    .await;
+                            }
                         }
                     }
-
-                    if let Some(callback) = update.callback_query {
-                        handle_callback_query(&config, &pool, &client, &bot_token, callback).await;
+                    Err(err) => {
+                        tracing::error!(?err, "Telegram poll error, will retry");
                     }
                 }
             }
-            Err(err) => {
-                tracing::error!(?err, "Telegram poll error, will retry");
-            }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+        }
+    }
+
+    // The executor observes the same shutdown signal: it stops accepting
+    // tasks, drops queued requests with a per-item warn log, and waits at
+    // most SHUTDOWN_DRAIN_TIMEOUT for the in-flight task before aborting it.
+    let summary = executor.join().await;
+    tracing::info!(
+        dropped_queued = summary.dropped_queued,
+        aborted_inflight = summary.aborted_inflight,
+        "Telegram bot poller stopped"
+    );
+    Ok(())
+}
+
+fn log_enqueue_rejected(error: &TryEnqueueError) {
+    match error {
+        TryEnqueueError::QueueFull(request) => tracing::warn!(
+            chat_id = request.chat_id,
+            tweet_id = %request.tweet_id,
+            status = "queue_full",
+            "share queue is full; request was not accepted for processing"
+        ),
+        TryEnqueueError::Closed(request) => tracing::warn!(
+            chat_id = request.chat_id,
+            tweet_id = %request.tweet_id,
+            status = "executor_closed",
+            "share executor is shut down; request was not accepted for processing"
+        ),
     }
 }
 
