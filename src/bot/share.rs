@@ -39,10 +39,10 @@ pub(crate) fn parse_x_tweet_url(text: &str) -> Option<ParsedTweetUrl> {
 pub(crate) fn route_private_message(
     chat_type: &str,
     chat_id: i64,
-    allowed_chat_id: i64,
+    allowed_chat_ids: &[i64],
     text: &str,
 ) -> PrivateMessageRoute {
-    if chat_type != "private" || chat_id != allowed_chat_id {
+    if chat_type != "private" || !allowed_chat_ids.contains(&chat_id) {
         return PrivateMessageRoute::Other;
     }
 
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn authorized_private_url_routes_to_share() {
-        let route = route_private_message("private", 7, 7, "https://x.com/u/status/123");
+        let route = route_private_message("private", 7, &[7], "https://x.com/u/status/123");
         let PrivateMessageRoute::Share(request) = route else {
             panic!("expected share route");
         };
@@ -301,15 +301,27 @@ mod tests {
     }
 
     #[test]
+    fn any_id_in_the_allowlist_can_share() {
+        for chat_id in [7, 9] {
+            let route =
+                route_private_message("private", chat_id, &[7, 9], "https://x.com/u/status/123");
+            let PrivateMessageRoute::Share(request) = route else {
+                panic!("expected share route for {chat_id}");
+            };
+            assert_eq!(request.chat_id, chat_id);
+        }
+    }
+
+    #[test]
     fn unauthorized_group_and_channel_messages_do_not_route_to_share() {
-        for (chat_type, chat_id, allowed) in [
-            ("private", 8, 7),
-            ("group", 7, 7),
-            ("supergroup", 7, 7),
-            ("channel", 7, 7),
+        for (chat_type, chat_id) in [
+            ("private", 8),
+            ("group", 7),
+            ("supergroup", 7),
+            ("channel", 7),
         ] {
             assert_eq!(
-                route_private_message(chat_type, chat_id, allowed, "https://x.com/u/status/123"),
+                route_private_message(chat_type, chat_id, &[7], "https://x.com/u/status/123"),
                 PrivateMessageRoute::Other
             );
         }
@@ -318,11 +330,11 @@ mod tests {
     #[test]
     fn commands_have_priority_and_plain_text_is_not_share() {
         assert_eq!(
-            route_private_message("private", 7, 7, "/help https://x.com/u/status/123"),
+            route_private_message("private", 7, &[7], "/help https://x.com/u/status/123"),
             PrivateMessageRoute::Command
         );
         assert_eq!(
-            route_private_message("private", 7, 7, "ordinary text"),
+            route_private_message("private", 7, &[7], "ordinary text"),
             PrivateMessageRoute::Other
         );
     }

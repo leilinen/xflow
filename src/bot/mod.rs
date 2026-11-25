@@ -99,7 +99,7 @@ pub async fn run_poller(
     mut shutdown: ShutdownHandle,
 ) -> anyhow::Result<()> {
     let bot_token = telegram::load_bot_token(&config.telegram)?;
-    let allowed_chat_id = load_allowed_private_chat_id(&config.telegram.chat_id_env)?;
+    let allowed_chat_ids = load_allowed_private_chat_ids(&config.telegram.chat_id_env)?;
     let bot_username = get_bot_username(&bot_token).await;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
@@ -143,7 +143,7 @@ pub async fn run_poller(
 
                                 // Private chat access is fail-closed. Authorization is
                                 // checked before inspecting message text or URLs.
-                                if is_private && message.chat.id != allowed_chat_id {
+                                if is_private && !allowed_chat_ids.contains(&message.chat.id) {
                                     tracing::warn!(
                                         chat_id = message.chat.id,
                                         "ignoring message from unauthorized private chat"
@@ -178,7 +178,7 @@ pub async fn run_poller(
                                     match share::route_private_message(
                                         &message.chat.chat_type,
                                         message.chat.id,
-                                        allowed_chat_id,
+                                        &allowed_chat_ids,
                                         &text,
                                     ) {
                                         PrivateMessageRoute::Share(request) => {
@@ -254,9 +254,48 @@ pub async fn run_poller(
     Ok(())
 }
 
-fn load_allowed_private_chat_id(env_name: &str) -> anyhow::Result<i64> {
-    let value = std::env::var(env_name).ok();
-    parse_allowed_private_chat_id(value.as_deref())
+/// Env var holding the comma-separated allowlist of private chat ids that
+/// may share tweet URLs to the bot. Kept separate from the delivery target
+/// (`TELEGRAM_CHAT_ID`) so single-user deployments where that id is a
+/// group/channel can still authorize the owner's private chat.
+const ALLOWED_PRIVATE_CHAT_IDS_ENV: &str = "TELEGRAM_ALLOWED_PRIVATE_CHAT_IDS";
+
+fn load_allowed_private_chat_ids(legacy_chat_id_env: &str) -> anyhow::Result<Vec<i64>> {
+    match std::env::var(ALLOWED_PRIVATE_CHAT_IDS_ENV) {
+        Ok(raw) => parse_allowed_private_chat_ids(&raw),
+        Err(_) => {
+            // Legacy fallback: use the configured chat id as the only
+            // allowed private chat. Deployments where that id holds a
+            // group/channel stay fail-closed — private shares keep being
+            // rejected until the dedicated allowlist variable is set.
+            let legacy = std::env::var(legacy_chat_id_env).ok();
+            let id = parse_allowed_private_chat_id(legacy.as_deref())?;
+            tracing::warn!(
+                fallback_env = legacy_chat_id_env,
+                missing_env = ALLOWED_PRIVATE_CHAT_IDS_ENV,
+                "share private allowlist not configured; falling back to the configured chat id as the only allowed private chat"
+            );
+            Ok(vec![id])
+        }
+    }
+}
+
+fn parse_allowed_private_chat_ids(raw: &str) -> anyhow::Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let id = part
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("invalid chat id in private allowlist: {part}"))?;
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        anyhow::bail!("private chat allowlist must contain at least one chat id");
+    }
+    Ok(ids)
 }
 
 fn parse_allowed_private_chat_id(value: Option<&str>) -> anyhow::Result<i64> {
@@ -2409,6 +2448,21 @@ mod tests {
         assert!(parse_allowed_private_chat_id(Some("")).is_err());
         assert!(parse_allowed_private_chat_id(Some("not-a-chat-id")).is_err());
         assert_eq!(parse_allowed_private_chat_id(Some("12345")).unwrap(), 12345);
+    }
+
+    #[test]
+    fn private_chat_allowlist_list_parses_csv_ids() {
+        assert_eq!(
+            parse_allowed_private_chat_ids("12345").unwrap(),
+            vec![12345]
+        );
+        assert_eq!(
+            parse_allowed_private_chat_ids(" 12345 , -100999 , 42 ").unwrap(),
+            vec![12345, -100999, 42]
+        );
+        assert!(parse_allowed_private_chat_ids("").is_err());
+        assert!(parse_allowed_private_chat_ids(" , ").is_err());
+        assert!(parse_allowed_private_chat_ids("12345,oops").is_err());
     }
 
     #[test]
